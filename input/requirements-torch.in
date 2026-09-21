@@ -1,0 +1,17 @@
+# Separate from requirements-centralized.in because torch/torchvision must be
+# resolved and downloaded from the PyTorch CUDA 12.8 index, not default PyPI:
+#
+#   uv pip compile requirements-torch.in --exclude-newer "10 days" --python 3.14 \
+#       --index-url https://download.pytorch.org/whl/cu128 -o requirements-torch.txt
+#
+#   python -m pip download -r requirements-torch.txt -d <wheelhouse>\torch `
+#       --index-url https://download.pytorch.org/whl/cu128 `
+#       --python-version 3.14 --platform win_amd64 --implementation cp --only-binary=:all:
+#
+# NOTE: cu128 wheels for torch are typically several GB each - plan wheelhouse
+# storage and Defender scan time accordingly, and verify cp314 builds actually
+# exist on this index before committing to Python 3.14 for this project.
+# If not yet published, torch is likely to be the first blocker on 3.14 adoption.
+
+torch>=2.7
+torchvision

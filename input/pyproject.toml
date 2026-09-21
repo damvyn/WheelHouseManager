@@ -1,0 +1,26 @@
+[project]
+name = "second"
+version = "0.1.0"
+description = "Foundation model investigator: NCS 3D ViT features on the Ichthys cube."
+requires-python = ">=3.11"
+dependencies = [
+    "ncs[inference]",
+    "torch>=2.7",
+    "torchvision",
+    "zarr>=3",
+    "xarray",
+    "dask",
+    "numpy",
+    "huggingface-hub[cli]",
+    "matplotlib>=3.11.1",
+]
+
+[tool.uv.sources]
+ncs = { path = "NCS_models", editable = true }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

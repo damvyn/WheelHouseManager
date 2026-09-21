@@ -1,0 +1,31 @@
+[
+  {
+    "name": "pillow",
+    "version": "12.3.0",
+    "vulns": [
+      {
+        "id": "TEST-VULN-0001",
+        "fix_versions": ["12.4.0"],
+        "aliases": ["CVE-0000-00001"],
+        "description": "SIMULATED FOR TESTING. Example heap buffer overflow when parsing a crafted image file, mimicking the shape of a real pip-audit finding."
+      }
+    ]
+  },
+  {
+    "name": "pyyaml",
+    "version": "6.0.3",
+    "vulns": [
+      {
+        "id": "TEST-VULN-0002",
+        "fix_versions": [],
+        "aliases": ["GHSA-xxxx-xxxx-xxxx"],
+        "description": "SIMULATED FOR TESTING. No fix version currently published - exercises the 'no fix available' recommendation branch in the alert."
+      }
+    ]
+  },
+  {
+    "name": "numpy",
+    "version": "2.5.3",
+    "vulns": []
+  }
+]

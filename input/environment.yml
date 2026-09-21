@@ -1,0 +1,17 @@
+name: geopypy
+channels:
+  - defaults
+dependencies:
+  - numpy
+  - pyside6[version='>=6.5,<6.9']
+  - pip
+  - python=3.11
+  - scipy[version='>=1.10']
+  - vispy[version='>=0.14']
+  - zarr[version='>=2.18']
+  - xarray[version='>=2024.0']
+  - pandas
+  - plotly
+  - pyyaml
+  - pytest
+  - jupyter

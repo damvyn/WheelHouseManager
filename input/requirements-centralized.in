@@ -1,0 +1,42 @@
+# Centralized package list 
+# UNPINNED by design - resolve on the build server with:
+#   uv pip compile requirements-centralized.in --exclude-newer "10 days" --python 3.14 -o requirements.txt
+# Target Python: 3.14 (major.minor only - see PythonVersion note in chat).
+# Target platform: win_amd64
+# Only top-level/direct packages are listed. Transitive dependencies are left for
+# the resolver to pick at their own latest-compatible version - hand-pinning them
+# separately would fight the resolver and reintroduce stale versions.
+#
+# EXCLUDED from this file (handled separately, see notes below / chat):
+#   - torch, torchvision            -> separate pytorch-cu128 index, own requirements file
+#   - ncs                            -> private editable package, not on PyPI
+#   - PyCube                         -> proprietary, not on PyPI
+#   - devito and its env (gcc/g++/cmake toolchain) -> currently pinned to python=3.10,
+#                                        compatibility with 3.14 not yet verified
+
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+plotly
+xarray
+zarr
+segyio
+lasio
+dask
+huggingface-hub[cli]
+pyyaml
+pytest
+jupyter
+ipykernel
+
+# Qt bindings: both kept per explicit decision - some existing code still
+# depends on Qt5 (pyqt5), while newer work targets Qt6 (pyside6). Having
+# both installed side by side is intentional here, not legacy leftover.
+pyside6
+pyqt5
+pyqtdarktheme
+darkdetect
+# pyqt5-sip and pyqt5-qt5 are pulled in automatically as pyqt5's own
+# dependencies - no need to pin them separately here.
