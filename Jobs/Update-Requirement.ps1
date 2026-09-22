@@ -61,12 +61,12 @@ $managerRoot = Split-Path -Path $PSScriptRoot -Parent
 $settingsPath = Join-Path $managerRoot "config\settings.psd1"
 $settings = Get-WheelhouseSettings -SettingsPath $settingsPath
 
-if (-not $PSBoundParameters.ContainsKey('RequirementsInPath')) {
-    $RequirementsInPath = Join-Path $managerRoot "Input\requirements.in"
-}
-if (-not $PSBoundParameters.ContainsKey('RequirementsTxtPath')) {
-    $RequirementsTxtPath = Join-Path $managerRoot "Input\requirements.txt"
-}
+$RequirementsInPath = Resolve-Setting -Name "RequirementsInPath" -ExplicitValue $RequirementsInPath `
+    -WasBound $PSBoundParameters.ContainsKey('RequirementsInPath') -Settings $settings `
+    -FallbackDefault (Join-Path $managerRoot "Input\requirements.in")
+$RequirementsTxtPath = Resolve-Setting -Name "LocalRequirementsPath" -ExplicitValue $RequirementsTxtPath `
+    -WasBound $PSBoundParameters.ContainsKey('RequirementsTxtPath') -Settings $settings `
+    -FallbackDefault (Join-Path $managerRoot "Input\requirements.txt")
 $PythonVersion = Resolve-Setting -Name "PythonVersion" -ExplicitValue $PythonVersion `
     -WasBound $PSBoundParameters.ContainsKey('PythonVersion') -Settings $settings -FallbackDefault "3.14"
 $MinimumPackageAgeDays = Resolve-Setting -Name "MinimumPackageAgeDays" -ExplicitValue $MinimumPackageAgeDays `

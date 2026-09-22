@@ -17,6 +17,12 @@
 .PARAMETER WheelhousePath
     Passed through to both underlying scripts.
 
+.PARAMETER LocalRequirementsPath
+    Passed through to Update-Wheelhouse.ps1 to trigger the merge step. Defaults to
+    config\settings.psd1's LocalRequirementsPath, same as that script. If empty
+    (no value here and none in settings.psd1), simply not passed down, and
+    Update-Wheelhouse.ps1 falls back to its own default resolution.
+
 .PARAMETER PythonVersion
 .PARAMETER Platform
 .PARAMETER MinimumPackageAgeDays
@@ -48,6 +54,8 @@
 param(
     [ValidateNotNullOrEmpty()]
     [string]$WheelhousePath,
+
+    [string]$LocalRequirementsPath,
 
     [ValidateNotNullOrEmpty()]
     [string]$PythonVersion,
@@ -84,6 +92,8 @@ $settings = Get-WheelhouseSettings -SettingsPath $settingsPath
 
 $WheelhousePath = Resolve-Setting -Name "WheelhousePath" -ExplicitValue $WheelhousePath `
     -WasBound $PSBoundParameters.ContainsKey('WheelhousePath') -Settings $settings -FallbackDefault $null
+$LocalRequirementsPath = Resolve-Setting -Name "LocalRequirementsPath" -ExplicitValue $LocalRequirementsPath `
+    -WasBound $PSBoundParameters.ContainsKey('LocalRequirementsPath') -Settings $settings -FallbackDefault $null
 $PythonVersion = Resolve-Setting -Name "PythonVersion" -ExplicitValue $PythonVersion `
     -WasBound $PSBoundParameters.ContainsKey('PythonVersion') -Settings $settings -FallbackDefault "3.14"
 $Platform = Resolve-Setting -Name "Platform" -ExplicitValue $Platform `
@@ -128,6 +138,9 @@ $updateParams = @{
     Platform              = $Platform
     MinimumPackageAgeDays = $MinimumPackageAgeDays
     VulnerabilityServices = $VulnerabilityServices
+}
+if (-not [string]::IsNullOrWhiteSpace($LocalRequirementsPath)) {
+    $updateParams["LocalRequirementsPath"] = $LocalRequirementsPath
 }
 & $UpdateWheelhouseScriptPath @updateParams
 

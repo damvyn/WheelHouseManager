@@ -47,14 +47,13 @@
     neither is set.
 
 .PARAMETER LocalRequirementsPath
-    Optional and OPT-IN - there is no default. When supplied, the entries in this
-    locally-resolved requirements.txt (typically produced by Update-Requirement.ps1)
-    are merged into the wheelhouse's group files before processing. Left empty (the
-    default), no merge happens at all - the script just processes the wheelhouse's
-    existing group files as-is. This is deliberate: a scheduled/periodic run must
-    NEVER silently merge whatever happens to be sitting in Input\requirements.txt
-    (which could be someone's unapproved draft) - merging only happens when this is
-    passed explicitly, which should be a deliberate action taken after approval.
+    A locally-resolved requirements.txt (typically produced by Update-Requirement.ps1)
+    whose entries get merged into the wheelhouse's group files before processing.
+    Defaults to config\settings.psd1's LocalRequirementsPath (itself defaulting to
+    Input\requirements.txt under the manager root, set by Setup.ps1). If that file is
+    missing or empty, no merge happens - the script just processes the wheelhouse's
+    existing group files as-is. Pass an explicit empty string ("") to force-skip the
+    merge even if settings.psd1 has a value set.
 
 .PARAMETER PythonVersion
     Target Python version for downloads and manifest tag matching (default: 3.14, tag "cp314").
@@ -123,7 +122,8 @@ $settings = Get-WheelhouseSettings -SettingsPath $settingsPath
 $WheelhousePath = Resolve-Setting -Name "WheelhousePath" -ExplicitValue $WheelhousePath `
     -WasBound $PSBoundParameters.ContainsKey('WheelhousePath') -Settings $settings -FallbackDefault $null
 # No default for LocalRequirementsPath - merging is opt-in only (see .PARAMETER above).
-# $LocalRequirementsPath stays exactly what the caller passed (or empty if omitted).
+$LocalRequirementsPath = Resolve-Setting -Name "LocalRequirementsPath" -ExplicitValue $LocalRequirementsPath `
+    -WasBound $PSBoundParameters.ContainsKey('LocalRequirementsPath') -Settings $settings -FallbackDefault $null
 $PythonVersion = Resolve-Setting -Name "PythonVersion" -ExplicitValue $PythonVersion `
     -WasBound $PSBoundParameters.ContainsKey('PythonVersion') -Settings $settings -FallbackDefault "3.14"
 $Platform = Resolve-Setting -Name "Platform" -ExplicitValue $Platform `
@@ -242,7 +242,7 @@ else {
 # Step 2: merge local requirements (if any) into the wheelhouse's group files
 # ---------------------------------------------------------------------------
 
-$groupFiles = @(Get-WheelhouseRequirementGroups -WheelhousePath $WheelhousePath)
+$groupFiles = Get-WheelhouseRequirementGroups -WheelhousePath $WheelhousePath
 
 $hasLocalRequirements = (-not [string]::IsNullOrWhiteSpace($LocalRequirementsPath)) -and (Test-Path -Path $LocalRequirementsPath)
 if ($hasLocalRequirements) {
@@ -270,7 +270,7 @@ if ($localPackages.Count -gt 0) {
     }
 
     # Re-scan: a brand new group file may have been created above.
-    $groupFiles = @(Get-WheelhouseRequirementGroups -WheelhousePath $WheelhousePath)
+    $groupFiles = Get-WheelhouseRequirementGroups -WheelhousePath $WheelhousePath
 }
 elseif (-not [string]::IsNullOrWhiteSpace($LocalRequirementsPath)) {
     Write-Log "No local requirements to merge (file missing or empty): $LocalRequirementsPath"
@@ -370,7 +370,7 @@ foreach ($groupFile in $groupFiles) {
     }
 
     if ($allAuditsPassed -and $ageCheckPassed) {
-        Write-Log "$groupName: audits passed and cooldown satisfied. Downloading..." "OK"
+        Write-Log "${groupName}: audits passed and cooldown satisfied. Downloading..." "OK"
         $pipDownloadArgs = @(
             "-m", "pip", "download",
             "-r", $groupFile,
@@ -383,20 +383,20 @@ foreach ($groupFile in $groupFiles) {
         & python @pipDownloadArgs
 
         if ($LASTEXITCODE -eq 0) {
-            Write-Log "$groupName: download completed successfully." "OK"
+            Write-Log "${groupName}: download completed successfully." "OK"
             $anyDownloadHappened = $true
         }
         else {
-            Write-Log "$groupName: download FAILED. Review the pip output above." "ERROR"
+            Write-Log "${groupName}: download FAILED. Review the pip output above." "ERROR"
             $overallAuditsPassed = $false
         }
     }
     else {
         if (-not $allAuditsPassed) {
-            Write-Log "$groupName: download SKIPPED - one or more vulnerability audits did not pass." "ERROR"
+            Write-Log "${groupName}: download SKIPPED - one or more vulnerability audits did not pass." "ERROR"
         }
         if (-not $ageCheckPassed) {
-            Write-Log "$groupName: download SKIPPED - one or more packages do not yet satisfy the cooldown." "ERROR"
+            Write-Log "${groupName}: download SKIPPED - one or more packages do not yet satisfy the cooldown." "ERROR"
         }
         $overallAuditsPassed = $false
     }

@@ -157,6 +157,8 @@ don't need to repeat `-WheelhousePath` (or anything else) on every call.
 ```powershell
 @{
     WheelhousePath        = '\\server\share\wheelhouse'
+    RequirementsInPath     = 'C:\WheelHouseManager\Input\requirements.in'
+    LocalRequirementsPath  = 'C:\WheelHouseManager\Input\requirements.txt'
     PythonVersion          = '3.14'
     Platform                = 'win_amd64'
     MinimumPackageAgeDays   = 10
@@ -216,7 +218,9 @@ can't contain two versions of the same package name, the wheelhouse instead hold
 | New package name | Added to the first group that doesn't already use that name |
 | Same name, different version, already used everywhere | A brand-new group file is created |
 
-`-LocalRequirementsPath` is **opt-in with no default** - omit it and the script just processes
+`-LocalRequirementsPath` defaults to `config\settings.psd1`'s `LocalRequirementsPath` (itself
+set by `Setup.ps1` to `Input\requirements.txt`). If that file is missing or empty, nothing is
+merged - the script just processes
 the wheelhouse's existing group files as-is, without merging anything.
 
 ### What it does, in order

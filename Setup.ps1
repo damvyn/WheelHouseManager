@@ -79,14 +79,17 @@ else {
 # Step 2: config\settings.psd1 (created once, merged thereafter - never clobbered)
 # ---------------------------------------------------------------------------
 
+$inputPath = Join-Path $DestinationPath "Input"
 $configPath = Join-Path $DestinationPath "config"
 New-Item -ItemType Directory -Path $configPath -Force | Out-Null
 $settingsPath = Join-Path $configPath "settings.psd1"
 
 if (-not (Test-Path -Path $settingsPath)) {
     $defaultSettings = @{
-        WheelhousePath        = ""
-        PythonVersion          = "3.14"
+        WheelhousePath         = ""
+        RequirementsInPath     = (Join-Path $inputPath "requirements.in")
+        LocalRequirementsPath  = (Join-Path $inputPath "requirements.txt")
+        PythonVersion           = "3.14"
         Platform                = "win_amd64"
         MinimumPackageAgeDays   = 10
         VulnerabilityServices   = @("osv", "pypi")
@@ -116,7 +119,6 @@ else {
 # Step 3: Input\ (created once - requirements.in/.txt are user data, never overwritten)
 # ---------------------------------------------------------------------------
 
-$inputPath = Join-Path $DestinationPath "Input"
 New-Item -ItemType Directory -Path $inputPath -Force | Out-Null
 
 $requirementsInDefault = @"
