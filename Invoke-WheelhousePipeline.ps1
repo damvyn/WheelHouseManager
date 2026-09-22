@@ -1,27 +1,27 @@
 <#
 .SYNOPSIS
-    Runs the wheelhouse maintenance script and automatically feeds any new
-    vulnerability audit reports it produced into the alert script.
+    Runs the wheelhouse maintenance script and automatically feeds the audit results
+    of that run into the alert script.
 
 .DESCRIPTION
-    Calls Update-Wheelhouse.ps1, then scans <WheelhousePath>\reports for
-    Report_*-OSV_*.json / Report_*-PYPI_*.json files created during that run
-    (by timestamp, not by parsing Update-Wheelhouse.ps1's internals - so this
-    script keeps working even if that script's logic changes later, as long as
-    the report naming convention stays the same). Those paths are passed
-    straight into Send-VulnerabilityAlert.ps1 - no manual -ReportPaths needed.
+    Calls Update-Wheelhouse.ps1, collects the Wheelhouse.AuditResult objects it
+    returns (one per group/service audit of THIS run - no guessing by report file
+    timestamps), and passes every vulnerable or failed audit straight into
+    Send-VulnerabilityAlert.ps1 - no manual -ReportPaths needed.
 
-    If Update-Wheelhouse.ps1 aborts before producing any audit report (e.g. an
-    integrity check failure), this script skips the alert step and says why.
+    If Update-Wheelhouse.ps1 aborts before running any audit (e.g. an integrity
+    check failure), this script skips the alert step and says why.
+
+    Every parameter is only passed down if you supply it; otherwise each child
+    script resolves it from config\settings.psd1 itself.
 
 .PARAMETER WheelhousePath
     Passed through to both underlying scripts.
 
 .PARAMETER LocalRequirementsPath
-    Passed through to Update-Wheelhouse.ps1 to trigger the merge step. Defaults to
-    config\settings.psd1's LocalRequirementsPath, same as that script. If empty
-    (no value here and none in settings.psd1), simply not passed down, and
-    Update-Wheelhouse.ps1 falls back to its own default resolution.
+    Passed through to Update-Wheelhouse.ps1. If omitted, that script uses
+    config\settings.psd1's LocalRequirementsPath (Input\requirements.txt), i.e. it
+    merges it if it has content. Pass "" to skip the merge.
 
 .PARAMETER PythonVersion
 .PARAMETER Platform
@@ -33,8 +33,8 @@
 .PARAMETER To
 .PARAMETER From
 .PARAMETER OutputHtmlPath
-    Passed through to Send-VulnerabilityAlert.ps1. Omit -SmtpServer to save an
-    HTML file instead of emailing (same behavior as calling that script directly).
+    Passed through to Send-VulnerabilityAlert.ps1. Without an SMTP server (here or in
+    settings.psd1) the alert is saved as an HTML file instead of emailed.
 
 .PARAMETER UpdateWheelhouseScriptPath
 .PARAMETER SendAlertScriptPath
@@ -63,7 +63,7 @@ param(
     [string]$Platform,
     [ValidateRange(0, 3650)]
     [int]$MinimumPackageAgeDays,
-    [ValidateSet("osv", "pypi")]
+    [ValidateSet('osv', 'pypi')]
     [string[]]$VulnerabilityServices,
 
     [string]$SmtpServer,
@@ -72,131 +72,63 @@ param(
     [string]$OutputHtmlPath,
 
     [ValidateNotNullOrEmpty()]
-    [string]$UpdateWheelhouseScriptPath = (Join-Path $PSScriptRoot "Jobs\Update-Wheelhouse.ps1"),
+    [string]$UpdateWheelhouseScriptPath = (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'Update-Wheelhouse.ps1'),
     [ValidateNotNullOrEmpty()]
-    [string]$SendAlertScriptPath = (Join-Path $PSScriptRoot "Jobs\Send-VulnerabilityAlert.ps1")
+    [string]$SendAlertScriptPath = (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'Send-VulnerabilityAlert.ps1')
 )
 
-$commonPath = Join-Path $PSScriptRoot "Jobs\functions.ps1"
-if (-not (Test-Path -Path $commonPath)) {
-    Write-Host "Required file not found: $commonPath" -ForegroundColor Red
-    exit 1
-}
-. $commonPath
+Import-Module (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'WheelhouseManager') -ErrorAction Stop
 
-# Resolve every optional parameter once here, then pass the resolved values down
-# explicitly to both child scripts - so settings.psd1 is read exactly once per run,
-# and the two child scripts don't each read it again independently.
-$settingsPath = Join-Path $PSScriptRoot "config\settings.psd1"
-$settings = Get-WheelhouseSettings -SettingsPath $settingsPath
+Write-Log '=== Wheelhouse pipeline started ==='
 
-$WheelhousePath = Resolve-Setting -Name "WheelhousePath" -ExplicitValue $WheelhousePath `
-    -WasBound $PSBoundParameters.ContainsKey('WheelhousePath') -Settings $settings -FallbackDefault $null
-$LocalRequirementsPath = Resolve-Setting -Name "LocalRequirementsPath" -ExplicitValue $LocalRequirementsPath `
-    -WasBound $PSBoundParameters.ContainsKey('LocalRequirementsPath') -Settings $settings -FallbackDefault $null
-$PythonVersion = Resolve-Setting -Name "PythonVersion" -ExplicitValue $PythonVersion `
-    -WasBound $PSBoundParameters.ContainsKey('PythonVersion') -Settings $settings -FallbackDefault "3.14"
-$Platform = Resolve-Setting -Name "Platform" -ExplicitValue $Platform `
-    -WasBound $PSBoundParameters.ContainsKey('Platform') -Settings $settings -FallbackDefault "win_amd64"
-$MinimumPackageAgeDays = Resolve-Setting -Name "MinimumPackageAgeDays" -ExplicitValue $MinimumPackageAgeDays `
-    -WasBound $PSBoundParameters.ContainsKey('MinimumPackageAgeDays') -Settings $settings -FallbackDefault 10
-$VulnerabilityServices = Resolve-Setting -Name "VulnerabilityServices" -ExplicitValue $VulnerabilityServices `
-    -WasBound $PSBoundParameters.ContainsKey('VulnerabilityServices') -Settings $settings -FallbackDefault @("osv", "pypi")
-$SmtpServer = Resolve-Setting -Name "SmtpServer" -ExplicitValue $SmtpServer `
-    -WasBound $PSBoundParameters.ContainsKey('SmtpServer') -Settings $settings -FallbackDefault $null
-$To = Resolve-Setting -Name "MailTo" -ExplicitValue $To `
-    -WasBound $PSBoundParameters.ContainsKey('To') -Settings $settings -FallbackDefault "servicedesk@company.com"
-$From = Resolve-Setting -Name "MailFrom" -ExplicitValue $From `
-    -WasBound $PSBoundParameters.ContainsKey('From') -Settings $settings -FallbackDefault "NoReply@company.com"
-
-if ([string]::IsNullOrWhiteSpace($WheelhousePath)) {
-    Write-Log "WheelhousePath was not supplied and is not set in config\settings.psd1. Pass -WheelhousePath, or run Setup.ps1 with -WheelhousePath first." "ERROR"
-    exit 1
+foreach ($scriptPath in $UpdateWheelhouseScriptPath, $SendAlertScriptPath) {
+    if (-not (Test-Path -Path $scriptPath)) {
+        Write-Log "Required script not found: $scriptPath" 'ERROR'
+        exit 1
+    }
 }
 
-Write-Log "=== Wheelhouse pipeline started ==="
-
-if (-not (Test-Path -Path $UpdateWheelhouseScriptPath)) {
-    Write-Log "Update-Wheelhouse.ps1 not found at: $UpdateWheelhouseScriptPath" "ERROR"
-    exit 1
+# Split the explicitly-passed parameters between the two child scripts.
+$updateParams = @{}
+foreach ($name in 'WheelhousePath', 'LocalRequirementsPath', 'PythonVersion', 'Platform', 'MinimumPackageAgeDays', 'VulnerabilityServices') {
+    if ($PSBoundParameters.ContainsKey($name)) { $updateParams[$name] = $PSBoundParameters[$name] }
 }
-if (-not (Test-Path -Path $SendAlertScriptPath)) {
-    Write-Log "Send-VulnerabilityAlert.ps1 not found at: $SendAlertScriptPath" "ERROR"
-    exit 1
+$alertParams = @{}
+foreach ($name in 'WheelhousePath', 'SmtpServer', 'To', 'From', 'OutputHtmlPath') {
+    if ($PSBoundParameters.ContainsKey($name)) { $alertParams[$name] = $PSBoundParameters[$name] }
 }
 
 # ---------------------------------------------------------------------------
-# Step 1: run Update-Wheelhouse.ps1
+# Step 1: run Update-Wheelhouse.ps1 and collect this run's audit results
 # ---------------------------------------------------------------------------
 
-$runStartTime = Get-Date
-Write-Log "Running Update-Wheelhouse.ps1..."
-
-$updateParams = @{
-    WheelhousePath        = $WheelhousePath
-    PythonVersion         = $PythonVersion
-    Platform              = $Platform
-    MinimumPackageAgeDays = $MinimumPackageAgeDays
-    VulnerabilityServices = $VulnerabilityServices
-}
-if (-not [string]::IsNullOrWhiteSpace($LocalRequirementsPath)) {
-    $updateParams["LocalRequirementsPath"] = $LocalRequirementsPath
-}
-& $UpdateWheelhouseScriptPath @updateParams
-
+Write-Log 'Running Update-Wheelhouse.ps1...'
+$auditResults = @(& $UpdateWheelhouseScriptPath @updateParams |
+        Where-Object { $_.PSObject.TypeNames -contains 'Wheelhouse.AuditResult' })
 $wheelhouseExitCode = $LASTEXITCODE
 Write-Log "Update-Wheelhouse.ps1 finished with exit code $wheelhouseExitCode."
 
 # ---------------------------------------------------------------------------
-# Step 2: find audit reports it just wrote and feed them into the alert script
+# Step 2: alert on every vulnerable or failed audit of this run
 # ---------------------------------------------------------------------------
 
-$reportsFolder = Join-Path $WheelhousePath "reports"
-$newAuditReports = @()
-
-if (Test-Path -Path $reportsFolder) {
-    $newAuditReports = @(
-        Get-ChildItem -Path $reportsFolder -File -ErrorAction SilentlyContinue |
-            Where-Object {
-                ($_.Name -match '-OSV_' -or $_.Name -match '-PYPI_') -and
-                $_.LastWriteTime -ge $runStartTime
-            } |
-            Select-Object -ExpandProperty FullName
-    )
-}
-
-if ($newAuditReports.Count -eq 0) {
-    Write-Log "No new audit reports were produced this run - skipping the alert step." "WARN"
-    Write-Log "(This is expected if Update-Wheelhouse.ps1 aborted early, e.g. on an integrity check failure - check its output above.)"
-    Write-Log "=== Wheelhouse pipeline finished ==="
+if ($auditResults.Count -eq 0) {
+    Write-Log 'No audits ran this run - skipping the alert step.' 'WARN'
+    Write-Log '(This is expected if Update-Wheelhouse.ps1 aborted early, e.g. on an integrity check failure - check its output above.)'
+    Write-Log '=== Wheelhouse pipeline finished ==='
     exit $wheelhouseExitCode
 }
 
-Write-Log "Found $($newAuditReports.Count) new audit report(s):"
-foreach ($report in $newAuditReports) {
-    Write-Log "  - $report"
+$alertParams = Get-VulnerabilityAlertParameter -AuditResult $auditResults -AlertParameters $alertParams
+$alertExitCode = 0
+if ($null -ne $alertParams) {
+    Write-Log 'Running Send-VulnerabilityAlert.ps1...'
+    & $SendAlertScriptPath @alertParams | Out-Host
+    $alertExitCode = $LASTEXITCODE
+    Write-Log "Send-VulnerabilityAlert.ps1 finished with exit code $alertExitCode."
 }
 
-# ---------------------------------------------------------------------------
-# Step 3: run Send-VulnerabilityAlert.ps1
-# ---------------------------------------------------------------------------
-
-Write-Log "Running Send-VulnerabilityAlert.ps1..."
-
-$alertParams = @{
-    ReportPaths    = $newAuditReports
-    WheelhousePath = $WheelhousePath
-    To             = $To
-    From           = $From
-}
-if (-not [string]::IsNullOrWhiteSpace($SmtpServer)) { $alertParams["SmtpServer"] = $SmtpServer }
-if (-not [string]::IsNullOrWhiteSpace($OutputHtmlPath)) { $alertParams["OutputHtmlPath"] = $OutputHtmlPath }
-
-& $SendAlertScriptPath @alertParams
-$alertExitCode = $LASTEXITCODE
-Write-Log "Send-VulnerabilityAlert.ps1 finished with exit code $alertExitCode."
-
-Write-Log "=== Wheelhouse pipeline finished ==="
+Write-Log '=== Wheelhouse pipeline finished ==='
 
 if ($wheelhouseExitCode -ne 0) { exit $wheelhouseExitCode }
 exit $alertExitCode

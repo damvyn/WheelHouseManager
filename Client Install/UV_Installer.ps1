@@ -18,7 +18,7 @@ function Start-ProductInstall {
     param()
 
     $InstallDirectory = 'C:\Program Files\astral.sh\uv'
-    $ProductVersion = "<AppVerion>"
+    $ProductVersion = "<AppVersion>"
     $ArchivePath = "$PSScriptRoot\uv-x86_64-pc-windows-msvc.zip"
     $VersionStampPath = "$InstallDirectory\.cetegra-version"
 

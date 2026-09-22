@@ -5,17 +5,19 @@
 
 .DESCRIPTION
     Deliberately does NOTHING else: no merge from Input\requirements.txt, no download,
-    no manifest rebuild, no Defender scan. This is the script that should run
-    unattended on a schedule - Update-WheelHouse.ps1 (merge + download) stays a
+    no manifest changes, no Defender scan. This is the script that should run
+    unattended on a schedule - Update-Wheelhouse.ps1 (merge + download) stays a
     manual, deliberate action taken after a requirements.txt change is approved.
 
     Steps:
-      1. Verifies wheelhouse integrity against manifest.json (every tracked file's
+      1. Checks python / pip-audit are usable (installs or upgrades them if needed).
+      2. Verifies wheelhouse integrity against manifest.json (every tracked file's
          hash must still match). Stops immediately on any mismatch.
-      2. For every requirements-N.txt group file, runs pip-audit against each
+      3. For every requirements-N.txt group file, runs pip-audit against each
          configured vulnerability service.
-      3. If any audit found a vulnerability, calls Send-VulnerabilityAlert.ps1 with
-         every report that had a finding, across all groups and services, in one call.
+      4. If any audit found a vulnerability OR could not be completed, calls
+         Send-VulnerabilityAlert.ps1 once with every such result, across all groups
+         and services. A failed audit is never reported as "no vulnerabilities".
 
 .PARAMETER WheelhousePath
     UNC or local path to the wheelhouse. Optional if set in config\settings.psd1.
@@ -28,13 +30,14 @@
 .PARAMETER MailTo
 .PARAMETER MailFrom
     Passed through to Send-VulnerabilityAlert.ps1 if a finding triggers an alert.
-    Same settings.psd1 fallback as that script (SmtpServer, MailTo, MailFrom keys).
+    If omitted, that script falls back to config\settings.psd1 itself.
 
 .EXAMPLE
     .\Test-Wheelhouse.ps1 -WheelhousePath "\\server\share\wheelhouse"
 
 .NOTES
-    Requires functions.ps1 and Send-VulnerabilityAlert.ps1 in the same folder as this script.
+    Requires the WheelhouseManager module folder and Send-VulnerabilityAlert.ps1 in the
+    same folder as this script.
 #>
 
 #Requires -Version 5.1
@@ -44,7 +47,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$WheelhousePath,
 
-    [ValidateSet("osv", "pypi")]
+    [ValidateSet('osv', 'pypi')]
     [string[]]$VulnerabilityServices,
 
     [string]$SmtpServer,
@@ -52,171 +55,97 @@ param(
     [string]$MailFrom,
 
     [ValidateNotNullOrEmpty()]
-    [string]$SendAlertScriptPath = (Join-Path $PSScriptRoot "Send-VulnerabilityAlert.ps1")
+    [string]$SendAlertScriptPath = (Join-Path $PSScriptRoot 'Send-VulnerabilityAlert.ps1')
 )
 
-$commonPath = Join-Path $PSScriptRoot "functions.ps1"
-if (-not (Test-Path -Path $commonPath)) {
-    Write-Host "Required file not found: $commonPath" -ForegroundColor Red
-    exit 1
-}
-. $commonPath
+Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
-$managerRoot = Split-Path -Path $PSScriptRoot -Parent
-$settingsPath = Join-Path $managerRoot "config\settings.psd1"
-$settings = Get-WheelhouseSettings -SettingsPath $settingsPath
+$cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
+    -Name WheelhousePath, VulnerabilityServices, ReportRetentionMonths
 
-$WheelhousePath = Resolve-Setting -Name "WheelhousePath" -ExplicitValue $WheelhousePath `
-    -WasBound $PSBoundParameters.ContainsKey('WheelhousePath') -Settings $settings -FallbackDefault $null
-$VulnerabilityServices = Resolve-Setting -Name "VulnerabilityServices" -ExplicitValue $VulnerabilityServices `
-    -WasBound $PSBoundParameters.ContainsKey('VulnerabilityServices') -Settings $settings -FallbackDefault @("osv", "pypi")
-$SmtpServer = Resolve-Setting -Name "SmtpServer" -ExplicitValue $SmtpServer `
-    -WasBound $PSBoundParameters.ContainsKey('SmtpServer') -Settings $settings -FallbackDefault $null
-$MailTo = Resolve-Setting -Name "MailTo" -ExplicitValue $MailTo `
-    -WasBound $PSBoundParameters.ContainsKey('MailTo') -Settings $settings -FallbackDefault "servicedesk@company.com"
-$MailFrom = Resolve-Setting -Name "MailFrom" -ExplicitValue $MailFrom `
-    -WasBound $PSBoundParameters.ContainsKey('MailFrom') -Settings $settings -FallbackDefault "NoReply@company.com"
+$title = 'Wheelhouse audit-only check'
+$outcome = $null
+$exitCode = 0
 
-if ([string]::IsNullOrWhiteSpace($WheelhousePath)) {
-    Write-Log "WheelhousePath was not supplied and is not set in config\settings.psd1." "ERROR"
-    exit 1
-}
-
-Write-Log "=== Wheelhouse audit-only check started ==="
-Write-Log "Wheelhouse path: $WheelhousePath"
-
-if (-not (Test-Path -Path $WheelhousePath)) {
-    Write-Log "Wheelhouse path does not exist or is not reachable: $WheelhousePath" "ERROR"
-    exit 1
-}
-
-$reportsFolder = Join-Path $WheelhousePath "reports"
-if (-not (Test-Path -Path $reportsFolder)) {
-    New-Item -ItemType Directory -Path $reportsFolder -Force | Out-Null
-    Write-Log "Created reports folder: $reportsFolder"
-}
-
-$logFile = Join-Path $reportsFolder "Log_Audit_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 try {
-    Start-Transcript -Path $logFile -Append | Out-Null
-    Write-Log "Full console output for this run is also being saved to: $logFile"
-}
-catch {
-    Write-Log "Could not start transcript logging to $logFile - continuing with console output only. ($($_.Exception.Message))" "WARN"
-}
+    $reportsFolder = Start-WheelhouseRun -WheelhousePath $cfg.WheelhousePath -Title $title -LogPrefix 'Log_Audit' -RetentionMonths $cfg.ReportRetentionMonths
 
-# ---------------------------------------------------------------------------
-# Step 1: manifest integrity check
-# ---------------------------------------------------------------------------
+    Confirm-PythonAndTooling
 
-$manifestPath = Join-Path $WheelhousePath "manifest.json"
-Write-Log "Loading manifest: $manifestPath"
+    # -----------------------------------------------------------------------
+    # Step 1: manifest integrity check
+    # -----------------------------------------------------------------------
 
-$parseError = Get-ManifestParseError -ManifestPath $manifestPath
-if ($null -ne $parseError) {
-    Write-Log "manifest.json exists but could not be parsed: $parseError" "ERROR"
-    Write-Log "Refusing to continue until this is resolved manually." "ERROR"
-    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
-    exit 1
-}
+    Write-Log "Loading manifest: $(Get-WheelhouseManifestPath -WheelhousePath $cfg.WheelhousePath)"
+    $manifest = Read-WheelhouseManifest -WheelhousePath $cfg.WheelhousePath
+    Write-Log "Manifest contains $($manifest.Count) tracked file(s)."
 
-$manifest = @()
-if (Test-Path -Path $manifestPath) {
-    $manifestContent = Get-Content -Path $manifestPath -Raw -ErrorAction SilentlyContinue
-    if (-not [string]::IsNullOrWhiteSpace($manifestContent)) {
-        foreach ($entry in (ConvertFrom-Json -InputObject $manifestContent)) {
-            $manifest += $entry
-        }
-    }
-}
-Write-Log "Manifest contains $($manifest.Count) tracked file(s)."
-
-if ($manifest.Count -gt 0) {
-    Write-Log "Verifying wheelhouse integrity against manifest..."
-    $integrityProblems = Test-ManifestIntegrity -Manifest $manifest -WheelhousePath $WheelhousePath
-
-    if ($integrityProblems.Count -gt 0) {
-        $integrityReportFile = Join-Path $reportsFolder "Report_Integrity_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-        $integrityProblems | ConvertTo-Json -Depth 3 | Out-File -FilePath $integrityReportFile -Encoding utf8
-
-        Write-Log "WHEELHOUSE INTEGRITY CHECK FAILED. The following problem(s) were found:" "ERROR"
-        foreach ($item in $integrityProblems) {
-            Write-Log "  - $item" "ERROR"
-        }
-        Write-Log "Integrity report saved to: $integrityReportFile" "ERROR"
-        Write-Log "Refusing to run the vulnerability audit until this is investigated manually." "ERROR"
-        Write-Log "=== Wheelhouse audit-only check finished (ABORTED - integrity check failed) ==="
-        Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
-        exit 1
-    }
-    Write-Log "Wheelhouse integrity check passed. All tracked files match their recorded hash." "OK"
-}
-else {
-    Write-Log "Manifest is empty - nothing to audit yet." "OK"
-    Write-Log "=== Wheelhouse audit-only check finished ==="
-    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
-    exit 0
-}
-
-# ---------------------------------------------------------------------------
-# Step 2: audit every group file against every configured vulnerability service
-# ---------------------------------------------------------------------------
-
-$groupFiles = Get-WheelhouseRequirementGroups -WheelhousePath $WheelhousePath
-if ($groupFiles.Count -eq 0) {
-    Write-Log "No requirement group files found in the wheelhouse - nothing to audit." "WARN"
-    Write-Log "=== Wheelhouse audit-only check finished ==="
-    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
-    exit 0
-}
-Write-Log "Auditing $($groupFiles.Count) requirement group file(s)."
-
-$allAuditsPassed = $true
-$failingReportPaths = @()
-
-foreach ($groupFile in $groupFiles) {
-    $groupName = [System.IO.Path]::GetFileNameWithoutExtension($groupFile)
-    Write-Log "--- Group: $groupName ---"
-
-    foreach ($service in $VulnerabilityServices) {
-        $result = Invoke-PipAudit -RequirementsFilePath $groupFile -ReportsFolderPath $reportsFolder -AuditName "Scheduled-$groupName" -Service $service
-        if (-not $result.Success) {
-            $allAuditsPassed = $false
-            $failingReportPaths += $result.ReportPath
-            Show-PipAuditFixSuggestions -RequirementsFilePath $groupFile
-        }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Step 3: alert on any finding, across all groups and services in one call
-# ---------------------------------------------------------------------------
-
-if ($failingReportPaths.Count -gt 0) {
-    Write-Log "$($failingReportPaths.Count) audit report(s) contain vulnerability findings. Triggering alert..." "ERROR"
-
-    if (-not (Test-Path -Path $SendAlertScriptPath)) {
-        Write-Log "Send-VulnerabilityAlert.ps1 not found at: $SendAlertScriptPath - cannot send the alert." "ERROR"
+    $groupFiles = @()
+    if ($manifest.Count -eq 0) {
+        Write-Log 'Manifest is empty - nothing to audit yet.' 'OK'
     }
     else {
-        $alertParams = @{
-            ReportPaths    = $failingReportPaths
-            WheelhousePath = $WheelhousePath
-            To             = $MailTo
-            From           = $MailFrom
-        }
-        if (-not [string]::IsNullOrWhiteSpace($SmtpServer)) { $alertParams["SmtpServer"] = $SmtpServer }
+        Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $cfg.WheelhousePath -ReportsFolder $reportsFolder
 
-        & $SendAlertScriptPath @alertParams
-        Write-Log "Send-VulnerabilityAlert.ps1 finished with exit code $LASTEXITCODE."
+        $groupFiles = Get-WheelhouseGroupFile -WheelhousePath $cfg.WheelhousePath
+        if ($groupFiles.Count -eq 0) {
+            Write-Log 'No requirement group files found in the wheelhouse - nothing to audit.' 'WARN'
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # Step 2: audit every group file against every configured vulnerability service
+    # -----------------------------------------------------------------------
+
+    $auditResults = [System.Collections.Generic.List[object]]::new()
+    if ($groupFiles.Count -gt 0) {
+        Write-Log "Auditing $($groupFiles.Count) requirement group file(s)."
+    }
+    foreach ($groupFile in $groupFiles) {
+        Write-Log "--- Group: $([System.IO.Path]::GetFileNameWithoutExtension($groupFile)) ---"
+        $groupResults = Invoke-GroupAudit -GroupFile $groupFile -Services $cfg.VulnerabilityServices -Stage 'Scheduled' -ReportsFolder $reportsFolder
+        foreach ($result in $groupResults) { $auditResults.Add($result) }
+    }
+
+    # -----------------------------------------------------------------------
+    # Step 3: alert on any finding or failed audit, in one call
+    # -----------------------------------------------------------------------
+
+    $alertParams = @{ WheelhousePath = $cfg.WheelhousePath }
+    foreach ($name in 'SmtpServer', 'MailTo', 'MailFrom') {
+        if ($PSBoundParameters.ContainsKey($name)) {
+            $alertParams[$name -replace '^Mail', ''] = $PSBoundParameters[$name]
+        }
+    }
+    $alertParams = Get-VulnerabilityAlertParameter -AuditResult $auditResults.ToArray() -AlertParameters $alertParams
+    $alertExitCode = 0
+    if ($null -ne $alertParams) {
+        if (Test-Path -Path $SendAlertScriptPath) {
+            & $SendAlertScriptPath @alertParams | Out-Host
+            $alertExitCode = $LASTEXITCODE
+            Write-Log "Send-VulnerabilityAlert.ps1 finished with exit code $alertExitCode."
+        }
+        else {
+            Write-Log "Send-VulnerabilityAlert.ps1 not found at: $SendAlertScriptPath - cannot send the alert." 'ERROR'
+            $alertExitCode = 1
+        }
+    }
+
+    if ($auditResults | Where-Object { $_.Status -ne 'Passed' }) {
+        $exitCode = 1
+        $outcome = 'findings or failed audits'
+    }
+    elseif ($alertExitCode -ne 0) {
+        $exitCode = $alertExitCode
     }
 }
-else {
-    Write-Log "All groups passed on all configured vulnerability services. No known vulnerabilities found." "OK"
+catch {
+    Write-Log $_.Exception.Message 'ERROR'
+    $exitCode = 1
+    $outcome = 'ABORTED'
+}
+finally {
+    Stop-WheelhouseRun -Title $title -Outcome $outcome
 }
 
-Write-Log "=== Wheelhouse audit-only check finished ==="
-Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
-
-if (-not $allAuditsPassed) { exit 1 }
-exit 0
+exit $exitCode
