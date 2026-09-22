@@ -4,8 +4,8 @@
     configuration and input files. Safe to re-run.
 
 .DESCRIPTION
-    Copies Jobs\ (functions.ps1, Update-Wheelhouse.ps1, Update-Requirement.ps1,
-    Send-VulnerabilityAlert.ps1) and Invoke-WheelhousePipeline.ps1 (deployed to the
+    Copies Jobs\ (the WheelhouseManager module, Update-Wheelhouse.ps1,
+    Update-Requirement.ps1, Test-Wheelhouse.ps1, Send-VulnerabilityAlert.ps1) and Invoke-WheelhousePipeline.ps1 (deployed to the
     destination root, not Jobs\) from next to this script into -DestinationPath,
     creates config\settings.psd1 if it doesn't exist yet, and creates an empty
     Input\requirements.in / Input\requirements.txt if they don't exist yet.
@@ -31,8 +31,7 @@
     .\Setup.ps1 -DestinationPath "D:\WheelHouseManager" -WheelhousePath "\\server\share\wheelhouse"
 
 .NOTES
-    Requires functions.ps1 (in Jobs\ next to this script) for Write-Log, Save-Settings,
-    Set-WheelhouseSetting, and Initialize-ManagerFile.
+    Requires the WheelhouseManager module (Jobs\WheelhouseManager next to this script).
 #>
 
 #Requires -Version 5.1
@@ -45,13 +44,8 @@ param(
     [string]$WheelhousePath
 )
 
-$sourceJobsPath = Join-Path $PSScriptRoot "Jobs"
-$commonPath = Join-Path $sourceJobsPath "functions.ps1"
-if (-not (Test-Path -Path $commonPath)) {
-    Write-Host "Required file not found: $commonPath" -ForegroundColor Red
-    exit 1
-}
-. $commonPath
+$sourceJobsPath = Join-Path $PSScriptRoot 'Jobs'
+Import-Module (Join-Path $sourceJobsPath 'WheelhouseManager') -ErrorAction Stop
 
 Write-Log "=== Wheelhouse manager setup started ==="
 Write-Log "Destination: $DestinationPath"
@@ -60,11 +54,32 @@ Write-Log "Destination: $DestinationPath"
 # Step 1: deploy Jobs\ (always refreshed - these are code, not user data)
 # ---------------------------------------------------------------------------
 
-$destJobsPath = Join-Path $DestinationPath "Jobs"
+$destJobsPath = Join-Path $DestinationPath 'Jobs'
 New-Item -ItemType Directory -Path $destJobsPath -Force | Out-Null
 
-Copy-Item -Path (Join-Path $sourceJobsPath "*.ps1") -Destination $destJobsPath -Force
-Write-Log "Deployed Jobs\ scripts to: $destJobsPath" "OK"
+# The scripts plus the WheelhouseManager module folder. The module folder is
+# replaced as a whole so function files removed from the package don't linger.
+$isSameFolder = [string]::Equals(
+    [System.IO.Path]::GetFullPath($sourceJobsPath).TrimEnd('\', '/'),
+    [System.IO.Path]::GetFullPath($destJobsPath).TrimEnd('\', '/'),
+    [System.StringComparison]::OrdinalIgnoreCase)
+if ($isSameFolder) {
+    Write-Log "Source and destination Jobs\ folders are the same - nothing to copy." "WARN"
+}
+else {
+    Copy-Item -Path (Join-Path $sourceJobsPath '*.ps1') -Destination $destJobsPath -Force
+    $destModulePath = Join-Path $destJobsPath 'WheelhouseManager'
+    if (Test-Path -Path $destModulePath) {
+        Remove-Item -Path $destModulePath -Recurse -Force
+    }
+    Copy-Item -Path (Join-Path $sourceJobsPath 'WheelhouseManager') -Destination $destJobsPath -Recurse -Force
+    # functions.ps1 was replaced by the WheelhouseManager module.
+    $legacyFunctionsPath = Join-Path $destJobsPath 'functions.ps1'
+    if (Test-Path -Path $legacyFunctionsPath) {
+        Remove-Item -Path $legacyFunctionsPath -Force
+    }
+}
+Write-Log "Deployed Jobs\ scripts and the WheelhouseManager module to: $destJobsPath" "OK"
 
 $sourceOrchestratorPath = Join-Path $PSScriptRoot "Invoke-WheelhousePipeline.ps1"
 if (Test-Path -Path $sourceOrchestratorPath) {
@@ -85,19 +100,8 @@ New-Item -ItemType Directory -Path $configPath -Force | Out-Null
 $settingsPath = Join-Path $configPath "settings.psd1"
 
 if (-not (Test-Path -Path $settingsPath)) {
-    $defaultSettings = @{
-        WheelhousePath         = ""
-        RequirementsInPath     = (Join-Path $inputPath "requirements.in")
-        LocalRequirementsPath  = (Join-Path $inputPath "requirements.txt")
-        PythonVersion           = "3.14"
-        Platform                = "win_amd64"
-        MinimumPackageAgeDays   = 10
-        VulnerabilityServices   = @("osv", "pypi")
-        SmtpServer              = ""
-        MailTo                  = "servicedesk@company.com"
-        MailFrom                = "NoReply@company.com"
-    }
-    Save-Settings -SettingsPath $settingsPath -Settings $defaultSettings
+    $defaultSettings = Get-WheelhouseDefaultSetting -ManagerRoot $DestinationPath
+    Save-WheelhouseSetting -SettingsPath $settingsPath -Settings $defaultSettings
     Write-Log "Created default settings file: $settingsPath" "OK"
 }
 else {
@@ -109,7 +113,7 @@ if (-not [string]::IsNullOrWhiteSpace($WheelhousePath)) {
     Write-Log "WheelhousePath set to: $WheelhousePath" "OK"
 }
 else {
-    $currentSettings = Get-WheelhouseSettings -SettingsPath $settingsPath
+    $currentSettings = Get-WheelhouseSetting -SettingsPath $settingsPath
     if ([string]::IsNullOrWhiteSpace($currentSettings["WheelhousePath"])) {
         Write-Log "No -WheelhousePath supplied and none is set yet in settings.psd1 - the other scripts will require it explicitly until this is set." "WARN"
     }
