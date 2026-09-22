@@ -59,7 +59,7 @@ param(
     [string]$SendAlertScriptPath = (Join-Path $PSScriptRoot "Send-VulnerabilityAlert.ps1")
 )
 
-$commonPath = Join-Path $PSScriptRoot "Wheelhouse-Common.ps1"
+$commonPath = Join-Path $PSScriptRoot "functions.ps1"
 if (-not (Test-Path -Path $commonPath)) {
     Write-Host "Required file not found: $commonPath" -ForegroundColor Red
     exit 1

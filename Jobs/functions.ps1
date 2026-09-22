@@ -5,7 +5,7 @@
 .DESCRIPTION
     Dot-sourced by Update-Wheelhouse.ps1, Send-VulnerabilityAlert.ps1, and
     Invoke-WheelhousePipeline.ps1:
-        . (Join-Path $PSScriptRoot "Wheelhouse-Common.ps1")
+        . (Join-Path $PSScriptRoot "functions.ps1")
     Must live in the same folder as the scripts that use it.
 
     Layout: a shared block used by more than one script, followed by one block

@@ -2,22 +2,39 @@
 
 This repository covers two related but separate parts of the same deployment:
 
-1. **Client-side uv installation** on non-persistent Windows VDI hosts (`UV_Installer.ps1` +
-   `Startup_UV.ps1`), which locks clients to a single, internal, audited package source.
-2. **Server-side wheelhouse automation** (`Wheelhouse-Common.ps1`, `Update-Wheelhouse.ps1`,
-   `Send-VulnerabilityAlert.ps1`, `Invoke-WheelhousePipeline.ps1`), which populates and audits
-   that internal package source (the "wheelhouse").
+1. **Client-side uv installation** on non-persistent Windows VDI hosts (`Client Install/`),
+   which locks clients to a single, internal, audited package source.
+2. **Server-side wheelhouse automation** (`Jobs/`), which populates and audits that internal
+   package source (the "wheelhouse").
+
+## Repository layout
+
+```
+Client Install/
+    UV_Installer.ps1       # Installs the uv binaries (Cetegra package)
+    Startup_UV.ps1          # Locks down uv configuration (GPO computer startup script)
+
+Jobs/
+    functions.ps1           # All shared/helper functions - dot-sourced by the three scripts below
+    Update-Wheelhouse.ps1    # Integrity check, audit, cooldown, download, manifest, Defender scan
+    Send-VulnerabilityAlert.ps1   # Parses audit reports, emails or saves an HTML alert
+    Invoke-WheelhousePipeline.ps1 # Orchestrator: runs the two scripts above in sequence
+```
+
+All four files in `Jobs/` must stay in the same folder - the three main scripts locate
+`functions.ps1` via `$PSScriptRoot`. The two files in `Client Install/` are deployed through
+different mechanisms (see section 1) and don't need to sit next to `Jobs/` on disk.
 
 ---
 
 ## 1. Installing uv on client machines
 
-Two scripts are involved, each with a different deployment mechanism.
+Two scripts are involved, from `Client Install/`, each with a different deployment mechanism.
 
-### 1.1 `UV_Installer.ps1` - installs the uv binaries
+### 1.1 `Client Install/UV_Installer.ps1` - installs the uv binaries
 
-Packaged as a  software deployment script (see the `.version` stamp file and
-`<AppVersion>` placeholder, which packaging tooling fills in at build time). It:
+Packaged as a Cetegra software deployment script (see the `.cetegra-version` stamp file and
+`<AppVersion>` placeholder, which Cetegra's packaging tooling fills in at build time). It:
 
 - Extracts `uv-x86_64-pc-windows-msvc.zip` (must sit next to the script) into
   `C:\Program Files\astral.sh\uv`.
@@ -27,10 +44,10 @@ Packaged as a  software deployment script (see the `.version` stamp file and
   work here because both locations are on the same volume.
 - Logs to `%WinDir%\Logs\Astral-uv-<version>_Script.txt`.
 
-Deploy this through software distribution tool your organization uses as
+Deploy this through Cetegra (or whichever software distribution tool your organization uses) as
 a standard application package targeting the VDI golden image or machine pool.
 
-### 1.2 `Startup_UV.ps1` - locks down configuration via Group Policy
+### 1.2 `Client Install/Startup_UV.ps1` - locks down configuration via Group Policy
 
 **This script runs as a Group Policy Computer Startup Script**, not as a login script or a
 manually-run tool. That placement matters:
@@ -64,11 +81,11 @@ backslashes are PowerShell/TOML escaping - keep that pattern, just change the pa
 
 ### GPO deployment steps
 
-1. Edit the wheelhouse path placeholder in `Startup_UV.ps1` (see above).
+1. Edit the wheelhouse path placeholder in `Client Install\Startup_UV.ps1` (see above).
 2. Open **Group Policy Management Console** and create or edit a GPO linked to the VDI OU.
 3. Navigate to **Computer Configuration → Policies → Windows Settings → Scripts (Startup/Shutdown) → Startup**.
 4. Add `Startup_UV.ps1` as a PowerShell Script (**PowerShell Scripts** tab, not the legacy Scripts tab).
-5. Ensure `UV_Installer.ps1` is deployed to the same machines - order doesn't
+5. Ensure `UV_Installer.ps1` (via Cetegra) is deployed to the same machines - order doesn't
    strictly matter between the two, since the startup script only configures environment/config
    and doesn't depend on `uv.exe` already existing, but both must be present before a user
    actually tries to run `uv`.
@@ -115,44 +132,45 @@ python -m pip install --upgrade uv pip-audit
 
 Wrap this in a scheduled maintenance task of its own if you want `uv`/`pip-audit` kept current
 automatically - the wheelhouse scripts already self-check and self-update `pip` and `pip-audit`
-on every run (see `Confirm-PythonAndTooling` in `Wheelhouse-Common.ps1`), but they don't
-currently self-update `uv` itself.
+on every run (see `Confirm-PythonAndTooling` in `Jobs\functions.ps1`), but they don't currently
+self-update `uv` itself.
 
 ---
 
 ## 3. Installing the wheelhouse script package
 
-Four files, and **all four must live in the same folder** (they locate each other via
-`$PSScriptRoot`):
+Everything in `Jobs/` - four files, and **all four must live in the same folder** (the three
+main scripts locate `functions.ps1` via `$PSScriptRoot`):
 
 ```
-Wheelhouse-Common.ps1
-Update-Wheelhouse.ps1
-Send-VulnerabilityAlert.ps1
-Invoke-WheelhousePipeline.ps1
+Jobs/
+    functions.ps1
+    Update-Wheelhouse.ps1
+    Send-VulnerabilityAlert.ps1
+    Invoke-WheelhousePipeline.ps1
 ```
 
 ### Manual installation
 
-1. Create a folder on the build server, e.g. `C:\WheelhouseScripts`.
-2. Copy all four `.ps1` files into it (drag-and-drop in Explorer, or however you normally
-   transfer files to this server).
+1. Create the folder on the build server, e.g. `C:\WheelhouseScripts\Jobs`.
+2. Copy all four `.ps1` files from `Jobs/` into it (drag-and-drop in Explorer, or however you
+   normally transfer files to this server).
 3. Unblock them if they were downloaded from the internet or copied from another machine:
    ```powershell
-   Get-ChildItem "C:\WheelhouseScripts\*.ps1" | Unblock-File
+   Get-ChildItem "C:\WheelhouseScripts\Jobs\*.ps1" | Unblock-File
    ```
 
 ### PowerShell installation
 
 ```powershell
-$destination = "C:\WheelhouseScripts"
+$destination = "C:\WheelhouseScripts\Jobs"
 New-Item -ItemType Directory -Path $destination -Force | Out-Null
 
 Copy-Item -Path @(
-    "Wheelhouse-Common.ps1",
-    "Update-Wheelhouse.ps1",
-    "Send-VulnerabilityAlert.ps1",
-    "Invoke-WheelhousePipeline.ps1"
+    "Jobs\functions.ps1",
+    "Jobs\Update-Wheelhouse.ps1",
+    "Jobs\Send-VulnerabilityAlert.ps1",
+    "Jobs\Invoke-WheelhousePipeline.ps1"
 ) -Destination $destination -Force
 
 Get-ChildItem "$destination\*.ps1" | Unblock-File
@@ -176,7 +194,7 @@ The recommended cadence is **weekly**, running `Invoke-WheelhousePipeline.ps1` (
    - Program/script: `powershell.exe`
    - Add arguments:
      ```
-     -NoProfile -ExecutionPolicy Bypass -File "C:\WheelhouseScripts\Invoke-WheelhousePipeline.ps1" -WheelhousePath "\\server\share\wheelhouse"
+     -NoProfile -ExecutionPolicy Bypass -File "C:\WheelhouseScripts\Jobs\Invoke-WheelhousePipeline.ps1" -WheelhousePath "\\server\share\wheelhouse"
      ```
 5. **Conditions** tab: uncheck "Start the task only if the computer is on AC power" if this is a
    server (usually irrelevant, but worth checking).
@@ -189,7 +207,7 @@ The recommended cadence is **weekly**, running `Invoke-WheelhousePipeline.ps1` (
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\WheelhouseScripts\Invoke-WheelhousePipeline.ps1" -WheelhousePath "\\server\share\wheelhouse"'
+    -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\WheelhouseScripts\Jobs\Invoke-WheelhousePipeline.ps1" -WheelhousePath "\\server\share\wheelhouse"'
 
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 2:00AM
 
@@ -214,7 +232,7 @@ These are **two different files with two different purposes** - don't confuse th
 | File | Contains | Who reads it |
 |---|---|---|
 | `requirements.in` | Unpinned package names (optionally with version ranges) | You, when resolving - never fed directly to the wheelhouse scripts |
-| `requirements.txt` | Exact pins (`name==version`), resolved from the `.in` file | Placed inside the wheelhouse root; read by `Update-Wheelhouse.ps1` |
+| `requirements.txt` | Exact pins (`name==version`), resolved from the `.in` file | Placed inside the wheelhouse root; read by `Jobs\Update-Wheelhouse.ps1` |
 
 ### Example `requirements.in`
 
@@ -280,7 +298,7 @@ while still running under the task's configured account/permissions and logging 
 ### Directly from the command line
 
 ```powershell
-cd C:\WheelhouseScripts
+cd C:\WheelhouseScripts\Jobs
 .\Invoke-WheelhousePipeline.ps1 -WheelhousePath "\\server\share\wheelhouse"
 ```
 
@@ -360,3 +378,21 @@ Same pipeline, unattended:
    whether to update `requirements.txt` to a fixed version (subject to the same cooldown policy,
    or with an explicit low `-MinimumPackageAgeDays` override for urgent cases), and re-runs the
    pipeline to pick up the fix.
+
+---
+
+## 8. Design note: `functions.ps1` and future scripts
+
+`Jobs\functions.ps1` currently holds every helper function used by the three main scripts,
+grouped by which script owns each one (see the block comments inside the file). Some of these
+functions are entirely generic - `Invoke-PipAudit`, `Get-RequirementsPackages`,
+`Confirm-PythonAndTooling`, `Read-PipAuditReport` - and don't depend on `manifest.json` or the
+wheelhouse concept at all. Others - `Save-Manifest`, `Test-ManifestIntegrity`,
+`Compare-RequirementsAgainstManifest` - are wheelhouse-specific.
+
+If a future script is added under `Jobs/` for a different purpose (e.g. scanning individual
+users' dev project folders for vulnerabilities), it can dot-source the same `functions.ps1` and
+use the generic functions directly, while ignoring the wheelhouse-specific ones. If `functions.ps1`
+grows large enough to be unwieldy, splitting it into a generic file and a wheelhouse-specific file
+(the latter dot-sourcing the former) is a straightforward follow-up - no logic changes needed,
+just reorganizing where each function lives.

@@ -19,7 +19,7 @@
     The manifest tracks every wheel file in the wheelhouse (direct + transitive dependencies),
     with SHA256 hash, package name/version, and target Python/platform tag per file.
 
-    Function definitions live in Wheelhouse-Common.ps1 (dot-sourced below) - this file
+    Function definitions live in functions.ps1 (dot-sourced below) - this file
     contains only the main script logic.
 
 .PARAMETER WheelhousePath
@@ -44,7 +44,7 @@
 
 .NOTES
     Start-MpScan (Defender scan) typically requires administrative privileges.
-    Requires Wheelhouse-Common.ps1 in the same folder as this script.
+    Requires functions.ps1 in the same folder as this script.
 #>
 
 param(
@@ -60,7 +60,7 @@ param(
     [string[]]$VulnerabilityServices = @("osv", "pypi")
 )
 
-$commonPath = Join-Path $PSScriptRoot "Wheelhouse-Common.ps1"
+$commonPath = Join-Path $PSScriptRoot "functions.ps1"
 if (-not (Test-Path -Path $commonPath)) {
     Write-Host "Required file not found: $commonPath" -ForegroundColor Red
     exit 1
