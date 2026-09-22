@@ -1,0 +1,68 @@
+name: PowerShell tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.shell == 'powershell' && 'Windows PowerShell 5.1' || 'PowerShell 7' }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show version
+        run: $PSVersionTable | Format-Table -AutoSize | Out-String
+
+      - name: Install Pester and PSScriptAnalyzer
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          if ($PSVersionTable.PSEdition -ne 'Core') {
+              Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          }
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Pester
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = './Tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
+      - name: Module loads and exports every function
+        run: |
+          Import-Module ./Jobs/WheelhouseManager -Force -ErrorAction Stop
+          $expected = (Import-PowerShellDataFile ./Jobs/WheelhouseManager/WheelhouseManager.psd1).FunctionsToExport
+          $actual = (Get-Command -Module WheelhouseManager).Name
+          $missing = $expected | Where-Object { $actual -notcontains $_ }
+          if ($missing) { throw "Not exported: $($missing -join ', ')" }
+          "Exported $($actual.Count) function(s)."
+
+      - name: Scripts parse
+        run: |
+          $failed = $false
+          Get-ChildItem -Path . -Recurse -Include *.ps1, *.psm1 | ForEach-Object {
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+              if ($errors) { $failed = $true; $errors | ForEach-Object { Write-Host "$($_.Extent.File):$($_.Extent.StartLineNumber) $($_.Message)" } }
+          }
+          if ($failed) { exit 1 }
+
+      - name: PSScriptAnalyzer
+        run: |
+          $paths = 'Jobs', 'Tests', 'Setup.ps1', 'Invoke-WheelhousePipeline.ps1'
+          $findings = $paths | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurse -Settings ./PSScriptAnalyzerSettings.psd1 -Severity Warning, Error }
+          $findings | Format-Table RuleName, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 200
+          if ($findings) { exit 1 }

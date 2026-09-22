@@ -30,7 +30,7 @@ Describe 'WheelhouseManager' {
 
     AfterAll {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
-        Remove-Variable -Name WhmMockExitCode, WhmMockReport -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -368,6 +368,24 @@ Describe 'WheelhouseManager' {
             $result = Invoke-PipAudit -RequirementsFilePath (Join-Path $reports 'requirements-1.txt') -ReportsFolder $reports -Stage 'Scheduled' -Service 'osv'
             $result.Status | Should -Be $Expected
             $result.Group | Should -Be 'requirements-1'
+        }
+    }
+
+    Context 'Confirm-PythonAndTooling' {
+        It 'upgrades only the tools that pip reports as outdated' {
+            # Regression: Windows PowerShell 5.1's ConvertFrom-Json emits a JSON array as one
+            # object; unflattened, every outdated package would look like "pip".
+            $global:WhmPipInstalls = [System.Collections.Generic.List[string]]::new()
+            Mock -ModuleName WheelhouseManager -CommandName python -MockWith {
+                $global:LASTEXITCODE = 0
+                if ($args -contains '--version') { return 'Python 3.14.0' }
+                if ($args -contains 'list') { return '[{"name": "requests", "version": "1.0", "latest_version": "2.0"}, {"name": "pip-audit", "version": "2.7", "latest_version": "2.8"}]' }
+                if ($args -contains 'install') { $global:WhmPipInstalls.Add($args[-1]) }
+            }
+
+            Confirm-PythonAndTooling
+
+            ($global:WhmPipInstalls -join ',') | Should -Be 'pip-audit'
         }
     }
 

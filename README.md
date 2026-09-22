@@ -417,6 +417,12 @@ Invoke-Pester -Path .\Tests
 Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
 ```
 
+The tests need Pester 5 (`Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck`)
+- the Pester 3.4 that ships with Windows can't run them. `.github/workflows/powershell-tests.yml`
+runs the tests, a parse check and PSScriptAnalyzer on every push, under **both Windows
+PowerShell 5.1 and PowerShell 7**; the scripts target 5.1 (keep source files ASCII - 5.1 reads
+BOM-less `.ps1` files as ANSI).
+
 A script run from inside a module function executes in the module's scope, which breaks the
 module's `$script:` variables - so module functions never invoke the `Jobs\*.ps1` scripts
 themselves (see `Get-VulnerabilityAlertParameter`: it builds the parameters, the calling script

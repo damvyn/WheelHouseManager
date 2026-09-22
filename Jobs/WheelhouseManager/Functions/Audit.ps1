@@ -24,7 +24,9 @@ function Confirm-PythonAndTooling {
     $outdatedJson = & python -m pip list --outdated --format=json 2>$null
     $outdated = @()
     if ($LASTEXITCODE -eq 0 -and $outdatedJson) {
-        $outdated = @($outdatedJson | ConvertFrom-Json)
+        # foreach (not @()) flattens the result on every version: Windows PowerShell 5.1's
+        # ConvertFrom-Json emits a JSON array as ONE object instead of enumerating it.
+        $outdated = @(foreach ($item in ($outdatedJson | ConvertFrom-Json)) { $item })
     }
     else {
         Write-Log 'Could not determine outdated packages (pip list --outdated failed). Continuing with the installed versions.' 'WARN'
@@ -303,6 +305,12 @@ function Test-PackageAge {
     $tooNew = [System.Collections.Generic.List[string]]::new()
     $results = [System.Collections.Generic.List[object]]::new()
     $nowUtc = (Get-Date).ToUniversalTime()
+
+    # Windows PowerShell 5.1 on older .NET Framework defaults to TLS 1.0/1.1, which
+    # pypi.org rejects - every age check would then fail closed.
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
 
     foreach ($name in ($Packages.Keys | Sort-Object)) {
         $version = $Packages[$name]
