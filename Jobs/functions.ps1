@@ -12,6 +12,8 @@
     per script containing only the functions that script uses.
 #>
 
+#Requires -Version 5.1
+
 # ---------------------------------------------------------------------------
 # Shared functions (used by all scripts)
 # ---------------------------------------------------------------------------
@@ -38,9 +40,277 @@ function Get-NormalizedPackageName {
     return ([regex]::Replace($Name, '[-_.]+', '-')).ToLower()
 }
 
+function Get-WheelhouseSettings {
+    # Reads config\settings.psd1. Returns an empty hashtable (not an error) if the
+    # file is missing or unreadable, so callers can fall back to their own defaults.
+    param([string]$SettingsPath)
+
+    if (-not (Test-Path -Path $SettingsPath)) {
+        return @{}
+    }
+    try {
+        return Import-PowerShellDataFile -Path $SettingsPath
+    }
+    catch {
+        Write-Log "Could not read settings file '$SettingsPath': $($_.Exception.Message)" "WARN"
+        return @{}
+    }
+}
+
+function Resolve-Setting {
+    # Precedence: explicit -Parameter (if the caller actually passed it) > value from
+    # settings.psd1 (if present and non-empty) > the script's own hardcoded fallback.
+    param(
+        [string]$Name,
+        $ExplicitValue,
+        [bool]$WasBound,
+        [hashtable]$Settings,
+        $FallbackDefault
+    )
+
+    if ($WasBound) { return $ExplicitValue }
+
+    if ($Settings.ContainsKey($Name)) {
+        $settingValue = $Settings[$Name]
+        $isEmpty = ($null -eq $settingValue) -or
+                   ($settingValue -is [string] -and [string]::IsNullOrWhiteSpace($settingValue)) -or
+                   ($settingValue -is [array] -and $settingValue.Count -eq 0)
+        if (-not $isEmpty) { return $settingValue }
+    }
+
+    return $FallbackDefault
+}
+
 # ---------------------------------------------------------------------------
 # Functions for Update-Wheelhouse.ps1
 # ---------------------------------------------------------------------------
+
+function Get-RequirementsGroupFiles {
+    # Returns paths to every requirements-N.txt in the wheelhouse root, sorted by N.
+    # The wheelhouse can hold several such files side by side specifically so that
+    # two different versions of the same package can coexist (different projects
+    # pin different versions) without violating requirements.txt's own rule that a
+    # package name can appear at most once per file.
+    param([string]$WheelhousePath)
+
+    $files = @(Get-ChildItem -Path $WheelhousePath -Filter "requirements-*.txt" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^requirements-(\d+)\.txt$' } |
+        Sort-Object { [int]([regex]::Match($_.Name, '\d+').Value) } |
+        Select-Object -ExpandProperty FullName)
+    Write-Output -NoEnumerate $files
+}
+
+function New-RequirementsGroupFile {
+    # Creates the next requirements-N.txt (N = current max + 1, or 1 if none exist yet).
+    param([string]$WheelhousePath)
+
+    $existing = @(Get-RequirementsGroupFiles -WheelhousePath $WheelhousePath)
+    $maxN = 0
+    foreach ($f in $existing) {
+        $n = [int]([regex]::Match((Split-Path -Path $f -Leaf), '\d+').Value)
+        if ($n -gt $maxN) { $maxN = $n }
+    }
+    $newPath = Join-Path $WheelhousePath "requirements-$($maxN + 1).txt"
+    New-Item -ItemType File -Path $newPath -Force | Out-Null
+    return $newPath
+}
+
+function Merge-LocalRequirements {
+    # Distributes each package from a local, already-approved requirements.txt into
+    # the wheelhouse's group files:
+    #   - name not present anywhere yet          -> add to the first group file
+    #   - name present with the SAME version      -> exact duplicate, skipped
+    #   - name present with a DIFFERENT version    -> added to a different group file
+    #                                                 that doesn't already have that
+    #                                                 name (a new group is created if
+    #                                                 every existing one already does)
+    # Rewrites every group file that changed. Returns a summary hashtable.
+    param(
+        [string]$LocalRequirementsPath,
+        [string]$WheelhousePath
+    )
+
+    $localPackages = Get-RequirementsPackages -FilePath $LocalRequirementsPath
+
+    $groupFiles = @(Get-RequirementsGroupFiles -WheelhousePath $WheelhousePath)
+    if ($groupFiles.Count -eq 0) {
+        $groupFiles = @(New-RequirementsGroupFile -WheelhousePath $WheelhousePath)
+        Write-Log "No existing group files in the wheelhouse - created: $($groupFiles[0])" "OK"
+    }
+
+    $groups = @{}
+    foreach ($gf in $groupFiles) {
+        $groups[$gf] = Get-RequirementsPackages -FilePath $gf
+    }
+
+    $added = 0
+    $skippedDuplicates = 0
+    $versionChanges = 0
+    $changedGroups = @{}
+
+    foreach ($name in $localPackages.Keys) {
+        $version = $localPackages[$name]
+
+        $existingGroup = $null
+        $existingVersion = $null
+        foreach ($gf in $groupFiles) {
+            if ($groups[$gf].ContainsKey($name)) {
+                $existingGroup = $gf
+                $existingVersion = $groups[$gf][$name]
+                break
+            }
+        }
+
+        if ($null -eq $existingGroup) {
+            $targetGroup = $groupFiles[0]
+            $groups[$targetGroup][$name] = $version
+            $changedGroups[$targetGroup] = $true
+            Write-Log "New package: $name==$version -> $(Split-Path -Path $targetGroup -Leaf)" "OK"
+            $added++
+            continue
+        }
+
+        if ($existingVersion -eq $version) {
+            Write-Log "Duplicate (already present, skipped): $name==$version" "WARN"
+            $skippedDuplicates++
+            continue
+        }
+
+        $targetGroup = $null
+        foreach ($gf in $groupFiles) {
+            if (-not $groups[$gf].ContainsKey($name)) {
+                $targetGroup = $gf
+                break
+            }
+        }
+        if ($null -eq $targetGroup) {
+            $targetGroup = New-RequirementsGroupFile -WheelhousePath $WheelhousePath
+            $groupFiles += $targetGroup
+            $groups[$targetGroup] = @{}
+            Write-Log "Every existing group already has '$name' - created: $(Split-Path -Path $targetGroup -Leaf)" "OK"
+        }
+        $groups[$targetGroup][$name] = $version
+        $changedGroups[$targetGroup] = $true
+        Write-Log "Version change: $name ($existingVersion already in $(Split-Path -Path $existingGroup -Leaf)) -> adding $version to $(Split-Path -Path $targetGroup -Leaf)" "WARN"
+        $versionChanges++
+    }
+
+    foreach ($gf in $changedGroups.Keys) {
+        $lines = $groups[$gf].Keys | Sort-Object | ForEach-Object { "$_==$($groups[$gf][$_])" }
+        $lines -join "`r`n" | Out-File -FilePath $gf -Encoding utf8
+    }
+
+    Write-Log "Merge summary: $added new, $skippedDuplicates duplicate(s) skipped, $versionChanges version change(s)." "OK"
+    return @{
+        Added          = $added
+        Skipped        = $skippedDuplicates
+        VersionChanges = $versionChanges
+        GroupFiles     = $groupFiles
+    }
+}
+
+function Get-WheelhouseRequirementGroups {
+    # Returns the wheelhouse's group requirement files (requirements-1.txt, -2.txt, ...),
+    # sorted by group number. Falls back to a legacy single requirements.txt (treated as
+    # the sole group) if no numbered group files exist yet, for backward compatibility
+    # with wheelhouses populated before group files existed.
+    param([string]$WheelhousePath)
+
+    $numbered = @(Get-ChildItem -Path $WheelhousePath -Filter "requirements-*.txt" -File -ErrorAction SilentlyContinue |
+        Sort-Object { [int]([regex]::Match($_.Name, '\d+').Value) })
+    if ($numbered.Count -gt 0) {
+        Write-Output -NoEnumerate @($numbered | ForEach-Object { $_.FullName })
+        return
+    }
+
+    $legacy = Join-Path $WheelhousePath "requirements.txt"
+    if (Test-Path -Path $legacy) {
+        Write-Output -NoEnumerate @($legacy)
+        return
+    }
+    Write-Output -NoEnumerate @()
+}
+
+function Merge-LocalRequirements {
+    # Decides where each locally-requested package/version belongs among the existing
+    # group files: skip if an identical name==version is already present anywhere
+    # (duplicate); otherwise place it in the first group that doesn't already use that
+    # package name; if every existing group already has that name pinned to a DIFFERENT
+    # version, start a new group file - group files never contain two versions of the
+    # same package (pip's own requirements format can't express that).
+    param(
+        [hashtable]$LocalPackages,
+        [string[]]$GroupFiles,
+        [string]$WheelhousePath
+    )
+
+    $groupPackages = @()
+    foreach ($file in $GroupFiles) {
+        $groupPackages += , (Get-RequirementsPackages -FilePath $file)
+    }
+
+    $duplicates = @()
+    $additions = @()
+
+    foreach ($name in $LocalPackages.Keys) {
+        $version = $LocalPackages[$name]
+        $handled = $false
+
+        for ($i = 0; $i -lt $groupPackages.Count; $i++) {
+            if ($groupPackages[$i].ContainsKey($name) -and $groupPackages[$i][$name] -eq $version) {
+                $duplicates += "$name==$version (already in $(Split-Path -Path $GroupFiles[$i] -Leaf))"
+                $handled = $true
+                break
+            }
+        }
+        if ($handled) { continue }
+
+        for ($i = 0; $i -lt $groupPackages.Count; $i++) {
+            if (-not $groupPackages[$i].ContainsKey($name)) {
+                $additions += [PSCustomObject]@{
+                    Name       = $name
+                    Version    = $version
+                    GroupFile  = $GroupFiles[$i]
+                    IsNewGroup = $false
+                }
+                $groupPackages[$i][$name] = $version
+                $handled = $true
+                break
+            }
+        }
+        if ($handled) { continue }
+
+        $newGroupIndex = $groupPackages.Count + 1
+        $newGroupFile = Join-Path $WheelhousePath "requirements-$newGroupIndex.txt"
+        $additions += [PSCustomObject]@{
+            Name       = $name
+            Version    = $version
+            GroupFile  = $newGroupFile
+            IsNewGroup = $true
+        }
+        $groupPackages += @{ $name = $version }
+        $GroupFiles += $newGroupFile
+    }
+
+    return @{ Additions = $additions; Duplicates = $duplicates }
+}
+
+function Add-RequirementToGroupFile {
+    # Creates the group file (new group) or appends a line to an existing one.
+    param(
+        [string]$GroupFile,
+        [string]$Name,
+        [string]$Version,
+        [bool]$IsNewGroup
+    )
+
+    if ($IsNewGroup -or -not (Test-Path -Path $GroupFile)) {
+        Set-Content -Path $GroupFile -Value "$Name==$Version" -Encoding utf8
+    }
+    else {
+        Add-Content -Path $GroupFile -Value "$Name==$Version" -Encoding utf8
+    }
+}
 
 function Get-RequirementsPackages {
     # Parses a requirements.txt file. Only exact pins ("name==version") are supported.
@@ -118,7 +388,13 @@ function Test-ManifestIntegrity {
             $problems += "$($entry.name)==$($entry.version): recorded file '$fileValue' is missing from the wheelhouse."
             continue
         }
-        $currentHash = (Get-FileHash -Path $filePath -Algorithm SHA256).Hash
+        try {
+            $currentHash = (Get-FileHash -Path $filePath -Algorithm SHA256 -ErrorAction Stop).Hash
+        }
+        catch {
+            $problems += "$($entry.name)==$($entry.version): could not read '$fileValue' to verify its hash ($($_.Exception.Message))."
+            continue
+        }
         if ($currentHash -ne $entry.sha256) {
             $problems += "$($entry.name)==$($entry.version): file '$fileValue' hash MISMATCH (expected $($entry.sha256), got $currentHash)."
         }
@@ -341,7 +617,7 @@ function Get-ServiceNameFromReportPath {
     return "Unknown"
 }
 
-function Read-PipAuditReport {
+function Get-PipAuditReport {
     # Returns an array of dependency objects ({name, version, vulns:[...]})
     # regardless of whether the JSON root is a flat array (older pip-audit)
     # or an object with a "dependencies" property (newer pip-audit).
@@ -421,3 +697,71 @@ function ConvertTo-HtmlSafe {
 # Functions for Invoke-WheelhousePipeline.ps1
 # ---------------------------------------------------------------------------
 # (none yet - this script currently only uses the shared block above)
+
+# ---------------------------------------------------------------------------
+# Functions for Setup.ps1
+# ---------------------------------------------------------------------------
+
+function Save-Settings {
+    # Hand-rolled psd1 writer - kept deliberately simple since the schema is a
+    # small, fixed set of strings/ints/string-arrays. Overwrites the whole file
+    # with the given hashtable (callers merge first via Set-WheelhouseSetting).
+    param(
+        [string]$SettingsPath,
+        [hashtable]$Settings
+    )
+
+    $lines = @('@{')
+    foreach ($key in $Settings.Keys) {
+        $value = $Settings[$key]
+        if ($value -is [array]) {
+            $quoted = ($value | ForEach-Object { "'$_'" }) -join ', '
+            $lines += "    $key = @($quoted)"
+        }
+        elseif ($value -is [int]) {
+            $lines += "    $key = $value"
+        }
+        else {
+            $lines += "    $key = '$value'"
+        }
+    }
+    $lines += '}'
+    $lines -join "`r`n" | Out-File -FilePath $SettingsPath -Encoding utf8
+}
+
+function Set-WheelhouseSetting {
+    # Merges the given key/value pairs into the existing settings.psd1 (creating it
+    # if absent) without touching any key the caller didn't ask to change.
+    param(
+        [string]$SettingsPath,
+        [hashtable]$Updates
+    )
+
+    $current = if (Test-Path -Path $SettingsPath) {
+        try { Import-PowerShellDataFile -Path $SettingsPath }
+        catch { @{} }
+    }
+    else { @{} }
+
+    foreach ($key in $Updates.Keys) {
+        $current[$key] = $Updates[$key]
+    }
+    Save-Settings -SettingsPath $SettingsPath -Settings $current
+}
+
+function Initialize-ManagerFile {
+    # Idempotent: never overwrites a file that already exists, so a re-run of
+    # Setup.ps1 never clobbers a requirements.in someone is actively editing.
+    param(
+        [string]$Path,
+        [string]$DefaultContent = ""
+    )
+
+    if (Test-Path -Path $Path) {
+        Write-Log "Already exists, leaving untouched: $Path"
+        return
+    }
+    Set-Content -Path $Path -Value $DefaultContent -Encoding utf8
+    Write-Log "Created: $Path" "OK"
+}
+

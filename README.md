@@ -1,35 +1,41 @@
 # Wheelhouse Automation - README
 
-This repository covers two related but separate parts of the same deployment:
+This project has two independent parts:
 
 1. **Client-side uv installation** on non-persistent Windows VDI hosts (`Client Install/`),
    which locks clients to a single, internal, audited package source.
-2. **Server-side wheelhouse automation** (`Jobs/`), which populates and audits that internal
-   package source (the "wheelhouse").
+2. **Wheelhouse Manager** (`Setup.ps1`, `Invoke-WheelhousePipeline.ps1`, `Jobs/`), which
+   prepares, approves, populates, and continuously audits that internal package source
+   (the "wheelhouse").
 
 ## Repository layout
 
 ```
 Client Install/
-    UV_Installer.ps1       # Installs the uv binaries (Cetegra package)
-    Startup_UV.ps1          # Locks down uv configuration (GPO computer startup script)
+    UV_Installer.ps1              # Installs the uv binaries (Cetegra package)
+    Startup_UV.ps1                 # Locks down uv configuration (GPO computer startup script)
+
+Setup.ps1                          # Deploys the manager to a local folder (run once, safe to re-run)
+Invoke-WheelhousePipeline.ps1      # Orchestrator: Update-Wheelhouse.ps1 + Send-VulnerabilityAlert.ps1
 
 Jobs/
-    functions.ps1           # All shared/helper functions - dot-sourced by the three scripts below
-    Update-Wheelhouse.ps1    # Integrity check, audit, cooldown, download, manifest, Defender scan
-    Send-VulnerabilityAlert.ps1   # Parses audit reports, emails or saves an HTML alert
-    Invoke-WheelhousePipeline.ps1 # Orchestrator: runs the two scripts above in sequence
+    functions.ps1                  # All shared/helper functions - dot-sourced by every script below
+    Update-Requirement.ps1         # Resolves Input\requirements.in -> Input\requirements.txt
+    Update-Wheelhouse.ps1          # Merge (opt-in) + per-group audit/cooldown/download/manifest/Defender
+    Test-Wheelhouse.ps1            # Audit-only check - this is what the Scheduled Task runs
+    Send-VulnerabilityAlert.ps1    # Parses audit reports, emails or saves an HTML alert
 ```
 
-All four files in `Jobs/` must stay in the same folder - the three main scripts locate
-`functions.ps1` via `$PSScriptRoot`. The two files in `Client Install/` are deployed through
-different mechanisms (see section 1) and don't need to sit next to `Jobs/` on disk.
+`Setup.ps1` and `Invoke-WheelhousePipeline.ps1` live at the project root; everything in
+`Jobs/` must stay together in one folder (they locate `functions.ps1` and each other via
+`$PSScriptRoot`). The two files in `Client Install/` are deployed through a different
+mechanism entirely (see section 1) and are unrelated to the manager's own folder layout.
 
 ---
 
 ## 1. Installing uv on client machines
 
-Two scripts are involved, from `Client Install/`, each with a different deployment mechanism.
+Two scripts, from `Client Install/`, each with a different deployment mechanism.
 
 ### 1.1 `Client Install/UV_Installer.ps1` - installs the uv binaries
 
@@ -44,20 +50,18 @@ Packaged as a Cetegra software deployment script (see the `.cetegra-version` sta
   work here because both locations are on the same volume.
 - Logs to `%WinDir%\Logs\Astral-uv-<version>_Script.txt`.
 
-Deploy this through Cetegra (or whichever software distribution tool your organization uses) as
-a standard application package targeting the VDI golden image or machine pool.
+Deploy this through Cetegra as a standard application package targeting the VDI golden image
+or machine pool.
 
 ### 1.2 `Client Install/Startup_UV.ps1` - locks down configuration via Group Policy
 
-**This script runs as a Group Policy Computer Startup Script**, not as a login script or a
-manually-run tool. That placement matters:
+**Runs as a Group Policy Computer Startup Script**, not a login script or a manually-run tool:
 
 - Computer startup scripts run as **SYSTEM**, at boot, **before any user logs on** - so the
   environment variables and `uv.toml` are guaranteed to be in place before any user session ever
   touches `uv`.
-- Because it's a *machine* policy (not a per-user one), a standard user cannot override it by
-  setting their own environment variables or editing their own `uv.toml` - `Startup_UV.ps1`
-  writes to `%ProgramData%\uv\uv.toml`, which ordinary users can't modify.
+- Because it's a *machine* policy, a standard user cannot override it - `Startup_UV.ps1` writes
+  to `%ProgramData%\uv\uv.toml`, which ordinary users can't modify.
 
 What it sets, all at machine scope:
 
@@ -65,7 +69,7 @@ What it sets, all at machine scope:
 |---|---|---|
 | `UV_PYTHON_DOWNLOADS` | `never` | Blocks `uv python install` from ever downloading a Python interpreter |
 | `UV_PYTHON_PREFERENCE` | `only-system` | Never resolve to a uv-managed Python; only pre-installed interpreters |
-| `UV_LINK_MODE` | `copy` | Cache and target venv are on different filesystems (local cache vs. FSLogix/network profile), so hardlinking isn't possible anyway |
+| `UV_LINK_MODE` | `copy` | Cache and target venv are on different filesystems (local cache vs. FSLogix/network profile) |
 | `UV_CACHE_DIR` | `C:\uv-cache` | Local, ephemeral cache (not on the roaming/FSLogix profile) |
 | `UV_NO_INDEX` | `true` | Blocks the default PyPI index entirely |
 | `%ProgramData%\uv\uv.toml` | flat index pointing at the wheelhouse | The **only** package source clients can use |
@@ -76,20 +80,16 @@ What it sets, all at machine scope:
 'url = "\\\\server\\pathToWheelHouse"',
 ```
 
-Replace `\\server\pathToWheelHouse` with your actual wheelhouse UNC path (the quadrupled
-backslashes are PowerShell/TOML escaping - keep that pattern, just change the path itself).
+Replace `\\server\pathToWheelHouse` with your actual wheelhouse UNC path.
 
 ### GPO deployment steps
 
-1. Edit the wheelhouse path placeholder in `Client Install\Startup_UV.ps1` (see above).
-2. Open **Group Policy Management Console** and create or edit a GPO linked to the VDI OU.
-3. Navigate to **Computer Configuration → Policies → Windows Settings → Scripts (Startup/Shutdown) → Startup**.
-4. Add `Startup_UV.ps1` as a PowerShell Script (**PowerShell Scripts** tab, not the legacy Scripts tab).
-5. Ensure `UV_Installer.ps1` (via Cetegra) is deployed to the same machines - order doesn't
-   strictly matter between the two, since the startup script only configures environment/config
-   and doesn't depend on `uv.exe` already existing, but both must be present before a user
-   actually tries to run `uv`.
-6. Run `gpupdate /force` on a test machine (or reboot it) and confirm:
+1. Edit the wheelhouse path placeholder in `Client Install\Startup_UV.ps1`.
+2. Open **Group Policy Management Console**, create or edit a GPO linked to the VDI OU.
+3. **Computer Configuration → Policies → Windows Settings → Scripts (Startup/Shutdown) → Startup**,
+   add `Startup_UV.ps1` under the **PowerShell Scripts** tab.
+4. Ensure `UV_Installer.ps1` (via Cetegra) is deployed to the same machines.
+5. Run `gpupdate /force` on a test machine (or reboot it) and confirm:
    ```powershell
    Test-Path "C:\Windows\System32\uv.exe"
    $env:UV_NO_INDEX
@@ -100,299 +100,247 @@ backslashes are PowerShell/TOML escaping - keep that pattern, just change the pa
 
 ## 2. Installing dependencies on the build server
 
-The build server (separate from the VDI clients - this is the machine that populates the
-wheelhouse) needs Python, pip, uv (as a resolver only), and pip-audit.
-
-### Manual installation
-
-1. Download and run the Python installer from [python.org](https://www.python.org/downloads/)
-   (check "Add python.exe to PATH" during setup).
-2. Open a new PowerShell window and confirm:
-   ```powershell
-   python --version
-   ```
-3. Install `uv` and `pip-audit` via pip:
-   ```powershell
-   python -m pip install --upgrade pip
-   python -m pip install uv pip-audit
-   ```
-4. Confirm:
-   ```powershell
-   uv --version
-   pip-audit --version
-   ```
-
-### PowerShell (scripted) installation
+The build server (separate from the VDI clients) needs Python, pip, uv (as a resolver only),
+and pip-audit.
 
 ```powershell
-# Assumes Python is already installed and on PATH; installs/updates the rest
 python -m pip install --upgrade pip
 python -m pip install --upgrade uv pip-audit
 ```
 
-Wrap this in a scheduled maintenance task of its own if you want `uv`/`pip-audit` kept current
-automatically - the wheelhouse scripts already self-check and self-update `pip` and `pip-audit`
-on every run (see `Confirm-PythonAndTooling` in `Jobs\functions.ps1`), but they don't currently
-self-update `uv` itself.
+Confirm: `python --version`, `uv --version`, `pip-audit --version`.
+
+The wheelhouse scripts self-check and self-update `pip` and `pip-audit` on every run (see
+`Confirm-PythonAndTooling` in `Jobs\functions.ps1`), but don't self-update `uv`.
 
 ---
 
-## 3. Installing the wheelhouse script package
+## 3. Deploying the manager - `Setup.ps1`
 
-Everything in `Jobs/` - four files, and **all four must live in the same folder** (the three
-main scripts locate `functions.ps1` via `$PSScriptRoot`):
+Run once to deploy everything into a working folder, and again any time you want to redeploy
+an updated script package. **Idempotent**: always refreshes the code in `Jobs\` and the root
+scripts, but never touches your `config\settings.psd1` values or your `Input\requirements.in`/
+`.txt` - those are your data, not code.
+
+```powershell
+.\Setup.ps1 -WheelhousePath "\\server\share\wheelhouse"
+```
+
+```powershell
+# Custom destination folder (default is C:\WheelHouseManager)
+.\Setup.ps1 -DestinationPath "D:\WheelHouseManager" -WheelhousePath "\\server\share\wheelhouse"
+```
+
+Result:
 
 ```
-Jobs/
-    functions.ps1
-    Update-Wheelhouse.ps1
-    Send-VulnerabilityAlert.ps1
+C:\WheelHouseManager\
+    config\
+        settings.psd1
+    Input\
+        requirements.in
+        requirements.txt
+    Jobs\
+        functions.ps1
+        Update-Requirement.ps1
+        Update-Wheelhouse.ps1
+        Test-Wheelhouse.ps1
+        Send-VulnerabilityAlert.ps1
     Invoke-WheelhousePipeline.ps1
 ```
 
-### Manual installation
+### `config\settings.psd1`
 
-1. Create the folder on the build server, e.g. `C:\WheelhouseScripts\Jobs`.
-2. Copy all four `.ps1` files from `Jobs/` into it (drag-and-drop in Explorer, or however you
-   normally transfer files to this server).
-3. Unblock them if they were downloaded from the internet or copied from another machine:
-   ```powershell
-   Get-ChildItem "C:\WheelhouseScripts\Jobs\*.ps1" | Unblock-File
-   ```
-
-### PowerShell installation
+Every script's optional parameters fall back to this file if not passed explicitly, so you
+don't need to repeat `-WheelhousePath` (or anything else) on every call.
 
 ```powershell
-$destination = "C:\WheelhouseScripts\Jobs"
-New-Item -ItemType Directory -Path $destination -Force | Out-Null
-
-Copy-Item -Path @(
-    "Jobs\functions.ps1",
-    "Jobs\Update-Wheelhouse.ps1",
-    "Jobs\Send-VulnerabilityAlert.ps1",
-    "Jobs\Invoke-WheelhousePipeline.ps1"
-) -Destination $destination -Force
-
-Get-ChildItem "$destination\*.ps1" | Unblock-File
+@{
+    WheelhousePath        = '\\server\share\wheelhouse'
+    PythonVersion          = '3.14'
+    Platform                = 'win_amd64'
+    MinimumPackageAgeDays   = 10
+    VulnerabilityServices   = @('osv', 'pypi')
+    SmtpServer              = ''
+    MailTo                  = 'servicedesk@company.com'
+    MailFrom                = 'NoReply@company.com'
+}
 ```
+
+Precedence everywhere: **explicit `-Parameter`** > **this file** > **the script's own hardcoded
+fallback**. Edit it directly, or let `Setup.ps1 -WheelhousePath ...` update just that one key
+without touching the rest.
 
 ---
 
-## 4. Creating the Scheduled Task
+## 4. Preparing packages - `Update-Requirement.ps1`
 
-The recommended cadence is **weekly**, running `Invoke-WheelhousePipeline.ps1` (which chains
-`Update-Wheelhouse.ps1` and, when needed, `Send-VulnerabilityAlert.ps1` automatically).
+Edit `Input\requirements.in` (unpinned names, or version ranges), then resolve it:
+
+```powershell
+cd C:\WheelHouseManager\Jobs
+.\Update-Requirement.ps1
+```
+
+Defaults to `Input\requirements.in` / `Input\requirements.txt` under the manager root, and to
+the `PythonVersion`/`MinimumPackageAgeDays` from `settings.psd1`. Internally runs:
+
+```powershell
+uv pip compile Input\requirements.in --exclude-newer "10 days" --python 3.14 -o Input\requirements.txt
+```
+
+Review the resulting `Input\requirements.txt` and get it approved before the next step.
+
+---
+
+## 5. Merging into the wheelhouse - `Update-Wheelhouse.ps1`
+
+**Manual, deliberate action** - taken after `Input\requirements.txt` is approved. Never runs
+unattended (see section 6 for what the Scheduled Task actually runs instead).
+
+```powershell
+cd C:\WheelHouseManager\Jobs
+.\Update-Wheelhouse.ps1 -LocalRequirementsPath "C:\WheelHouseManager\Input\requirements.txt"
+```
+
+### Why "merge" instead of "replace"
+
+The wheelhouse can hold **multiple versions of the same package** side by side - one user's
+project may need `numpy==2.5.3`, another's `numpy==1.26.4`. Since a single `requirements.txt`
+can't contain two versions of the same package name, the wheelhouse instead holds several
+**group files**: `requirements-1.txt`, `requirements-2.txt`, etc. Merging decides, per package:
+
+| Situation | Result |
+|---|---|
+| Exact duplicate (same name==version already present anywhere) | Skipped, logged |
+| New package name | Added to the first group that doesn't already use that name |
+| Same name, different version, already used everywhere | A brand-new group file is created |
+
+`-LocalRequirementsPath` is **opt-in with no default** - omit it and the script just processes
+the wheelhouse's existing group files as-is, without merging anything.
+
+### What it does, in order
+
+1. Integrity check (SHA256 vs. `manifest.json`) - stops immediately on any mismatch.
+2. Merge (only if `-LocalRequirementsPath` was passed).
+3. For **each** group file: compare against the manifest, audit (OSV + PyPI), cooldown check
+   on new/changed packages, conditional download.
+4. One manifest rebuild covering every group's downloads (direct + transitive dependencies).
+5. One Microsoft Defender scan of the whole wheelhouse folder.
+
+---
+
+## 6. Scheduled Task - `Test-Wheelhouse.ps1`
+
+**This, not `Update-Wheelhouse.ps1`, is what the Scheduled Task runs.** It only detects and
+alerts - no merge, no download, no manifest changes, no Defender scan - so it's safe to leave
+completely unattended on a schedule without risking a silent merge of an unapproved
+`Input\requirements.in` edit.
+
+### What it does
+
+1. Integrity check (same as above) - aborts on mismatch.
+2. Runs `pip-audit` against **every** group file, on every configured vulnerability service.
+3. If anything is found, calls `Send-VulnerabilityAlert.ps1` once with every failing report.
 
 ### Manual setup (Task Scheduler GUI)
 
-1. Open **Task Scheduler** → **Create Task** (not "Create Basic Task" - you need the extra tabs).
-2. **General** tab: name it (e.g. `Wheelhouse Weekly Maintenance`), select **Run whether user is
-   logged on or not**, and **Run with highest privileges** (required for the Microsoft Defender
-   scan step).
-3. **Triggers** tab → **New** → Weekly, pick a day/time (e.g. Sunday 02:00).
-4. **Actions** tab → **New** → **Start a program**:
+1. **Create Task** (not "Create Basic Task").
+2. **General**: name it, **Run whether user is logged on or not**.
+3. **Triggers**: Weekly, e.g. Sunday 02:00.
+4. **Actions** → **Start a program**:
    - Program/script: `powershell.exe`
-   - Add arguments:
+   - Arguments:
      ```
-     -NoProfile -ExecutionPolicy Bypass -File "C:\WheelhouseScripts\Jobs\Invoke-WheelhousePipeline.ps1" -WheelhousePath "\\server\share\wheelhouse"
+     -NoProfile -ExecutionPolicy Bypass -File "C:\WheelHouseManager\Jobs\Test-Wheelhouse.ps1"
      ```
-5. **Conditions** tab: uncheck "Start the task only if the computer is on AC power" if this is a
-   server (usually irrelevant, but worth checking).
-6. **Settings** tab: check "Run task as soon as possible after a scheduled start is missed" so a
-   missed week (server down, etc.) still catches up.
-7. Save, entering credentials for an account with local admin rights on this server (needed for
-   `Start-MpScan`).
+   (No `-WheelhousePath` needed if `config\settings.psd1` already has it.)
+5. **Settings**: check "Run task as soon as possible after a scheduled start is missed".
+6. Save with an account that has whatever rights `pip-audit`/network access to the wheelhouse
+   requires (no admin rights needed here, unlike a Defender scan - `Test-Wheelhouse.ps1` never
+   runs one).
 
 ### PowerShell setup
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\WheelhouseScripts\Jobs\Invoke-WheelhousePipeline.ps1" -WheelhousePath "\\server\share\wheelhouse"'
-
+    -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\WheelHouseManager\Jobs\Test-Wheelhouse.ps1"'
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 2:00AM
-
-$principal = New-ScheduledTaskPrincipal -UserId "DOMAIN\svc-wheelhouse" -LogonType Password -RunLevel Highest
-
+$principal = New-ScheduledTaskPrincipal -UserId "DOMAIN\svc-wheelhouse" -LogonType Password
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
 
-Register-ScheduledTask -TaskName "Wheelhouse Weekly Maintenance" `
+Register-ScheduledTask -TaskName "Wheelhouse Weekly Audit" `
     -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-    -Description "Weekly wheelhouse audit, cooldown check, download, and vulnerability alert."
+    -Description "Weekly wheelhouse integrity check and vulnerability audit, alerting on findings."
 ```
-
-You'll be prompted for the service account's password when registering with `-LogonType
-Password`. The account needs local admin rights on this server for the Defender scan step.
 
 ---
 
-## 5. Using `requirements.in` and `requirements.txt`
-
-These are **two different files with two different purposes** - don't confuse them.
-
-| File | Contains | Who reads it |
-|---|---|---|
-| `requirements.in` | Unpinned package names (optionally with version ranges) | You, when resolving - never fed directly to the wheelhouse scripts |
-| `requirements.txt` | Exact pins (`name==version`), resolved from the `.in` file | Placed inside the wheelhouse root; read by `Jobs\Update-Wheelhouse.ps1` |
-
-### Example `requirements.in`
-
-```
-numpy
-pandas
-scipy
-pyyaml
-jupyter
-```
-
-### Resolving it into `requirements.txt`
-
-Run this on the build server, using `uv` purely as a resolver (nothing gets installed locally):
+## 7. Manual runs, end to end
 
 ```powershell
-uv pip compile requirements.in `
-    --exclude-newer "10 days" `
-    --python 3.14 `
-    -o requirements.txt
+cd C:\WheelHouseManager\Jobs
+
+# 1. Edit Input\requirements.in, then resolve it
+.\Update-Requirement.ps1
+
+# 2. Review/approve Input\requirements.txt, then merge + process
+.\Update-Wheelhouse.ps1 -LocalRequirementsPath "C:\WheelHouseManager\Input\requirements.txt"
+
+# Optional: run just the audit + alert combo on demand, same as the Scheduled Task
+.\Test-Wheelhouse.ps1
+
+# Optional: run Update-Wheelhouse.ps1 AND automatically alert on whatever it finds, in one call
+cd C:\WheelHouseManager
+.\Invoke-WheelhousePipeline.ps1
 ```
 
-- `--exclude-newer "10 days"` enforces the cooldown policy at resolution time - only versions
-  published more than 10 days ago are even considered candidates.
-- `--python 3.14` targets the same Python version the wheelhouse itself is standardized on
-  (**major.minor only** - never a full patch version like `3.14.7`, since wheel compatibility
-  tags don't encode the patch level).
-
-### Example resulting `requirements.txt`
-
-```
-numpy==2.5.3
-pandas==3.0.5
-scipy==1.18.1
-pyyaml==6.0.3
-jupyter==1.1.1
-```
-
-### Where it goes
-
-```powershell
-Copy-Item requirements.txt "\\server\share\wheelhouse\requirements.txt"
-```
-
-`Update-Wheelhouse.ps1` always reads `requirements.txt` from inside the wheelhouse root - it
-never looks at `requirements.in`, which exists purely as your own working/source file.
+`Invoke-WheelhousePipeline.ps1` auto-discovers whatever `Report_*-OSV_*.json` /
+`Report_*-PYPI_*.json` files `Update-Wheelhouse.ps1` just wrote (by timestamp) and feeds them
+into `Send-VulnerabilityAlert.ps1` automatically - it does **not** take a
+`-LocalRequirementsPath` parameter itself; if you need to merge, run `Update-Wheelhouse.ps1`
+directly with that parameter instead.
 
 ---
 
-## 6. Manual run
+## 8. What happens when a vulnerability is detected
 
-You can trigger the exact same pipeline the scheduled task uses, in two ways:
+1. The relevant `pip-audit` step exits non-zero; findings are written to
+   `Report_<...>-<group>-<OSV|PYPI>_<timestamp>.json`.
+2. **During `Update-Wheelhouse.ps1`'s per-group processing**: that group's download is skipped
+   entirely - nothing vulnerable is ever added to the wheelhouse.
+3. **During `Test-Wheelhouse.ps1`'s scheduled check**: nothing is downloaded or removed (it
+   never downloads anything at all) - this is purely detection.
+4. Either way, `pip-audit --fix --dry-run` output is captured too (suggested safe versions,
+   informational only - never applied automatically, since that would bypass the cooldown
+   policy and change a requirements file without review).
+5. `Send-VulnerabilityAlert.ps1` emails an HTML summary (if `SmtpServer` is configured) or saves
+   it as `<wheelhouse>\reports\Alert_<timestamp>.html` - each finding includes the CVE/GHSA ID,
+   description, suggested fix version, and the exact wheel filename(s) to quarantine (resolved
+   from `manifest.json`).
+6. **Nothing is quarantined or deleted automatically.** An admin reviews the alert and decides
+   whether to update `Input\requirements.in`, re-resolve, get it approved, and re-run
+   `Update-Wheelhouse.ps1` - subject to the same cooldown policy, or an explicit low
+   `-MinimumPackageAgeDays` override for urgent cases.
 
-### Via the Scheduled Task itself
-
-```powershell
-Start-ScheduledTask -TaskName "Wheelhouse Weekly Maintenance"
-```
-
-Useful when you've just edited `requirements.txt` and don't want to wait for the weekly trigger,
-while still running under the task's configured account/permissions and logging the same way.
-
-### Directly from the command line
-
-```powershell
-cd C:\WheelhouseScripts\Jobs
-.\Invoke-WheelhousePipeline.ps1 -WheelhousePath "\\server\share\wheelhouse"
-```
-
-Or, to run just the maintenance step without the alert step (e.g. for debugging):
-
-```powershell
-.\Update-Wheelhouse.ps1 -WheelhousePath "\\server\share\wheelhouse"
-```
-
-Both accept the same optional parameters (`-PythonVersion`, `-Platform`,
-`-MinimumPackageAgeDays`, `-VulnerabilityServices`) if you need to override a default for a
-one-off run.
+An integrity-check failure (tampering/corruption) is a **separate** failure mode from a
+vulnerability finding - it stops the relevant script immediately and is only visible via the
+console log / `Report_Integrity_*.json` / the Scheduled Task's failure status, not via
+`Send-VulnerabilityAlert.ps1` (which only understands `pip-audit`'s report format).
 
 ---
 
-## 7. What actually happens
+## 9. Design note: `functions.ps1` and future scripts
 
-### On every run (manual or scheduled), the sequence is the same
+`Jobs\functions.ps1` holds every helper function used across the project, grouped by which
+script owns each one (see the block comments inside the file). Many are entirely generic -
+`Invoke-PipAudit`, `Get-RequirementsPackages`, `Confirm-PythonAndTooling`,
+`Get-PipAuditReport` - and don't depend on `manifest.json` or the wheelhouse concept at all.
+Others - `Save-Manifest`, `Test-ManifestIntegrity`, `Compare-RequirementsAgainstManifest`,
+`Merge-LocalRequirements` - are wheelhouse-specific.
 
-1. **Integrity check** - every file tracked in `manifest.json` is re-hashed (SHA256) and compared
-   against the recorded value. Any mismatch or missing file **stops the run immediately** -
-   nothing else executes until this is investigated manually.
-2. **Compare `requirements.txt` against the manifest** - checks that every required
-   package/version has a manifest entry matching the target Python/platform tag (`abi3` wheels
-   are accepted regardless of their specific `cp3xx` tag, since they're forward-compatible by
-   design).
-3. **Branch automatically:**
-   - **Nothing changed** → lightweight audit-only pass: re-run `pip-audit` (both configured
-     vulnerability services) against the existing `requirements.txt`, no download, no Defender
-     scan.
-   - **Something changed** (new/updated packages, or first-time setup with an empty wheelhouse)
-     → full pipeline: pre-download audit → 10-day cooldown check on the new/changed packages
-     only → conditional `pip download` → manifest rebuild (direct + transitive dependencies,
-     fresh SHA256 hashes) → Microsoft Defender scan of the wheelhouse folder.
-4. Full console output is saved to `<wheelhouse>\reports\Log_<timestamp>.txt` (logs older than 6
-   months are cleaned up automatically). Audit/age/integrity results are saved as separate
-   `Report_*.json` files in the same folder.
-
-### Manual run specifically
-
-Identical behavior to the scheduled task - there is no separate "manual mode." The only
-practical differences are: you see the console output live, and you can override parameters
-(e.g. a lower `-MinimumPackageAgeDays` for an urgent fix) for that one invocation without
-touching the scheduled task's configuration.
-
-### Scheduled task run specifically
-
-Same pipeline, unattended:
-
-- Runs as the configured service account, with highest privileges (needed for the Defender scan).
-- Nobody is watching the console, so the transcript log (`Log_*.txt`) and the `Report_*.json`
-  files are the only record - check the reports folder after each run if you're not otherwise
-  notified.
-- `Invoke-WheelhousePipeline.ps1` additionally auto-discovers any `Report_*-OSV_*.json` /
-  `Report_*-PYPI_*.json` files written during that specific run (by timestamp) and feeds them
-  straight into `Send-VulnerabilityAlert.ps1` - no manual step needed to trigger the alert.
-
-### When a vulnerability is detected
-
-1. The relevant `pip-audit` step exits non-zero; the affected package(s) and vulnerability
-   ID(s) are written to `Report_<...>-<OSV|PYPI>_<timestamp>.json`.
-2. **If this happened during the full pipeline** (new/changed packages): the download step is
-   **skipped entirely** - nothing vulnerable is ever added to the wheelhouse. The run ends with a
-   non-zero exit code.
-3. **If this happened during the audit-only pass** (already-deployed packages, re-audited
-   periodically): nothing is removed or downloaded automatically - the wheelhouse continues
-   serving what it already has. This is a detection-only path; remediation is manual.
-4. Either way, `pip-audit --fix --dry-run` output is also captured, showing suggested safe
-   versions (informational only - never applied automatically, since an automatic version bump
-   would bypass the cooldown policy and change `requirements.txt` without review).
-5. `Send-VulnerabilityAlert.ps1` parses the audit report(s) and either emails an HTML summary
-   (if `-SmtpServer` is configured) or saves it as `<wheelhouse>\reports\Alert_<timestamp>.html`
-   for manual review - each finding includes the CVE/GHSA ID, description, suggested fix version
-   (if any), and the exact wheel filename(s) to move into quarantine, resolved from
-   `manifest.json`.
-6. **Nothing is quarantined or deleted automatically.** An admin reviews the alert, decides
-   whether to update `requirements.txt` to a fixed version (subject to the same cooldown policy,
-   or with an explicit low `-MinimumPackageAgeDays` override for urgent cases), and re-runs the
-   pipeline to pick up the fix.
-
----
-
-## 8. Design note: `functions.ps1` and future scripts
-
-`Jobs\functions.ps1` currently holds every helper function used by the three main scripts,
-grouped by which script owns each one (see the block comments inside the file). Some of these
-functions are entirely generic - `Invoke-PipAudit`, `Get-RequirementsPackages`,
-`Confirm-PythonAndTooling`, `Read-PipAuditReport` - and don't depend on `manifest.json` or the
-wheelhouse concept at all. Others - `Save-Manifest`, `Test-ManifestIntegrity`,
-`Compare-RequirementsAgainstManifest` - are wheelhouse-specific.
-
-If a future script is added under `Jobs/` for a different purpose (e.g. scanning individual
-users' dev project folders for vulnerabilities), it can dot-source the same `functions.ps1` and
-use the generic functions directly, while ignoring the wheelhouse-specific ones. If `functions.ps1`
-grows large enough to be unwieldy, splitting it into a generic file and a wheelhouse-specific file
-(the latter dot-sourcing the former) is a straightforward follow-up - no logic changes needed,
-just reorganizing where each function lives.
+A future script (e.g. one that scans individual users' dev project folders for vulnerable
+dependencies, once their storage location is confirmed) can dot-source the same
+`functions.ps1` and reuse the generic functions directly, ignoring the wheelhouse-specific
+ones - `Test-Wheelhouse.ps1` was itself built this way, adding no new shared functions of its
+own beyond what `Update-Wheelhouse.ps1` had already established.

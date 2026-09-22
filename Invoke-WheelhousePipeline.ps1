@@ -32,7 +32,8 @@
 
 .PARAMETER UpdateWheelhouseScriptPath
 .PARAMETER SendAlertScriptPath
-    Paths to the two underlying scripts. Default to the same folder as this script.
+    Paths to the two underlying scripts. Default to Jobs\ next to this script
+    (this script itself lives at the manager root, alongside config\ and Input\).
 
 .EXAMPLE
     .\Invoke-WheelhousePipeline.ps1 -WheelhousePath "\\server\share\wheelhouse"
@@ -41,30 +42,67 @@
     .\Invoke-WheelhousePipeline.ps1 -WheelhousePath "\\server\share\wheelhouse" -SmtpServer "10.0.0.25"
 #>
 
+#Requires -Version 5.1
+
+[CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
     [string]$WheelhousePath,
 
-    [string]$PythonVersion = "3.14",
-    [string]$Platform = "win_amd64",
-    [int]$MinimumPackageAgeDays = 10,
-    [string[]]$VulnerabilityServices = @("osv", "pypi"),
+    [ValidateNotNullOrEmpty()]
+    [string]$PythonVersion,
+    [ValidateNotNullOrEmpty()]
+    [string]$Platform,
+    [ValidateRange(0, 3650)]
+    [int]$MinimumPackageAgeDays,
+    [ValidateSet("osv", "pypi")]
+    [string[]]$VulnerabilityServices,
 
     [string]$SmtpServer,
-    [string]$To = "servicedesk@company.com",
-    [string]$From = "NoReply@company.com",
+    [string]$To,
+    [string]$From,
     [string]$OutputHtmlPath,
 
-    [string]$UpdateWheelhouseScriptPath = (Join-Path $PSScriptRoot "Update-Wheelhouse.ps1"),
-    [string]$SendAlertScriptPath = (Join-Path $PSScriptRoot "Send-VulnerabilityAlert.ps1")
+    [ValidateNotNullOrEmpty()]
+    [string]$UpdateWheelhouseScriptPath = (Join-Path $PSScriptRoot "Jobs\Update-Wheelhouse.ps1"),
+    [ValidateNotNullOrEmpty()]
+    [string]$SendAlertScriptPath = (Join-Path $PSScriptRoot "Jobs\Send-VulnerabilityAlert.ps1")
 )
 
-$commonPath = Join-Path $PSScriptRoot "functions.ps1"
+$commonPath = Join-Path $PSScriptRoot "Jobs\functions.ps1"
 if (-not (Test-Path -Path $commonPath)) {
     Write-Host "Required file not found: $commonPath" -ForegroundColor Red
     exit 1
 }
 . $commonPath
+
+# Resolve every optional parameter once here, then pass the resolved values down
+# explicitly to both child scripts - so settings.psd1 is read exactly once per run,
+# and the two child scripts don't each read it again independently.
+$settingsPath = Join-Path $PSScriptRoot "config\settings.psd1"
+$settings = Get-WheelhouseSettings -SettingsPath $settingsPath
+
+$WheelhousePath = Resolve-Setting -Name "WheelhousePath" -ExplicitValue $WheelhousePath `
+    -WasBound $PSBoundParameters.ContainsKey('WheelhousePath') -Settings $settings -FallbackDefault $null
+$PythonVersion = Resolve-Setting -Name "PythonVersion" -ExplicitValue $PythonVersion `
+    -WasBound $PSBoundParameters.ContainsKey('PythonVersion') -Settings $settings -FallbackDefault "3.14"
+$Platform = Resolve-Setting -Name "Platform" -ExplicitValue $Platform `
+    -WasBound $PSBoundParameters.ContainsKey('Platform') -Settings $settings -FallbackDefault "win_amd64"
+$MinimumPackageAgeDays = Resolve-Setting -Name "MinimumPackageAgeDays" -ExplicitValue $MinimumPackageAgeDays `
+    -WasBound $PSBoundParameters.ContainsKey('MinimumPackageAgeDays') -Settings $settings -FallbackDefault 10
+$VulnerabilityServices = Resolve-Setting -Name "VulnerabilityServices" -ExplicitValue $VulnerabilityServices `
+    -WasBound $PSBoundParameters.ContainsKey('VulnerabilityServices') -Settings $settings -FallbackDefault @("osv", "pypi")
+$SmtpServer = Resolve-Setting -Name "SmtpServer" -ExplicitValue $SmtpServer `
+    -WasBound $PSBoundParameters.ContainsKey('SmtpServer') -Settings $settings -FallbackDefault $null
+$To = Resolve-Setting -Name "MailTo" -ExplicitValue $To `
+    -WasBound $PSBoundParameters.ContainsKey('To') -Settings $settings -FallbackDefault "servicedesk@company.com"
+$From = Resolve-Setting -Name "MailFrom" -ExplicitValue $From `
+    -WasBound $PSBoundParameters.ContainsKey('From') -Settings $settings -FallbackDefault "NoReply@company.com"
+
+if ([string]::IsNullOrWhiteSpace($WheelhousePath)) {
+    Write-Log "WheelhousePath was not supplied and is not set in config\settings.psd1. Pass -WheelhousePath, or run Setup.ps1 with -WheelhousePath first." "ERROR"
+    exit 1
+}
 
 Write-Log "=== Wheelhouse pipeline started ==="
 
@@ -84,12 +122,14 @@ if (-not (Test-Path -Path $SendAlertScriptPath)) {
 $runStartTime = Get-Date
 Write-Log "Running Update-Wheelhouse.ps1..."
 
-& $UpdateWheelhouseScriptPath `
-    -WheelhousePath $WheelhousePath `
-    -PythonVersion $PythonVersion `
-    -Platform $Platform `
-    -MinimumPackageAgeDays $MinimumPackageAgeDays `
-    -VulnerabilityServices $VulnerabilityServices
+$updateParams = @{
+    WheelhousePath        = $WheelhousePath
+    PythonVersion         = $PythonVersion
+    Platform              = $Platform
+    MinimumPackageAgeDays = $MinimumPackageAgeDays
+    VulnerabilityServices = $VulnerabilityServices
+}
+& $UpdateWheelhouseScriptPath @updateParams
 
 $wheelhouseExitCode = $LASTEXITCODE
 Write-Log "Update-Wheelhouse.ps1 finished with exit code $wheelhouseExitCode."
