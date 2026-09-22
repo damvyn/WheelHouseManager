@@ -162,7 +162,7 @@ else {
 # Step 2: audit every group file against every configured vulnerability service
 # ---------------------------------------------------------------------------
 
-$groupFiles = @(Get-WheelhouseRequirementGroups -WheelhousePath $WheelhousePath)
+$groupFiles = Get-WheelhouseRequirementGroups -WheelhousePath $WheelhousePath
 if ($groupFiles.Count -eq 0) {
     Write-Log "No requirement group files found in the wheelhouse - nothing to audit." "WARN"
     Write-Log "=== Wheelhouse audit-only check finished ==="
