@@ -163,7 +163,7 @@ $items
 </style>
 </head>
 <body>
-  <h2>Wheelhouse Vulnerability Alert</h2>
+  <h2>Wheelhouse Vulnerability Alert from ${env:Computername}</h2>
   $($sections.ToString())
   <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
   <p style="margin-top:16px; color:#666; font-size:11px;">
