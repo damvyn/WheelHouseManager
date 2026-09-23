@@ -12,7 +12,7 @@ This project has two independent parts:
 
 ```
 Client Install/
-    UV_Installer.ps1              # Installs the uv binaries (Cetegra package)
+    UV_Installer.ps1              # Installs the uv binaries
     Startup_UV.ps1                 # Locks down uv configuration (GPO computer startup script)
 
 Setup.ps1                          # Deploys the manager to a local folder (run once, safe to re-run)
@@ -46,8 +46,8 @@ Two scripts, from `Client Install/`, each with a different deployment mechanism.
 
 ### 1.1 `Client Install/UV_Installer.ps1` - installs the uv binaries
 
-Packaged as a Cetegra software deployment script (see the `.cetegra-version` stamp file and
-`<AppVersion>` placeholder, which Cetegra's packaging tooling fills in at build time). It:
+Packaged as a software deployment script (see the `.version` stamp file and
+`<AppVersion>` placeholder, which packaging tooling fills in at build time). It:
 
 - Extracts `uv-x86_64-pc-windows-msvc.zip` (must sit next to the script) into
   `C:\Program Files\astral.sh\uv`.
@@ -57,7 +57,7 @@ Packaged as a Cetegra software deployment script (see the `.cetegra-version` sta
   work here because both locations are on the same volume.
 - Logs to `%WinDir%\Logs\Astral-uv-<version>_Script.txt`.
 
-Deploy this through Cetegra as a standard application package targeting the VDI golden image
+Deploy this through deployment system as a standard application package targeting the VDI golden image
 or machine pool.
 
 ### 1.2 `Client Install/Startup_UV.ps1` - locks down configuration via Group Policy
@@ -95,7 +95,7 @@ Replace `\\server\pathToWheelHouse` with your actual wheelhouse UNC path.
 2. Open **Group Policy Management Console**, create or edit a GPO linked to the VDI OU.
 3. **Computer Configuration → Policies → Windows Settings → Scripts (Startup/Shutdown) → Startup**,
    add `Startup_UV.ps1` under the **PowerShell Scripts** tab.
-4. Ensure `UV_Installer.ps1` (via Cetegra) is deployed to the same machines.
+4. Ensure `UV_Installer.ps1` is deployed to the same machines.
 5. Run `gpupdate /force` on a test machine (or reboot it) and confirm:
    ```powershell
    Test-Path "C:\Windows\System32\uv.exe"
