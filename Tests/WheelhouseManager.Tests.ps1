@@ -30,7 +30,7 @@ Describe 'WheelhouseManager' {
 
     AfterAll {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
-        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -505,6 +505,7 @@ Describe 'WheelhouseManager' {
                 }
             }
             Mock -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -MockWith {
+                $global:WhmIntakeDownloaded = @($Packages.Keys | Sort-Object)
                 $ok = @{} + $Packages
                 $ok.Remove('nowheel')
                 @{ Succeeded = $ok; Failed = @("nowheel==$($Packages['nowheel'])"); Error = $null }
@@ -530,7 +531,7 @@ Describe 'WheelhouseManager' {
             $reasons['fresh'] | Should -Match 'published 2 day'
             $reasons['nowheel'] | Should -Match 'no downloadable wheel'
             # Rejected packages are never passed on to the next step.
-            Assert-MockCalled -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -Times 1 -Exactly -ParameterFilter { -not $Packages.ContainsKey('vulnpkg') -and -not $Packages.ContainsKey('fresh') }
+            ($global:WhmIntakeDownloaded -join ',') | Should -Be 'good,nowheel'
         }
 
         It 'accepts nothing when the audit could not be completed' {
