@@ -60,15 +60,24 @@ param(
 
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
-$cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, VulnerabilityServices, ReportRetentionMonths, PythonVersion, Platform
+$whlParams = @{
+    'BoundParameters' = $PSBoundParameters
+    'Name' = @('WheelhousePath', 'VulnerabilityServices', 'ReportRetentionMonths', 'PythonVersion', 'Platform')
+}
+$cfg = Resolve-WheelhouseParameter @whlParams
 
 $title = 'Wheelhouse audit-only check'
 $outcome = $null
 $exitCode = 0
 
 try {
-    $reportsFolder = Start-WheelhouseRun -WheelhousePath $cfg.WheelhousePath -Title $title -LogPrefix 'Log_Audit' -RetentionMonths $cfg.ReportRetentionMonths
+    $whlRunParams = @{
+        'WheelhousePath' = $cfg.WheelhousePath
+        'Title' = $title
+        'LogPrefix' = 'Log_Audit'
+        'RetentionMonths' = $cfg.ReportRetentionMonths
+    }
+    $reportsFolder = Start-WheelhouseRun @whlRunParams
 
     Confirm-PythonAndTooling
 
@@ -93,7 +102,13 @@ try {
         }
 
         # Group entries without a wheel can't be installed by clients.
-        $undownloaded = @(Get-UndownloadedPin -GroupFiles $groupFiles -Manifest $manifest -PythonVersion $cfg.PythonVersion -Platform $cfg.Platform)
+        $undownloadParams = @{
+            'GroupFiles' = $groupFiles
+            'Manifest' = $manifest
+            'PythonVersion' = $cfg.PythonVersion
+            'Platform' = $cfg.Platform
+        }
+        $undownloaded = @(Get-UndownloadedPin @undownloadParams)
         if ($undownloaded.Count -gt 0) {
             Write-Log "$($undownloaded.Count) package(s) are listed in group files but have no wheel in the wheelhouse:" 'WARN'
             foreach ($item in $undownloaded) {
@@ -113,7 +128,13 @@ try {
     }
     foreach ($groupFile in $groupFiles) {
         Write-Log "--- Group: $([System.IO.Path]::GetFileNameWithoutExtension($groupFile)) ---"
-        $groupResults = Invoke-GroupAudit -GroupFile $groupFile -Services $cfg.VulnerabilityServices -Stage 'Scheduled' -ReportsFolder $reportsFolder
+        $groupAuditParams = @{
+            'GroupFile' = $groupFile
+            'Services' = $cfg.VulnerabilityServices
+            'Stage' = 'Scheduled'
+            'ReportsFolder' = $reportsFolder
+        }
+        $groupResults = Invoke-GroupAudit @groupAuditParams
         foreach ($result in $groupResults) { $auditResults.Add($result) }
     }
 
