@@ -26,7 +26,7 @@ jobs:
         id: module-path
         shell: pwsh
         run: |
-          $path = if ('${{ matrix.shell }}') -eq 'powershell') {
+          $path = if ('${{ matrix.shell }}' -eq 'powershell') {
             "$HOME\Documents\WindowsPowerShell\Modules"
           } else {
             "$HOME\Documents\PowerShellModules"
