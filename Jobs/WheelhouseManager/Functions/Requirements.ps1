@@ -166,3 +166,99 @@ function Add-RequirementToGroupFile {
         Set-Content -Path $GroupFile -Value "$Name==$Version" -Encoding utf8 -ErrorAction Stop
     }
 }
+
+function ConvertTo-UvPythonPlatform {
+    # Maps the wheel platform tag used by pip (settings.psd1's Platform) to the target
+    # triple that `uv pip compile --python-platform` expects.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Platform
+    )
+
+    switch ($Platform) {
+        'win_amd64' { return 'x86_64-pc-windows-msvc' }
+        'win_arm64' { return 'aarch64-pc-windows-msvc' }
+        'win32' { return 'i686-pc-windows-msvc' }
+        default { throw "Platform '$Platform' has no known uv --python-platform equivalent. Supported: win_amd64, win_arm64, win32." }
+    }
+}
+
+function Test-RequirementWheelAvailability {
+    # Checks that every pin in a requirements file can be downloaded exactly the way
+    # Update-Wheelhouse.ps1 downloads it: a binary wheel for the target Python version
+    # and platform, with Requires-Python satisfied. `uv pip compile` can pick versions
+    # that fail this (it accepts source-only releases unless told otherwise, and it
+    # ignores upper bounds on Requires-Python), so the resolved file is checked with
+    # pip itself, via `pip install --dry-run` - only metadata is fetched, nothing is
+    # installed.
+    #
+    # pip stops at the first unavailable pin, so failing pins are dropped one at a
+    # time and the check repeated, to report all of them in one run.
+    # Returns @{ Passed; Unavailable = 'name==version', ...; Error = message or $null }.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RequirementsFilePath,
+
+        [Parameter(Mandatory)]
+        [string]$PythonVersion,
+
+        [Parameter(Mandatory)]
+        [string]$Platform
+    )
+
+    $remaining = Read-RequirementFile -FilePath $RequirementsFilePath
+    $unavailable = [System.Collections.Generic.List[string]]::new()
+    $workFolder = Join-Path ([System.IO.Path]::GetTempPath()) ("wheelhouse-check-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $workFolder -Force | Out-Null
+
+    try {
+        while ($remaining.Count -gt 0) {
+            $checkFile = Join-Path $workFolder 'requirements.txt'
+            Set-Content -Path $checkFile -Value @($remaining.Keys | Sort-Object | ForEach-Object { "$_==$($remaining[$_])" }) -Encoding ascii
+
+            $pipArgs = @(
+                '-m', 'pip', 'install',
+                '--dry-run', '--no-deps', '--ignore-installed',
+                '--only-binary=:all:',
+                '--python-version', $PythonVersion,
+                '--platform', $Platform,
+                '--implementation', 'cp',
+                '--target', (Join-Path $workFolder 'target'),
+                '--disable-pip-version-check',
+                '-r', $checkFile
+            )
+            $output = Invoke-NativeCommand -FilePath python -ArgumentList $pipArgs -PassThru
+            if ($LASTEXITCODE -eq 0) { break }
+
+            $failedPin = $null
+            foreach ($line in $output) {
+                if ($line -match 'No matching distribution found for\s+(?<pin>\S+)') {
+                    $failedPin = $Matches['pin']
+                    break
+                }
+            }
+            $failedName = if ($failedPin -and $failedPin -match '^(?<name>[A-Za-z0-9][A-Za-z0-9_.\-]*)') { Get-NormalizedPackageName $Matches['name'] } else { $null }
+
+            if (-not $failedName -or -not $remaining.ContainsKey($failedName)) {
+                return @{
+                    Passed      = $false
+                    Unavailable = $unavailable.ToArray()
+                    Error       = "pip exited with code $LASTEXITCODE without naming an unavailable package - see the pip output above (network or proxy problem?)."
+                }
+            }
+
+            $unavailable.Add("$failedName==$($remaining[$failedName])")
+            Write-Log "No wheel for Python $PythonVersion / $($Platform): $failedName==$($remaining[$failedName])" 'WARN'
+            $remaining.Remove($failedName)
+        }
+    }
+    finally {
+        Remove-Item -Path $workFolder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    return @{ Passed = ($unavailable.Count -eq 0); Unavailable = $unavailable.ToArray(); Error = $null }
+}

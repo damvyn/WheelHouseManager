@@ -25,6 +25,8 @@
         'Get-WheelhouseGroupFile',
         'Get-RequirementMergePlan',
         'Add-RequirementToGroupFile',
+        'ConvertTo-UvPythonPlatform',
+        'Test-RequirementWheelAvailability',
         'Get-WheelFileInfo',
         'Get-WheelhouseManifestPath',
         'Read-WheelhouseManifest',
