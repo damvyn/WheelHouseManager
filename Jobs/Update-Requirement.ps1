@@ -78,7 +78,7 @@ $compileArgs = @(
     "-o", $cfg.RequirementsTxtPath
 )
 
-& uv @compileArgs
+Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs
 
 if ($LASTEXITCODE -ne 0) {
     Write-Log "uv pip compile FAILED (exit code $LASTEXITCODE). Review the output above." "ERROR"

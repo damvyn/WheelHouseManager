@@ -92,3 +92,26 @@ function Write-JsonFile {
     if ($null -eq $json) { $json = '[]' }
     Write-TextFileAtomic -Path $Path -Content $json
 }
+
+function Invoke-NativeCommand {
+    # Runs an external program (python, uv, ...) and shows both its stdout and stderr
+    # on the host, line by line. Windows PowerShell 5.1's Start-Transcript does not
+    # record stderr that a native program writes straight to the console (pip prints
+    # its "ERROR: ..." lines there), so stderr is merged into the pipeline first -
+    # that way every line reaches both the console and the log file.
+    # The program's exit code is left in $LASTEXITCODE as usual.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$FilePath,
+
+        [string[]]$ArgumentList = @()
+    )
+
+    # With 'Stop', Windows PowerShell 5.1 would turn the first stderr line into a
+    # terminating error.
+    $ErrorActionPreference = 'Continue'
+    & $FilePath @ArgumentList 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+    } | Out-Host
+}

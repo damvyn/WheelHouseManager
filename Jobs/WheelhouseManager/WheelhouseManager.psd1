@@ -10,6 +10,7 @@
         'ConvertTo-HtmlSafe',
         'Write-TextFileAtomic',
         'Write-JsonFile',
+        'Invoke-NativeCommand',
         'Get-WheelhouseDefaultSetting',
         'Get-WheelhouseSettingsPath',
         'Get-WheelhouseSetting',

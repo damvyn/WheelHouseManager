@@ -389,6 +389,28 @@ Describe 'WheelhouseManager' {
         }
     }
 
+    Context 'Invoke-NativeCommand' {
+        It 'records stdout and stderr of a native program in the transcript and keeps its exit code' {
+            # Regression: Windows PowerShell 5.1's transcript missed stderr (pip's "ERROR:" lines).
+            $shell = (Get-Process -Id $PID).Path
+            $log = Join-Path (Get-TestFolder) 'transcript.txt'
+
+            Start-Transcript -Path $log | Out-Null
+            try {
+                Invoke-NativeCommand -FilePath $shell -ArgumentList '-NoProfile', '-Command', "[Console]::Out.WriteLine('stdout-line'); [Console]::Error.WriteLine('ERROR: stderr-line'); exit 3"
+                $exitCode = $LASTEXITCODE
+            }
+            finally {
+                Stop-Transcript | Out-Null
+            }
+
+            $exitCode | Should -Be 3
+            $content = Get-Content -Path $log -Raw
+            $content | Should -Match 'stdout-line'
+            $content | Should -Match 'ERROR: stderr-line'
+        }
+    }
+
     Context 'Remove-ExpiredReport' {
         It 'removes only old log/report/alert files' {
             $reports = Get-TestFolder
