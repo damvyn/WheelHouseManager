@@ -30,7 +30,7 @@ Describe 'WheelhouseManager' {
 
     AfterAll {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
-        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -483,6 +483,110 @@ Describe 'WheelhouseManager' {
             $result = Test-RequirementWheelAvailability -RequirementsFilePath $file -PythonVersion '3.14' -Platform 'win_amd64'
             $result.Passed | Should -Be $false
             $result.Error | Should -Match 'network or proxy'
+        }
+    }
+
+    Context 'Invoke-CandidateIntake' {
+        It 'rejects each failing package with its reason and accepts only what was downloaded' {
+            $folder = Get-TestFolder
+            $vulnReport = Join-Path $folder 'Report_PreDownload-requirements-1-candidates-OSV_20260101_000000.json'
+            Set-Content -Path $vulnReport -Value '{"dependencies":[{"name":"VulnPkg","version":"1.0","vulns":[{"id":"PYSEC-1"}]},{"name":"good","version":"1.0","vulns":[]}]}'
+
+            $global:WhmIntakeAudit = @([PSCustomObject]@{ Stage = 'PreDownload'; Group = 'requirements-1-candidates'; Service = 'osv'; Status = 'Vulnerable'; ReportPath = $vulnReport; Message = 'm' })
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-GroupAudit -MockWith { , $global:WhmIntakeAudit }
+            Mock -ModuleName WheelhouseManager -CommandName Test-PackageAge -MockWith {
+                @{
+                    TooNew  = @('fresh==1.0')
+                    Results = @(
+                        foreach ($name in $Packages.Keys) {
+                            [PSCustomObject]@{ Package = $name; Version = $Packages[$name]; AgeDays = $(if ($name -eq 'fresh') { 2 } else { 400 }); Passed = ($name -ne 'fresh') }
+                        }
+                    )
+                }
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -MockWith {
+                $global:WhmIntakeDownloaded = @($Packages.Keys | Sort-Object)
+                $ok = @{} + $Packages
+                $ok.Remove('nowheel')
+                @{ Succeeded = $ok; Failed = @("nowheel==$($Packages['nowheel'])"); Error = $null }
+            }
+
+            $intakeParams = @{
+                Packages       = @{ good = '1.0'; vulnpkg = '1.0'; fresh = '1.0'; nowheel = '2.0' }
+                GroupName      = 'requirements-1'
+                WheelhousePath = $folder
+                ReportsFolder  = $folder
+                Services       = @('osv')
+                MinimumAgeDays = 10
+                PythonVersion  = '3.14'
+                Platform       = 'win_amd64'
+            }
+            $result = Invoke-CandidateIntake @intakeParams
+
+            ($result.Accepted.Keys -join ',') | Should -Be 'good'
+            $reasons = @{}
+            foreach ($item in $result.Rejected) { $reasons[$item.Name] = $item.Reason }
+            ($reasons.Keys | Sort-Object) -join ',' | Should -Be 'fresh,nowheel,vulnpkg'
+            $reasons['vulnpkg'] | Should -Match 'PYSEC-1'
+            $reasons['fresh'] | Should -Match 'published 2 day'
+            $reasons['nowheel'] | Should -Match 'no downloadable wheel'
+            # Rejected packages are never passed on to the next step.
+            ($global:WhmIntakeDownloaded -join ',') | Should -Be 'good,nowheel'
+        }
+
+        It 'accepts nothing when the audit could not be completed' {
+            $folder = Get-TestFolder
+            $global:WhmIntakeAudit = @([PSCustomObject]@{ Stage = 'PreDownload'; Group = 'requirements-1-candidates'; Service = 'osv'; Status = 'Error'; ReportPath = 'none'; Message = 'm' })
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-GroupAudit -MockWith { , $global:WhmIntakeAudit }
+            Mock -ModuleName WheelhouseManager -CommandName Test-PackageAge -MockWith { throw 'must not be called' }
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -MockWith { throw 'must not be called' }
+
+            $intakeParams = @{
+                Packages       = @{ a = '1'; b = '2' }
+                GroupName      = 'requirements-1'
+                WheelhousePath = $folder
+                ReportsFolder  = $folder
+                Services       = @('osv')
+                MinimumAgeDays = 10
+                PythonVersion  = '3.14'
+                Platform       = 'win_amd64'
+            }
+            $result = Invoke-CandidateIntake @intakeParams
+
+            $result.Accepted.Count | Should -Be 0
+            @($result.Rejected).Count | Should -Be 2
+            $result.Rejected[0].Reason | Should -Match 'could not be completed'
+        }
+    }
+
+    Context 'Get-UndownloadedPin' {
+        It 'lists group entries without a matching wheel in the manifest' {
+            $wheelhouse = Get-TestFolder
+            $group = Join-Path $wheelhouse 'requirements-1.txt'
+            Set-Content -Path $group -Value @('six==1.16.0', 'pyqtdarktheme2==2.1.2')
+            $manifest = @([PSCustomObject]@{ name = 'six'; version = '1.16.0'; python_tag = 'py3'; abi_tag = 'none'; platform_tag = 'any' })
+
+            $result = @(Get-UndownloadedPin -GroupFiles @($group) -Manifest $manifest -PythonVersion '3.14' -Platform 'win_amd64')
+
+            $result.Count | Should -Be 1
+            $result[0].Group | Should -Be 'requirements-1'
+            "$($result[0].Package)==$($result[0].Version)" | Should -Be 'pyqtdarktheme2==2.1.2'
+        }
+    }
+
+    Context 'Vulnerability alert for blocked candidates' {
+        It 'marks a finding from a candidate audit as blocked, not deployed' {
+            $reports = Get-TestFolder
+            $report = Join-Path $reports 'Report_PreDownload-requirements-2-candidates-OSV_20260921_153000.json'
+            Copy-Item -Path (Join-Path $examplesPath 'Report_Scheduled-OSV_20260921_153000.json') -Destination $report
+
+            $result = Get-VulnerabilityFinding -ReportPaths @($report)
+            $result.Findings[0].Deployed | Should -Be $false
+            $result.Findings[0].GroupFiles -join ',' | Should -Be 'requirements-2.txt'
+
+            $html = ConvertTo-VulnerabilityAlertHtml -Findings $result.Findings -WheelhousePath ''
+            $html | Should -Match 'Blocked before download'
+            $html | Should -Not -Match 'quarantine folder'
         }
     }
 

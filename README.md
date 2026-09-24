@@ -264,8 +264,12 @@ can't contain two versions of the same package name, the wheelhouse instead hold
 | Situation | Result |
 |---|---|
 | Exact duplicate (same name==version already present anywhere) | Skipped, logged |
-| New package name | Added to the first group that doesn't already use that name |
-| Same name, different version, already used everywhere | A brand-new group file is created |
+| New package name | Candidate for the first group that doesn't already use that name |
+| Same name, different version, already used everywhere | Candidate for a brand-new group file |
+
+A candidate is written into its group file **only after it passed the vulnerability audit, the
+cooldown and the download** - a group file never lists a package whose wheel isn't in the
+wheelhouse (see "What it does" below).
 
 New group files are numbered after the highest existing one (`requirements-1.txt` +
 `requirements-3.txt` -> next is `requirements-4.txt`), so an existing group file is never
@@ -286,9 +290,25 @@ record `name==version`. Anything else (unpinned, `-e`, URLs) is skipped with a w
 
 1. Integrity check (SHA256 vs. `manifest.json`) - stops immediately on any mismatch. Wheel files
    present in the folder but not tracked by the manifest are reported as a warning.
-2. Merge of the local requirements file (see above).
-3. For **each** group file: compare against the manifest, audit (OSV + PyPI), cooldown check
-   on new/changed packages, conditional download.
+2. Merge **plan** for the local requirements file (see above) - nothing is written yet.
+3. For **each** group, the candidates - the planned new packages, plus packages the group
+   already lists without a wheel in the wheelhouse - go through, in order:
+   1. vulnerability audit (OSV + PyPI) of the candidates,
+   2. cooldown check,
+   3. download (`pip download --no-deps --only-binary=:all:`).
+
+   Each package is judged on its own: one that fails a step is **rejected with the reason**
+   and never holds back the others. Only packages whose wheel was downloaded are written into
+   the group file.
+   - A rejected **new** package is not written anywhere - it stays in `Input\requirements.txt`
+     and is simply tried again on the next run (e.g. once its cooldown has passed).
+   - A rejected package that the group **already lists** stays listed (group files are never
+     rewritten automatically) and is reported as "still listed without a wheel" - fix or
+     remove that line by hand.
+
+   Rejections are logged with their reason and saved in
+   `<wheelhouse>\reports\Report_Rejected_<timestamp>.json`; the script then exits with code 1.
+   Every group that already existed is afterwards audited as deployed (no download).
 4. Manifest update: existing entries are kept unchanged; only wheel files that appeared during
    this run are hashed and added. An untracked wheel that was already in the folder before the
    run is **never** added automatically - remove it and let the script download it again.
@@ -319,7 +339,9 @@ completely unattended on a schedule without risking a silent merge of an unappro
 ### What it does
 
 1. Checks `python` / `pip-audit` (installs or upgrades them if needed).
-2. Integrity check (same as above) - aborts on mismatch.
+2. Integrity check (same as above) - aborts on mismatch. Packages that a group file lists but
+   that have no wheel in the wheelhouse are reported as a warning (e.g. entries left over from
+   before candidates were checked before being written).
 3. Runs `pip-audit` against **every** group file, on every configured vulnerability service.
 4. If anything is found **or an audit could not be completed** (network error, tooling
    failure, ...), calls `Send-VulnerabilityAlert.ps1` once with every such result. A failed
@@ -391,8 +413,9 @@ Like `Update-Wheelhouse.ps1`, it merges `Input\requirements.txt` by default - pa
 1. The relevant `pip-audit` step exits non-zero; findings are written to
    `Report_<Scheduled|PreDownload>-<group>-<OSV|PYPI>_<timestamp>.json`. If `pip-audit` fails
    without a usable report, the audit is reported as an **error**, not as clean.
-2. **During `Update-Wheelhouse.ps1`'s per-group processing**: that group's download is skipped
-   entirely - nothing vulnerable is ever added to the wheelhouse.
+2. **During `Update-Wheelhouse.ps1`**: a vulnerable candidate is rejected before download and
+   is never written into a group file; the other candidates carry on. The alert marks such a
+   finding as "Blocked before download" (nothing to quarantine).
 3. **During `Test-Wheelhouse.ps1`'s scheduled check**: nothing is downloaded or removed (it
    never downloads anything at all) - this is purely detection.
 4. Either way, `pip-audit --fix --dry-run` output is captured too (suggested safe versions,

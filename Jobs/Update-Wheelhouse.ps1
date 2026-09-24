@@ -16,18 +16,23 @@
 
       - If the local requirements file (-LocalRequirementsPath, or config\settings.psd1's
         LocalRequirementsPath - by default Input\requirements.txt) exists and has
-        content, its entries are merged into the wheelhouse's group files: an exact
-        duplicate (same name==version already present anywhere) is skipped and logged;
-        a genuinely new package name is added to the first group that doesn't already
-        use that name; a name already pinned to a DIFFERENT version everywhere gets its
-        own new group file. Nothing is ever downloaded from this merge step alone - it
-        only updates the group files that the steps below then process.
+        content, a merge is PLANNED for its entries: an exact duplicate (same
+        name==version already listed anywhere) is skipped; a new package name goes to
+        the first group that doesn't already use that name; a name already pinned to a
+        DIFFERENT version everywhere goes to a new group file. Nothing is written yet.
 
-      - For EACH group file: if it matches the manifest (correct versions and target
-        tag present), runs a lightweight audit-only pass for that group (vulnerability
-        check, no download). If it does NOT match (new/changed packages in that group,
-        or a first-time group), runs the full pipeline for that group: vulnerability
-        audit, package-age (cooldown) check, conditional download.
+      - For EACH group, the candidates - the planned new pins plus any pins the group
+        already lists without a wheel in the wheelhouse - go through the vulnerability
+        audit, the package-age (cooldown) check and the download, one package at a
+        time as far as the outcome goes. A package that fails a step is rejected with
+        the reason (log + Report_Rejected_<timestamp>.json) and never holds back the
+        others. Only packages whose wheel was actually downloaded are written into the
+        group file - a group file never lists a package that isn't in the wheelhouse.
+        A rejected new package stays in the local requirements file and is simply
+        tried again on the next run (e.g. once its cooldown has passed).
+
+      - Every group that already existed is then audited as deployed (vulnerability
+        check, no download).
 
       - Downloads use pip's --no-deps: group files come from `uv pip compile`, so every
         transitive dependency is already pinned in them and goes through the same
@@ -142,10 +147,11 @@ try {
             ForEach-Object { $_.Name })
 
     # -----------------------------------------------------------------------
-    # Step 2: merge local requirements (if any) into the wheelhouse's group files
+    # Step 2: plan the merge of local requirements - nothing is written yet
     # -----------------------------------------------------------------------
 
-    $groupFiles = Get-WheelhouseGroupFile -WheelhousePath $cfg.WheelhousePath
+    [string[]]$groupFiles = Get-WheelhouseGroupFile -WheelhousePath $cfg.WheelhousePath
+    $additionsByGroup = @{}
 
     $localPath = $cfg.LocalRequirementsPath
     $localPackages = @{}
@@ -154,36 +160,41 @@ try {
     }
 
     if ($localPackages.Count -gt 0) {
-        Write-Log "Merging $($localPackages.Count) package(s) from local requirements: $localPath"
+        Write-Log "Planning merge of $($localPackages.Count) package(s) from local requirements: $localPath"
         $mergePlan = Get-RequirementMergePlan -LocalPackages $localPackages -GroupFiles $groupFiles -WheelhousePath $cfg.WheelhousePath
 
         foreach ($dup in $mergePlan.Duplicates) {
-            Write-Log "  Duplicate, skipped: $dup"
+            Write-Log "  Already listed, skipped: $dup"
         }
         foreach ($add in $mergePlan.Additions) {
             $label = if ($add.IsNewGroup) { 'new group' } else { 'existing group' }
-            Write-Log "  Adding $($add.Name)==$($add.Version) to $(Split-Path -Path $add.GroupFile -Leaf) ($label)" 'OK'
-            Add-RequirementToGroupFile -GroupFile $add.GroupFile -Name $add.Name -Version $add.Version
+            Write-Log "  Candidate: $($add.Name)==$($add.Version) for $(Split-Path -Path $add.GroupFile -Leaf) ($label)"
+            if (-not $additionsByGroup.ContainsKey($add.GroupFile)) { $additionsByGroup[$add.GroupFile] = @{} }
+            $additionsByGroup[$add.GroupFile][$add.Name] = $add.Version
         }
         if ($mergePlan.Additions.Count -eq 0) {
-            Write-Log 'Nothing new to merge - every local package was already present.' 'OK'
+            Write-Log 'Nothing new to merge - every local package is already listed in a group.' 'OK'
         }
-
-        # Re-scan: a brand new group file may have been created above.
-        $groupFiles = Get-WheelhouseGroupFile -WheelhousePath $cfg.WheelhousePath
+        else {
+            Write-Log 'Candidates are only written to their group file after passing the audit, the cooldown and the download.'
+        }
     }
     elseif (-not [string]::IsNullOrWhiteSpace($localPath)) {
         Write-Log "No local requirements to merge (file missing or empty): $localPath"
     }
 
-    if ($groupFiles.Count -eq 0) {
+    # Existing groups first, then planned new groups in number order.
+    $targetGroups = @($groupFiles) + @($additionsByGroup.Keys | Where-Object { $groupFiles -notcontains $_ } |
+            Sort-Object { Get-GroupFileNumber -Path $_ })
+    if ($targetGroups.Count -eq 0) {
         Write-Log 'Run Update-Requirement.ps1 and re-run this script with -LocalRequirementsPath to create the first group.' 'ERROR'
         throw 'Wheelhouse has no requirement group files yet, and no local requirements were supplied to bootstrap one.'
     }
-    Write-Log "Processing $($groupFiles.Count) requirement group file(s)."
+    Write-Log "Processing $($targetGroups.Count) requirement group file(s)."
 
     # -----------------------------------------------------------------------
-    # Step 3: process each group file - compare, audit, cooldown, download
+    # Step 3: per group - take candidates through audit, cooldown and download,
+    # write only the accepted ones, then audit the group as deployed
     # -----------------------------------------------------------------------
 
     $expectedPythonTag = 'cp' + ($cfg.PythonVersion -replace '\.', '')
@@ -191,100 +202,99 @@ try {
 
     $overallPassed = $true
     $anyDownloadHappened = $false
+    $rejectedAll = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($groupFile in $groupFiles) {
+    foreach ($groupFile in $targetGroups) {
         $groupName = [System.IO.Path]::GetFileNameWithoutExtension($groupFile)
         Write-Log "--- Group: $groupName ($groupFile) ---"
 
-        $requiredPackages = Read-RequirementFile -FilePath $groupFile
-        Write-Log "Found $($requiredPackages.Count) pinned package(s) in this group."
+        $groupExisted = Test-Path -Path $groupFile
+        $listed = if ($groupExisted) { Read-RequirementFile -FilePath $groupFile } else { @{} }
+        $additions = if ($additionsByGroup.ContainsKey($groupFile)) { $additionsByGroup[$groupFile] } else { @{} }
 
-        $compareParams = @{
-            Required            = $requiredPackages
-            Manifest            = $manifest
-            ExpectedPythonTag   = $expectedPythonTag
-            ExpectedPlatformTag = $cfg.Platform
-        }
-        $compareResult = Compare-RequirementsAgainstManifest @compareParams
-        $isMatch = ($compareResult.Descriptions.Count -eq 0)
-
-        if ($isMatch) {
-            Write-Log "$groupName matches the manifest. Running audit-only pass (no download)." 'OK'
-            $stage = 'Scheduled'
-        }
-        else {
-            Write-Log "$groupName does NOT match the manifest:" 'WARN'
-            foreach ($item in $compareResult.Descriptions) {
-                Write-Log "  - $item" 'WARN'
+        # Pins the group already lists but whose wheel is not in the wheelhouse yet
+        # (e.g. a group file edited by hand, or left over from before this check existed).
+        $missing = @{}
+        if ($listed.Count -gt 0) {
+            $compareParams = @{
+                Required            = $listed
+                Manifest            = $manifest
+                ExpectedPythonTag   = $expectedPythonTag
+                ExpectedPlatformTag = $cfg.Platform
             }
-            $stage = 'PreDownload'
+            $missing = (Compare-RequirementsAgainstManifest @compareParams).Packages
         }
+        Write-Log "$($listed.Count) package(s) listed, $($missing.Count) of them without a wheel yet; $($additions.Count) new candidate(s)."
 
-        $groupResults = Invoke-GroupAudit -GroupFile $groupFile -Services $cfg.VulnerabilityServices -Stage $stage -ReportsFolder $reportsFolder
-        foreach ($result in $groupResults) { $auditResults.Add($result) }
-        $auditsPassed = -not ($groupResults | Where-Object { $_.Status -ne 'Passed' })
+        $candidates = @{} + $missing
+        foreach ($name in $additions.Keys) { $candidates[$name] = $additions[$name] }
 
-        if ($isMatch) {
-            if (-not $auditsPassed) {
-                Write-Log "$groupName has known vulnerabilities (or an incomplete audit) in already-deployed packages." 'ERROR'
-                $overallPassed = $false
+        if ($candidates.Count -gt 0) {
+            foreach ($name in ($candidates.Keys | Sort-Object)) {
+                $kind = if ($additions.ContainsKey($name)) { 'new' } else { 'listed, no wheel yet' }
+                Write-Log "  Candidate: $name==$($candidates[$name]) ($kind)" 'WARN'
             }
-            continue
-        }
 
-        $ageCheckPassed = $true
-        if ($compareResult.Packages.Count -gt 0) {
-            Write-Log "Checking minimum package age (cooldown: $($cfg.MinimumPackageAgeDays) day(s)) for $groupName..."
-            $ageCheck = Test-PackageAge -Packages $compareResult.Packages -MinimumAgeDays $cfg.MinimumPackageAgeDays
+            $intakeParams = @{
+                Packages       = $candidates
+                GroupName      = $groupName
+                WheelhousePath = $cfg.WheelhousePath
+                ReportsFolder  = $reportsFolder
+                Services       = $cfg.VulnerabilityServices
+                MinimumAgeDays = $cfg.MinimumPackageAgeDays
+                PythonVersion  = $cfg.PythonVersion
+                Platform       = $cfg.Platform
+            }
+            $intake = Invoke-CandidateIntake @intakeParams
+            foreach ($result in $intake.AuditResults) { $auditResults.Add($result) }
 
-            $ageReportFile = Join-Path $reportsFolder "Report_PackageAge-$($groupName)_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-            Write-JsonFile -Path $ageReportFile -InputObject @($ageCheck.Results) -Depth 5
-            Write-Log "Package age report saved to: $ageReportFile"
-
-            if ($ageCheck.TooNew.Count -gt 0) {
-                $ageCheckPassed = $false
-                Write-Log "The following package(s) in $groupName do not yet satisfy the $($cfg.MinimumPackageAgeDays)-day cooldown:" 'ERROR'
-                foreach ($item in $ageCheck.TooNew) {
-                    Write-Log "  - $item" 'ERROR'
+            if ($intake.Accepted.Count -gt 0) { $anyDownloadHappened = $true }
+            foreach ($name in ($intake.Accepted.Keys | Sort-Object)) {
+                if ($additions.ContainsKey($name)) {
+                    Add-RequirementToGroupFile -GroupFile $groupFile -Name $name -Version $intake.Accepted[$name]
+                    Write-Log "  Accepted and added to ${groupName}: $name==$($intake.Accepted[$name])" 'OK'
+                }
+                else {
+                    Write-Log "  Accepted, wheel now downloaded: $name==$($intake.Accepted[$name])" 'OK'
                 }
             }
-            else {
-                Write-Log "All new/changed packages in $groupName satisfy the $($cfg.MinimumPackageAgeDays)-day cooldown." 'OK'
+
+            foreach ($item in $intake.Rejected) {
+                if ($additions.ContainsKey($item.Name)) {
+                    $action = "NOT added to $groupName - it stays in the local requirements file and is tried again next run"
+                }
+                else {
+                    $action = "Still listed in $groupName without a wheel - fix or remove that line in the group file"
+                }
+                Write-Log "  Rejected: $($item.Name)==$($item.Version) - $($item.Reason) -> $action" 'ERROR'
+                $rejectedAll.Add([PSCustomObject]@{
+                        Group   = $groupName
+                        Package = $item.Name
+                        Version = $item.Version
+                        Kind    = $(if ($additions.ContainsKey($item.Name)) { 'new' } else { 'listed' })
+                        Reason  = $item.Reason
+                    })
             }
+            if ($intake.Rejected.Count -gt 0) { $overallPassed = $false }
         }
 
-        if (-not ($auditsPassed -and $ageCheckPassed)) {
-            if (-not $auditsPassed) {
-                Write-Log "${groupName}: download SKIPPED - one or more vulnerability audits did not pass." 'ERROR'
+        # Audit what the group lists as deployed. A group created in this run holds
+        # only packages that were just audited as candidates.
+        if ($groupExisted -and $listed.Count -gt 0) {
+            Write-Log "Auditing $groupName as deployed (no download)..."
+            $groupResults = Invoke-GroupAudit -GroupFile $groupFile -Services $cfg.VulnerabilityServices -Stage 'Scheduled' -ReportsFolder $reportsFolder
+            foreach ($result in $groupResults) { $auditResults.Add($result) }
+            if ($groupResults | Where-Object { $_.Status -ne 'Passed' }) {
+                Write-Log "$groupName has known vulnerabilities (or an incomplete audit) in listed packages." 'ERROR'
+                $overallPassed = $false
             }
-            if (-not $ageCheckPassed) {
-                Write-Log "${groupName}: download SKIPPED - one or more packages do not yet satisfy the cooldown." 'ERROR'
-            }
-            $overallPassed = $false
-            continue
         }
+    }
 
-        Write-Log "${groupName}: audits passed and cooldown satisfied. Downloading..." 'OK'
-        $pipDownloadArgs = @(
-            '-m', 'pip', 'download',
-            '-r', $groupFile,
-            '-d', $cfg.WheelhousePath,
-            '--python-version', $cfg.PythonVersion,
-            '--platform', $cfg.Platform,
-            '--implementation', 'cp',
-            '--only-binary=:all:',
-            '--no-deps'
-        )
-        Invoke-NativeCommand -FilePath python -ArgumentList $pipDownloadArgs
-
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log "${groupName}: download completed successfully." 'OK'
-            $anyDownloadHappened = $true
-        }
-        else {
-            Write-Log "${groupName}: download FAILED. Review the pip output above." 'ERROR'
-            $overallPassed = $false
-        }
+    if ($rejectedAll.Count -gt 0) {
+        $rejectedReport = Join-Path $reportsFolder "Report_Rejected_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+        Write-JsonFile -Path $rejectedReport -InputObject @($rejectedAll.ToArray()) -Depth 3
+        Write-Log "$($rejectedAll.Count) package(s) were rejected this run - details: $rejectedReport" 'ERROR'
     }
 
     # -----------------------------------------------------------------------

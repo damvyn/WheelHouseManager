@@ -185,17 +185,76 @@ function ConvertTo-UvPythonPlatform {
     }
 }
 
+function Invoke-PipPinRetry {
+    # Runs a pip command against a set of exact pins and works out which pins pip
+    # rejects. pip stops at the first pin it can't satisfy ("No matching distribution
+    # found for X"), so that pin is dropped and the command repeated until it succeeds
+    # for everything left - one run reports every failing pin, and the rest are not
+    # held back by them.
+    #
+    # -PipArguments is the pip command without "-r <file>" (e.g. '-m','pip','download',...);
+    # the pins are written to a temporary requirements file which is appended as -r.
+    # Returns @{ Succeeded = @{name=version}; Failed = 'name==version', ...; Error = $null
+    # or a message when pip failed without naming a pin (network, proxy, ...) - in that
+    # case the pins not yet attributed are neither in Succeeded nor in Failed }.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [hashtable]$Packages,
+
+        [Parameter(Mandatory)]
+        [string[]]$PipArguments
+    )
+
+    $remaining = @{} + $Packages
+    $failed = [System.Collections.Generic.List[string]]::new()
+    $workFolder = Join-Path ([System.IO.Path]::GetTempPath()) ("wheelhouse-pip-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $workFolder -Force | Out-Null
+
+    try {
+        while ($remaining.Count -gt 0) {
+            $pinFile = Join-Path $workFolder 'requirements.txt'
+            Set-Content -Path $pinFile -Value @($remaining.Keys | Sort-Object | ForEach-Object { "$_==$($remaining[$_])" }) -Encoding ascii
+
+            $output = Invoke-NativeCommand -FilePath python -ArgumentList (@($PipArguments) + @('-r', $pinFile)) -PassThru
+            if ($LASTEXITCODE -eq 0) {
+                return @{ Succeeded = $remaining; Failed = $failed.ToArray(); Error = $null }
+            }
+
+            $failedName = $null
+            foreach ($line in $output) {
+                if ($line -match 'No matching distribution found for\s+(?<pin>[A-Za-z0-9][A-Za-z0-9_.\-]*)') {
+                    $failedName = Get-NormalizedPackageName $Matches['pin']
+                    break
+                }
+            }
+            if (-not $failedName -or -not $remaining.ContainsKey($failedName)) {
+                return @{
+                    Succeeded = @{}
+                    Failed    = $failed.ToArray()
+                    Error     = "pip exited with code $LASTEXITCODE without naming an unavailable package - see the pip output above (network or proxy problem?)."
+                }
+            }
+
+            $failed.Add("$failedName==$($remaining[$failedName])")
+            $remaining.Remove($failedName)
+        }
+        return @{ Succeeded = @{}; Failed = $failed.ToArray(); Error = $null }
+    }
+    finally {
+        Remove-Item -Path $workFolder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-RequirementWheelAvailability {
     # Checks that every pin in a requirements file can be downloaded exactly the way
     # Update-Wheelhouse.ps1 downloads it: a binary wheel for the target Python version
     # and platform, with Requires-Python satisfied. `uv pip compile` can pick versions
     # that fail this (it accepts source-only releases unless told otherwise, and it
     # ignores upper bounds on Requires-Python), so the resolved file is checked with
-    # pip itself, via `pip install --dry-run` - only metadata is fetched, nothing is
-    # installed.
-    #
-    # pip stops at the first unavailable pin, so failing pins are dropped one at a
-    # time and the check repeated, to report all of them in one run.
+    # pip itself, via `pip install --dry-run` - nothing is installed.
     # Returns @{ Passed; Unavailable = 'name==version', ...; Error = message or $null }.
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -210,55 +269,30 @@ function Test-RequirementWheelAvailability {
         [string]$Platform
     )
 
-    $remaining = Read-RequirementFile -FilePath $RequirementsFilePath
-    $unavailable = [System.Collections.Generic.List[string]]::new()
-    $workFolder = Join-Path ([System.IO.Path]::GetTempPath()) ("wheelhouse-check-" + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $workFolder -Force | Out-Null
-
+    $targetFolder = Join-Path ([System.IO.Path]::GetTempPath()) ("wheelhouse-check-" + [guid]::NewGuid().ToString('N'))
     try {
-        while ($remaining.Count -gt 0) {
-            $checkFile = Join-Path $workFolder 'requirements.txt'
-            Set-Content -Path $checkFile -Value @($remaining.Keys | Sort-Object | ForEach-Object { "$_==$($remaining[$_])" }) -Encoding ascii
-
-            $pipArgs = @(
-                '-m', 'pip', 'install',
-                '--dry-run', '--no-deps', '--ignore-installed',
-                '--only-binary=:all:',
-                '--python-version', $PythonVersion,
-                '--platform', $Platform,
-                '--implementation', 'cp',
-                '--target', (Join-Path $workFolder 'target'),
-                '--disable-pip-version-check',
-                '-r', $checkFile
-            )
-            $output = Invoke-NativeCommand -FilePath python -ArgumentList $pipArgs -PassThru
-            if ($LASTEXITCODE -eq 0) { break }
-
-            $failedPin = $null
-            foreach ($line in $output) {
-                if ($line -match 'No matching distribution found for\s+(?<pin>\S+)') {
-                    $failedPin = $Matches['pin']
-                    break
-                }
-            }
-            $failedName = if ($failedPin -and $failedPin -match '^(?<name>[A-Za-z0-9][A-Za-z0-9_.\-]*)') { Get-NormalizedPackageName $Matches['name'] } else { $null }
-
-            if (-not $failedName -or -not $remaining.ContainsKey($failedName)) {
-                return @{
-                    Passed      = $false
-                    Unavailable = $unavailable.ToArray()
-                    Error       = "pip exited with code $LASTEXITCODE without naming an unavailable package - see the pip output above (network or proxy problem?)."
-                }
-            }
-
-            $unavailable.Add("$failedName==$($remaining[$failedName])")
-            Write-Log "No wheel for Python $PythonVersion / $($Platform): $failedName==$($remaining[$failedName])" 'WARN'
-            $remaining.Remove($failedName)
-        }
+        $pipArgs = @(
+            '-m', 'pip', 'install',
+            '--dry-run', '--no-deps', '--ignore-installed',
+            '--only-binary=:all:',
+            '--python-version', $PythonVersion,
+            '--platform', $Platform,
+            '--implementation', 'cp',
+            '--target', $targetFolder,
+            '--disable-pip-version-check'
+        )
+        $result = Invoke-PipPinRetry -Packages (Read-RequirementFile -FilePath $RequirementsFilePath) -PipArguments $pipArgs
     }
     finally {
-        Remove-Item -Path $workFolder -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $targetFolder -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    return @{ Passed = ($unavailable.Count -eq 0); Unavailable = $unavailable.ToArray(); Error = $null }
+    foreach ($pin in $result.Failed) {
+        Write-Log "No wheel for Python $PythonVersion / $($Platform): $pin" 'WARN'
+    }
+    return @{
+        Passed      = ($result.Failed.Count -eq 0 -and -not $result.Error)
+        Unavailable = $result.Failed
+        Error       = $result.Error
+    }
 }
