@@ -69,13 +69,10 @@ param(
     [string]$SmtpServer,
     [string]$To,
     [string]$From,
-    [string]$OutputHtmlPath,
-
-    [ValidateNotNullOrEmpty()]
-    [string]$UpdateWheelhouseScriptPath = (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'Update-Wheelhouse.ps1'),
-    [ValidateNotNullOrEmpty()]
-    [string]$SendAlertScriptPath = (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'Send-VulnerabilityAlert.ps1')
+    [string]$OutputHtmlPath
 )
+$UpdateWheelhouseScriptPath = (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'Update-Wheelhouse.ps1')
+$SendAlertScriptPath = (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'Send-VulnerabilityAlert.ps1')
 
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'WheelhouseManager') -ErrorAction Stop
 
@@ -90,12 +87,32 @@ foreach ($scriptPath in $UpdateWheelhouseScriptPath, $SendAlertScriptPath) {
 
 # Split the explicitly-passed parameters between the two child scripts.
 $updateParams = @{}
-foreach ($name in 'WheelhousePath', 'LocalRequirementsPath', 'PythonVersion', 'Platform', 'MinimumPackageAgeDays', 'VulnerabilityServices') {
-    if ($PSBoundParameters.ContainsKey($name)) { $updateParams[$name] = $PSBoundParameters[$name] }
+$updateParamsIn = @(
+    'WheelhousePath',
+    'LocalRequirementsPath',
+    'PythonVersion',
+    'Platform',
+    'MinimumPackageAgeDays',
+    'VulnerabilityServices'
+)
+foreach ($name in $updateParamsIn) {
+    if ($PSBoundParameters.ContainsKey($name)) {
+        $updateParams[$name] = $PSBoundParameters[$name]
+    }
 }
+
 $alertParams = @{}
-foreach ($name in 'WheelhousePath', 'SmtpServer', 'To', 'From', 'OutputHtmlPath') {
-    if ($PSBoundParameters.ContainsKey($name)) { $alertParams[$name] = $PSBoundParameters[$name] }
+$alertParamsIn = @(
+    'WheelhousePath',
+    'SmtpServer',
+    'To',
+    'From',
+    'OutputHtmlPath'
+)
+foreach ($name in $alertParamsIn) {
+    if ($PSBoundParameters.ContainsKey($name)) {
+        $alertParams[$name] = $PSBoundParameters[$name]
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -114,7 +131,7 @@ Write-Log "Update-Wheelhouse.ps1 finished with exit code $wheelhouseExitCode."
 
 if ($auditResults.Count -eq 0) {
     Write-Log 'No audits ran this run - skipping the alert step.' 'WARN'
-    Write-Log '(This is expected if Update-Wheelhouse.ps1 aborted early, e.g. on an integrity check failure - check its output above.)'
+    Write-Log '(This is expected if script aborted early.)'
     Write-Log '=== Wheelhouse pipeline finished ==='
     exit $wheelhouseExitCode
 }
