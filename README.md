@@ -1,14 +1,27 @@
-# Wheelhouse Automation - README
+﻿# Wheelhouse Manager
+
+## ❓What does it do?
+This project creates a standalone index for Python packages and provide management functionalities:
+- Add new packages and dependencies
+- Run OSV and PyPi audit
+- Run antivirus scan (Defender)
+- Build Requirements.txt according to specified rules
+- Generate scan reports
+- Send email alerts
+
+---
+
+## ⚙️ How does it work?
 
 This project has two independent parts:
 
-1. **Client-side uv installation** on non-persistent Windows VDI hosts (`Client Install/`),
+1. **Client-side installation** on Windows hosts use uv package manager (`Client Install/`),
    which locks clients to a single, internal, audited package source.
 2. **Wheelhouse Manager** (`Setup.ps1`, `Invoke-WheelhousePipeline.ps1`, `Jobs/`), which
    prepares, approves, populates, and continuously audits that internal package source
    (the "wheelhouse").
 
-## Repository layout
+### Repository layout
 
 ```
 Client Install/
@@ -46,28 +59,25 @@ Two scripts, from `Client Install/`, each with a different deployment mechanism.
 
 ### 1.1 `Client Install/UV_Installer.ps1` - installs the uv binaries
 
-Packaged as a software deployment script (see the `.version` stamp file and
-`<AppVersion>` placeholder, which packaging tooling fills in at build time). It:
-
-- Extracts `uv-x86_64-pc-windows-msvc.zip` (must sit next to the script) into
-  `C:\Program Files\astral.sh\uv`.
-- Skips reinstalling if a version stamp file already matches the target version.
-- Creates **hardlinks** for `uv.exe`, `uvw.exe`, `uvx.exe` into `C:\Windows\System32` instead of
+It is a simple example of deployment script. It:
+* Extracts `uv-x86_64-pc-windows-msvc.zip` (must sit next to the script) into
+   `C:\Program Files\astral.sh\uv`.
+* Skips reinstalling if a version stamp file already matches the target version.
+* Creates **hardlinks** for `uv.exe`, `uvw.exe`, `uvx.exe` into `C:\Windows\System32` instead of
   modifying the system `PATH` - `System32` is already on `PATH` for every user, and hardlinks
   work here because both locations are on the same volume.
 - Logs to `%WinDir%\Logs\Astral-uv-<version>_Script.txt`.
 
-Deploy this through deployment system as a standard application package targeting the VDI golden image
-or machine pool.
+Deploy this through deployment system as a standard application package.
 
 ### 1.2 `Client Install/Startup_UV.ps1` - locks down configuration via Group Policy
 
 **Runs as a Group Policy Computer Startup Script**, not a login script or a manually-run tool:
 
-- Computer startup scripts run as **SYSTEM**, at boot, **before any user logs on** - so the
+* Computer startup scripts run as **SYSTEM**, at boot, **before any user logs on** - so the
   environment variables and `uv.toml` are guaranteed to be in place before any user session ever
   touches `uv`.
-- Because it's a *machine* policy, a standard user cannot override it - `Startup_UV.ps1` writes
+* Because it's a *machine* policy, a standard user cannot override it - `Startup_UV.ps1` writes
   to `%ProgramData%\uv\uv.toml`, which ordinary users can't modify.
 
 What it sets, all at machine scope:
@@ -223,8 +233,9 @@ cd C:\WheelHouseManager\Jobs
 .\Update-Wheelhouse.ps1
 ```
 
-**Note:** a plain run merges `Input\requirements.txt` (see below). Only run it after that file
-has been approved, or skip the merge explicitly with `-LocalRequirementsPath ""`.
+> [!NOTE]
+> a plain run merges `Input\requirements.txt` (see below). Only run it after that file
+> has been approved, or skip the merge explicitly with `-LocalRequirementsPath ""`.
 
 ### Why "merge" instead of "replace"
 
@@ -284,9 +295,7 @@ the output stream - this is what `Invoke-WheelhousePipeline.ps1` alerts on.
 ---
 
 ## 6. Scheduled Task - `Test-Wheelhouse.ps1`
-
-**This, not `Update-Wheelhouse.ps1`, is what the Scheduled Task runs.** It only detects and
-alerts - no merge, no download, no manifest changes, no Defender scan - so it's safe to leave
+It only detects and alerts - no merge, no download, no manifest changes, no Defender
 completely unattended on a schedule without risking a silent merge of an unapproved
 `Input\requirements.in` edit.
 
