@@ -74,9 +74,13 @@ param(
 
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
-$cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name RequirementsInPath, RequirementsTxtPath, PythonVersion, Platform, MinimumPackageAgeDays `
-    -SettingName @{ RequirementsTxtPath = 'LocalRequirementsPath' }
+$paramNames = @('RequirementsInPath', 'RequirementsTxtPath', 'PythonVersion', 'Platform', 'MinimumPackageAgeDays')
+$whlParams = @{
+    'BoundParameters' = $PSBoundParameters
+    'Name' = $paramNames
+    'SettingName' = @{ RequirementsTxtPath = 'LocalRequirementsPath' }
+}
+$cfg = Resolve-WheelhouseParameter @whlParams
 
 Write-Log "=== Update-Requirement started ==="
 Write-Log "Source (requirements.in): $($cfg.RequirementsInPath)"
