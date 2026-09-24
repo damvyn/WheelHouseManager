@@ -354,3 +354,42 @@ function Get-QuarantineFileName {
 
     return @($manifestMatches | ForEach-Object { [string]$_.file })
 }
+
+function Get-UndownloadedPin {
+    # Pins that a group file lists but whose wheel (for the target Python / platform)
+    # is not in the manifest - i.e. entries clients would expect but can't install.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$GroupFiles,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Manifest,
+
+        [Parameter(Mandatory)]
+        [string]$PythonVersion,
+
+        [Parameter(Mandatory)]
+        [string]$Platform
+    )
+
+    $pythonTag = 'cp' + ($PythonVersion -replace '\.', '')
+    foreach ($groupFile in $GroupFiles) {
+        $compareParams = @{
+            Required            = (Read-RequirementFile -FilePath $groupFile)
+            Manifest            = $Manifest
+            ExpectedPythonTag   = $pythonTag
+            ExpectedPlatformTag = $Platform
+        }
+        $missing = (Compare-RequirementsAgainstManifest @compareParams).Packages
+        foreach ($name in ($missing.Keys | Sort-Object)) {
+            [PSCustomObject]@{
+                Group   = [System.IO.Path]::GetFileNameWithoutExtension($groupFile)
+                Package = $name
+                Version = $missing[$name]
+            }
+        }
+    }
+}

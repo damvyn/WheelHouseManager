@@ -4,6 +4,6 @@
 # Manager root = the folder containing Jobs\, config\ and Input\ (two levels up).
 $script:ManagerRoot = Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent
 
-foreach ($file in @('Common', 'Settings', 'Requirements', 'Manifest', 'Audit', 'Alert', 'Run')) {
+foreach ($file in @('Common', 'Settings', 'Requirements', 'Manifest', 'Audit', 'Intake', 'Alert', 'Run')) {
     . (Join-Path (Join-Path $PSScriptRoot 'Functions') "$file.ps1")
 }

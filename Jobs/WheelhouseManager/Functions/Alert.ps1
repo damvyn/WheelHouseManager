@@ -21,7 +21,11 @@ function Get-VulnerabilityFinding {
         Write-Log "Reading report: $reportPath"
         $info = Get-AuditReportInfo -Path $reportPath
         $service = if ($info) { $info.Service } else { 'Unknown' }
-        $groupFile = if ($info -and $info.Group) { "$($info.Group).txt" } else { $null }
+        # Reports of candidate audits (Invoke-CandidateIntake) are named <group>-candidates:
+        # those packages were blocked before download and are not in the wheelhouse.
+        $isCandidate = [bool]($info -and $info.Group -and $info.Group.EndsWith('-candidates'))
+        $group = if ($info -and $info.Group) { $info.Group -replace '-candidates$', '' } else { $null }
+        $groupFile = if ($group) { "$group.txt" } else { $null }
 
         try {
             $dependencies = Get-PipAuditReport -Path $reportPath
@@ -48,9 +52,11 @@ function Get-VulnerabilityFinding {
                         FixVersions    = (@($vuln.fix_versions) | Where-Object { $_ }) -join ', '
                         Services       = [System.Collections.Generic.List[string]]::new()
                         GroupFiles     = [System.Collections.Generic.List[string]]::new()
+                        Deployed       = $false
                     }
                 }
                 $finding = $findings[$key]
+                if (-not $isCandidate) { $finding.Deployed = $true }
                 if (-not $finding.Services.Contains($service)) { $finding.Services.Add($service) }
                 if ($groupFile -and -not $finding.GroupFiles.Contains($groupFile)) { $finding.GroupFiles.Add($groupFile) }
             }
@@ -99,14 +105,21 @@ function ConvertTo-VulnerabilityAlertHtml {
             $requirementsLine = "$($finding.NormalizedName)==$($finding.Version)"
             $groupFiles = if ($finding.GroupFiles.Count -gt 0) { $finding.GroupFiles -join ', ' } else { 'the wheelhouse group file(s) (requirements-N.txt)' }
 
-            $recommendation = "1) Remove or update the line <code>$(ConvertTo-HtmlSafe $requirementsLine)</code> in $(ConvertTo-HtmlSafe $groupFiles)"
-            if ($finding.FixVersions) {
-                $recommendation += " (suggested fix version: <b>$(ConvertTo-HtmlSafe $finding.FixVersions)</b>, subject to the cooldown policy)."
+            $fixNote = if ($finding.FixVersions) {
+                " (suggested fix version: <b>$(ConvertTo-HtmlSafe $finding.FixVersions)</b>, subject to the cooldown policy)."
             }
             else {
-                $recommendation += ' (no fix version is currently published - consider removing the dependency or accepting the risk with sign-off).'
+                ' (no fix version is currently published - consider removing the dependency or accepting the risk with sign-off).'
             }
-            $recommendation += "<br/>2) Move the following wheel file(s) to the quarantine folder:<br/>$quarantineFilesHtml"
+
+            if ($finding.Deployed) {
+                $recommendation = "1) Remove or update the line <code>$(ConvertTo-HtmlSafe $requirementsLine)</code> in $(ConvertTo-HtmlSafe $groupFiles)$fixNote"
+                $recommendation += "<br/>2) Move the following wheel file(s) to the quarantine folder:<br/>$quarantineFilesHtml"
+            }
+            else {
+                $recommendation = "<b>Blocked before download</b> - this version was NOT added to the wheelhouse ($(ConvertTo-HtmlSafe $groupFiles)). "
+                $recommendation += "Change or remove it in requirements.in and re-run Update-Requirement.ps1$fixNote"
+            }
 
             [void]$rows.AppendLine(@"
 <tr>

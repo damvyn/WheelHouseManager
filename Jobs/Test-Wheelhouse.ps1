@@ -61,7 +61,7 @@ param(
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, VulnerabilityServices, ReportRetentionMonths
+    -Name WheelhousePath, VulnerabilityServices, ReportRetentionMonths, PythonVersion, Platform
 
 $title = 'Wheelhouse audit-only check'
 $outcome = $null
@@ -90,6 +90,16 @@ try {
         $groupFiles = Get-WheelhouseGroupFile -WheelhousePath $cfg.WheelhousePath
         if ($groupFiles.Count -eq 0) {
             Write-Log 'No requirement group files found in the wheelhouse - nothing to audit.' 'WARN'
+        }
+
+        # Group entries without a wheel can't be installed by clients.
+        $undownloaded = @(Get-UndownloadedPin -GroupFiles $groupFiles -Manifest $manifest -PythonVersion $cfg.PythonVersion -Platform $cfg.Platform)
+        if ($undownloaded.Count -gt 0) {
+            Write-Log "$($undownloaded.Count) package(s) are listed in group files but have no wheel in the wheelhouse:" 'WARN'
+            foreach ($item in $undownloaded) {
+                Write-Log "  - $($item.Group): $($item.Package)==$($item.Version)" 'WARN'
+            }
+            Write-Log 'Run Update-Wheelhouse.ps1 to download them (it reports why a package is rejected), or remove those lines from the group files.' 'WARN'
         }
     }
 
