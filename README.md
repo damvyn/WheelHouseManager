@@ -213,11 +213,28 @@ cd C:\WheelHouseManager\Jobs
 ```
 
 Defaults to `Input\requirements.in` / `Input\requirements.txt` under the manager root, and to
-the `PythonVersion`/`MinimumPackageAgeDays` from `settings.psd1`. Internally runs:
+the `PythonVersion` / `Platform` / `MinimumPackageAgeDays` from `settings.psd1`. It works in
+two steps, so that the result can always be downloaded by `Update-Wheelhouse.ps1` later
+(binary wheels only, for exactly that Python version and platform):
 
-```powershell
-uv pip compile Input\requirements.in --exclude-newer "10 days" --python 3.14 -o Input\requirements.txt
-```
+1. **Resolve with uv, binary wheels only, for the target platform:**
+   ```powershell
+   uv pip compile Input\requirements.in --exclude-newer "10 days" --python-version 3.14 `
+       --python-platform x86_64-pc-windows-msvc --only-binary :all: -o <temporary file>
+   ```
+   Without `--only-binary` uv would accept versions that only exist as source archives
+   (e.g. `numpy==1.26.4` has no Python 3.14 wheel), which `pip download --only-binary` can't fetch.
+2. **Verify with pip:** uv ignores upper bounds on `Requires-Python` (e.g. `pyqtdarktheme2`
+   declares `<3.14`), so the resolved file is checked with `pip install --dry-run --no-deps
+   --only-binary=:all: --python-version 3.14 --platform win_amd64` - the same rules as the
+   later download. Every unavailable package is listed, not just the first.
+
+Only a result that passes both steps replaces `Input\requirements.txt`. Otherwise the existing
+`requirements.txt` is left untouched, the rejected result is saved as
+`Input\requirements.rejected.txt` for review, and the script exits with code 1 - remove the
+listed packages from `requirements.in` (or constrain them to a version that supports the target
+Python) and run it again. The check downloads the wheels into pip's cache, so the later
+`Update-Wheelhouse.ps1` download of the same files is fast.
 
 Review the resulting `Input\requirements.txt` and get it approved before the next step.
 

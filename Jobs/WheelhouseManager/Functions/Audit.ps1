@@ -38,7 +38,7 @@ function Confirm-PythonAndTooling {
             continue
         }
         Write-Log "$tool is outdated (current: $($toolOutdated.version), latest: $($toolOutdated.latest_version)). Upgrading..." 'WARN'
-        & python -m pip install --upgrade $tool | Out-Host
+        Invoke-NativeCommand -FilePath python -ArgumentList '-m', 'pip', 'install', '--upgrade', $tool
         if ($LASTEXITCODE -eq 0) {
             Write-Log "$tool upgraded successfully." 'OK'
         }
@@ -50,7 +50,7 @@ function Confirm-PythonAndTooling {
     & python -m pip show pip-audit *> $null
     if ($LASTEXITCODE -ne 0) {
         Write-Log 'pip-audit is not installed. Installing...' 'WARN'
-        & python -m pip install pip-audit | Out-Host
+        Invoke-NativeCommand -FilePath python -ArgumentList '-m', 'pip', 'install', 'pip-audit'
         if ($LASTEXITCODE -ne 0) {
             throw "pip-audit installation FAILED (exit code $LASTEXITCODE)."
         }
@@ -196,7 +196,7 @@ function Invoke-PipAudit {
         '--format', 'json',
         '--output', $reportFile
     )
-    & python @pipAuditArgs | Out-Host
+    Invoke-NativeCommand -FilePath python -ArgumentList $pipAuditArgs
     $exitCode = $LASTEXITCODE
 
     $status = 'Passed'
@@ -255,7 +255,7 @@ function Show-PipAuditFixSuggestion {
     )
 
     Write-Log 'Checking whether pip-audit can suggest safe replacement versions (informational only, NOT applied automatically)...'
-    & python -m pip_audit -r $RequirementsFilePath --vulnerability-service pypi --progress-spinner off --fix --dry-run | Out-Host
+    Invoke-NativeCommand -FilePath python -ArgumentList '-m', 'pip_audit', '-r', $RequirementsFilePath, '--vulnerability-service', 'pypi', '--progress-spinner', 'off', '--fix', '--dry-run'
     Write-Log 'Review the suggestions above. Update the requirements manually if you choose to adopt any of them.' 'WARN'
 }
 

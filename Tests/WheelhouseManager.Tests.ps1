@@ -30,7 +30,7 @@ Describe 'WheelhouseManager' {
 
     AfterAll {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
-        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -386,6 +386,103 @@ Describe 'WheelhouseManager' {
             Confirm-PythonAndTooling
 
             ($global:WhmPipInstalls -join ',') | Should -Be 'pip-audit'
+        }
+    }
+
+    Context 'Invoke-NativeCommand' {
+        It 'records stdout and stderr of a native program in the transcript and keeps its exit code' {
+            # Regression: Windows PowerShell 5.1's transcript missed stderr (pip's "ERROR:" lines).
+            $shell = (Get-Process -Id $PID).Path
+            $log = Join-Path (Get-TestFolder) 'transcript.txt'
+
+            Start-Transcript -Path $log | Out-Null
+            try {
+                Invoke-NativeCommand -FilePath $shell -ArgumentList '-NoProfile', '-Command', "[Console]::Out.WriteLine('stdout-line'); [Console]::Error.WriteLine('ERROR: stderr-line'); exit 3"
+                $exitCode = $LASTEXITCODE
+            }
+            finally {
+                Stop-Transcript | Out-Null
+            }
+
+            $exitCode | Should -Be 3
+            $content = Get-Content -Path $log -Raw
+            $content | Should -Match 'stdout-line'
+            $content | Should -Match 'ERROR: stderr-line'
+        }
+    }
+
+    Context 'Invoke-NativeCommand with Python' {
+        It 'records a Python program''s stderr (like pip "ERROR:" lines) in the transcript and returns lines with -PassThru' {
+            $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $python) {
+                Set-ItResult -Skipped -Because 'python is not installed'
+                return
+            }
+            $log = Join-Path (Get-TestFolder) 'transcript.txt'
+
+            Start-Transcript -Path $log | Out-Null
+            try {
+                $lines = Invoke-NativeCommand -FilePath $python.Source -PassThru -ArgumentList '-c', "import sys; print('Collecting x==1'); sys.stderr.write('ERROR: No matching distribution found for x==1\n'); sys.exit(1)"
+                $exitCode = $LASTEXITCODE
+            }
+            finally {
+                Stop-Transcript | Out-Null
+            }
+
+            $exitCode | Should -Be 1
+            ($lines -join "`n") | Should -Match 'No matching distribution found for x==1'
+            (Get-Content -Path $log -Raw) | Should -Match 'ERROR: No matching distribution found for x==1'
+        }
+    }
+
+    Context 'ConvertTo-UvPythonPlatform' {
+        It 'maps pip platform tags to uv target triples' {
+            ConvertTo-UvPythonPlatform -Platform 'win_amd64' | Should -Be 'x86_64-pc-windows-msvc'
+            ConvertTo-UvPythonPlatform -Platform 'win_arm64' | Should -Be 'aarch64-pc-windows-msvc'
+            { ConvertTo-UvPythonPlatform -Platform 'manylinux_2_28_x86_64' } | Should -Throw
+        }
+    }
+
+    Context 'Test-RequirementWheelAvailability' {
+        It 'reports every pin pip cannot download, re-checking after dropping each one' {
+            $file = Join-Path (Get-TestFolder) 'requirements.txt'
+            Set-Content -Path $file -Value @('good==1.0', 'pyqtdarktheme2==2.1.2', 'numpy==1.26.4')
+            $global:WhmPipChecks = [System.Collections.Generic.List[string]]::new()
+
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-NativeCommand -MockWith {
+                $reqFile = $ArgumentList[[array]::IndexOf($ArgumentList, '-r') + 1]
+                $pins = @(Get-Content -Path $reqFile)
+                $global:WhmPipChecks.Add($pins -join ',')
+                # Like pip: stop at the first pin (in file order) that has no usable wheel.
+                $bad = $pins | Where-Object { $_ -in 'numpy==1.26.4', 'pyqtdarktheme2==2.1.2' } | Select-Object -First 1
+                if ($bad) {
+                    $global:LASTEXITCODE = 1
+                    return @('ERROR: Could not find a version that satisfies the requirement ' + $bad, 'ERROR: No matching distribution found for ' + $bad)
+                }
+                $global:LASTEXITCODE = 0
+                return @('Would install ' + ($pins -join ' '))
+            }
+
+            $result = Test-RequirementWheelAvailability -RequirementsFilePath $file -PythonVersion '3.14' -Platform 'win_amd64'
+
+            $result.Passed | Should -Be $false
+            ($result.Unavailable | Sort-Object) -join ',' | Should -Be 'numpy==1.26.4,pyqtdarktheme2==2.1.2'
+            $result.Error | Should -BeNullOrEmpty
+            $global:WhmPipChecks.Count | Should -Be 3
+            $global:WhmPipChecks[2] | Should -Be 'good==1.0'
+        }
+
+        It 'passes a clean file and reports a pip failure it cannot attribute as an error' {
+            $file = Join-Path (Get-TestFolder) 'requirements.txt'
+            Set-Content -Path $file -Value 'good==1.0'
+
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-NativeCommand -MockWith { $global:LASTEXITCODE = 0; return @('Would install good-1.0') }
+            (Test-RequirementWheelAvailability -RequirementsFilePath $file -PythonVersion '3.14' -Platform 'win_amd64').Passed | Should -Be $true
+
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-NativeCommand -MockWith { $global:LASTEXITCODE = 1; return @('ERROR: Could not fetch URL https://pypi.org/simple/good/: connection error') }
+            $result = Test-RequirementWheelAvailability -RequirementsFilePath $file -PythonVersion '3.14' -Platform 'win_amd64'
+            $result.Passed | Should -Be $false
+            $result.Error | Should -Match 'network or proxy'
         }
     }
 

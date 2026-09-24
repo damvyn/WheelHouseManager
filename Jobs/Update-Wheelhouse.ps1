@@ -275,7 +275,7 @@ try {
             '--only-binary=:all:',
             '--no-deps'
         )
-        & python @pipDownloadArgs | Out-Host
+        Invoke-NativeCommand -FilePath python -ArgumentList $pipDownloadArgs
 
         if ($LASTEXITCODE -eq 0) {
             Write-Log "${groupName}: download completed successfully." 'OK'
