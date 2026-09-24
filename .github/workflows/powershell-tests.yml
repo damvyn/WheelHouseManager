@@ -17,12 +17,30 @@ jobs:
       run:
         shell: ${{ matrix.shell }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Show version
         run: $PSVersionTable | Format-Table -AutoSize | Out-String
+      
+      - name: Determine module path
+        id: module-path
+        shell: pwsh
+        run: |
+          $path = if ('${{ matrix.shell }}') -eq 'powershell') {
+            "$HOME\Documents\WindowsPowerShell\Modules"
+          } else {
+            "$HOME\Documents\PowerShellModules"
+          }
+          "path=$path" >> $env:GITHUB_OUTPUT
+      - name: Cache PowerShell Modules
+        id: cache-modules
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.module-path.outputs.path }}
+          key: ${{ runner.os }}-${{ matrix.shell }}-psmodules-pester5.5.0-psa
 
       - name: Install Pester and PSScriptAnalyzer
+        if: steps.cache-modules.outputs.cache-hit != 'true'
         run: |
           [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
           if ($PSVersionTable.PSEdition -ne 'Core') {
