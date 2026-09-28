@@ -52,12 +52,10 @@ param(
 
     [string]$SmtpServer,
     [string]$MailTo,
-    [string]$MailFrom,
-
-    [ValidateNotNullOrEmpty()]
-    [string]$SendAlertScriptPath = (Join-Path $PSScriptRoot 'Send-VulnerabilityAlert.ps1')
+    [string]$MailFrom
 )
 
+$sendAlertScriptPath = (Join-Path $PSScriptRoot 'Send-VulnerabilityAlert.ps1')
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $whlParams = @{
@@ -151,13 +149,13 @@ try {
     $alertParams = Get-VulnerabilityAlertParameter -AuditResult $auditResults.ToArray() -AlertParameters $alertParams
     $alertExitCode = 0
     if ($null -ne $alertParams) {
-        if (Test-Path -Path $SendAlertScriptPath) {
-            & $SendAlertScriptPath @alertParams | Out-Host
+        if (Test-Path -Path $sendAlertScriptPath) {
+            & $sendAlertScriptPath @alertParams | Out-Host
             $alertExitCode = $LASTEXITCODE
             Write-Log "Send-VulnerabilityAlert.ps1 finished with exit code $alertExitCode."
         }
         else {
-            Write-Log "Send-VulnerabilityAlert.ps1 not found at: $SendAlertScriptPath - cannot send the alert." 'ERROR'
+            Write-Log "Send-VulnerabilityAlert.ps1 not found at: $sendAlertScriptPath - cannot send the alert." 'ERROR'
             $alertExitCode = 1
         }
     }

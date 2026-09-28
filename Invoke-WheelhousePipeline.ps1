@@ -36,11 +36,6 @@
     Passed through to Send-VulnerabilityAlert.ps1. Without an SMTP server (here or in
     settings.psd1) the alert is saved as an HTML file instead of emailed.
 
-.PARAMETER UpdateWheelhouseScriptPath
-.PARAMETER SendAlertScriptPath
-    Paths to the two underlying scripts. Default to Jobs\ next to this script
-    (this script itself lives at the manager root, alongside config\ and Input\).
-
 .EXAMPLE
     .\Invoke-WheelhousePipeline.ps1 -WheelhousePath "\\server\share\wheelhouse"
 

@@ -8,7 +8,7 @@
     Update-Requirement.ps1, Test-Wheelhouse.ps1, Send-VulnerabilityAlert.ps1) and
     Invoke-WheelhousePipeline.ps1 (deployed to the destination root, not Jobs\)
     from next to this script into -DestinationPath, creates config\settings.psd1
-    if it doesn't exist yet, and creates an empty Input\requirements.in / 
+    if it doesn't exist yet, and creates an empty Input\requirements.in and
     Input\requirements.txt if they don't exist yet.
 
     Idempotent: re-running this script always refreshes the Jobs\ scripts (so a
@@ -75,7 +75,7 @@ else {
     }
     Copy-Item -Path (Join-Path $sourceJobsPath 'WheelhouseManager') -Destination $destJobsPath -Recurse -Force
 }
-Write-Log "Deployed Jobs\scripts and the WheelhouseManager module to: $destJobsPath" "OK"
+Write-Log "Deployed Jobs\ scripts and the WheelhouseManager module to: $destJobsPath" "OK"
 
 $sourceOrchestratorPath = Join-Path $PSScriptRoot "Invoke-WheelhousePipeline.ps1"
 if (Test-Path -Path $sourceOrchestratorPath) {
