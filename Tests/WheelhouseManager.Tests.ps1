@@ -17,7 +17,7 @@ Describe 'WheelhouseManager' {
         }
 
         # Writes a pip-audit JSON report with one vulnerable package; returns its path.
-        function New-TestAuditReport {
+        function Write-TestAuditReport {
             param([string]$Path)
             $report = '{"dependencies":[{"name":"requests","version":"2.19.0","vulns":[{"id":"PYSEC-2018-28","aliases":["CVE-2018-18074"],"fix_versions":["2.20.0"],"description":"Credentials leak on redirect."}]},{"name":"six","version":"1.16.0","vulns":[]}],"fixes":[]}'
             Set-Content -Path $Path -Value $report
@@ -338,7 +338,7 @@ Describe 'WheelhouseManager' {
     Context 'Get-VulnerabilityFinding' {
         It 'merges the same vulnerability from several reports and reports unreadable files as errors' {
             $reports = Get-TestFolder
-            $example = New-TestAuditReport -Path (Join-Path $reports 'example.json')
+            $example = Write-TestAuditReport -Path (Join-Path $reports 'example.json')
             $osv = Join-Path $reports 'Report_Scheduled-requirements-1-OSV_20260921_153000.json'
             $pypi = Join-Path $reports 'Report_Scheduled-requirements-2-PYPI_20260921_153000.json'
             Copy-Item -Path $example -Destination $osv
@@ -356,7 +356,7 @@ Describe 'WheelhouseManager' {
         It 'produces HTML naming the group file and the audit errors' {
             $reports = Get-TestFolder
             $osv = Join-Path $reports 'Report_Scheduled-requirements-3-OSV_20260921_153000.json'
-            New-TestAuditReport -Path $osv | Out-Null
+            Write-TestAuditReport -Path $osv | Out-Null
             $result = Get-VulnerabilityFinding -ReportPaths @($osv)
             $html = ConvertTo-VulnerabilityAlertHtml -Findings $result.Findings -AuditErrors @('requirements-1 / OSV: <boom>') -WheelhousePath ''
             $html | Should -Match 'requirements-3\.txt'
@@ -599,7 +599,7 @@ Describe 'WheelhouseManager' {
         It 'marks a finding from a candidate audit as blocked, not deployed' {
             $reports = Get-TestFolder
             $report = Join-Path $reports 'Report_PreDownload-requirements-2-candidates-OSV_20260921_153000.json'
-            New-TestAuditReport -Path $report | Out-Null
+            Write-TestAuditReport -Path $report | Out-Null
 
             $result = Get-VulnerabilityFinding -ReportPaths @($report)
             $result.Findings[0].Deployed | Should -Be $false
