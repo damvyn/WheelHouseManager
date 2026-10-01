@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wheelhouse Manager</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Wheelhouse Manager</div>
+  <div id="status" class="status"></div>
+  <button id="stop-ui" class="btn small ghost" title="Stop the UI server on this computer">Stop UI</button>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="packages" class="active">Packages</button>
+  <button data-tab="add">Add packages</button>
+  <button data-tab="quarantine">Quarantine</button>
+  <button data-tab="denylist">Denylist</button>
+  <button data-tab="settings">Settings</button>
+  <button data-tab="jobs">Jobs</button>
+</nav>
+
+<main>
+  <div id="banner" class="banner hidden"></div>
+
+  <section id="tab-packages" class="tab"></section>
+  <section id="tab-add" class="tab hidden"></section>
+  <section id="tab-quarantine" class="tab hidden"></section>
+  <section id="tab-denylist" class="tab hidden"></section>
+  <section id="tab-settings" class="tab hidden"></section>
+  <section id="tab-jobs" class="tab hidden"></section>
+</main>
+
+<aside id="jobbar" class="jobbar hidden">
+  <div class="jobbar-head">
+    <strong id="jobbar-title"></strong>
+    <span id="jobbar-state" class="badge"></span>
+    <span class="spacer"></span>
+    <button id="jobbar-cancel" class="btn small danger hidden">Cancel</button>
+    <button id="jobbar-toggle" class="btn small ghost">Hide log</button>
+    <button id="jobbar-close" class="btn small ghost">Close</button>
+  </div>
+  <pre id="jobbar-log" class="log"></pre>
+</aside>
+
+<dialog id="dialog"></dialog>
+<div id="toasts" class="toasts"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

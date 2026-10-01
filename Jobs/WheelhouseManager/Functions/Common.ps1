@@ -124,3 +124,49 @@ function Invoke-NativeCommand {
 
     if ($PassThru) { Write-Output -NoEnumerate $lines.ToArray() }
 }
+
+function Enter-WheelhouseLock {
+    # Takes the wheelhouse-wide lock (<wheelhouse>\.wheelhouse.lock) that every
+    # operation changing the manifest or the group files holds while it runs, so a
+    # UI action, Update-Wheelhouse.ps1 and a scheduled run never rewrite them at
+    # the same time. The lock is an exclusively opened, delete-on-close file: the
+    # operating system releases it even if the holding process crashes.
+    # Returns the lock handle for Exit-WheelhouseLock; throws InvalidOperationException
+    # if another operation holds the lock.
+    [CmdletBinding()]
+    [OutputType([System.IO.FileStream])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath
+    )
+
+    $lockPath = Join-Path $WheelhousePath '.wheelhouse.lock'
+    try {
+        $stream = [System.IO.FileStream]::new(
+            $lockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::DeleteOnClose)
+    }
+    catch [System.IO.IOException] {
+        throw [System.InvalidOperationException]::new("Another wheelhouse operation is already running (lock file in use: $lockPath). Wait for it to finish and try again.")
+    }
+
+    $info = [System.Text.Encoding]::ASCII.GetBytes("pid=$PID user=$env:USERNAME started=$((Get-Date).ToString('s'))")
+    $stream.Write($info, 0, $info.Length)
+    $stream.Flush()
+    # The comma stops PowerShell from trying to enumerate the stream.
+    return , $stream
+}
+
+function Exit-WheelhouseLock {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [System.IO.FileStream]$Lock
+    )
+
+    if ($null -ne $Lock) { $Lock.Dispose() }
+}

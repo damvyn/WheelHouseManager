@@ -224,3 +224,87 @@ function Initialize-ManagerFile {
         Write-Log "Created: $Path" 'OK'
     }
 }
+
+function Get-WheelhouseSettingSchema {
+    # The settings the UI may edit, with the kind of value each takes. Defaults come
+    # from Get-WheelhouseDefaultSetting; this only describes how to present and
+    # validate them.
+    [CmdletBinding()]
+    param()
+
+    $schema = @(
+        @{ Key = 'WheelhousePath'; Type = 'path'; Label = 'Wheelhouse folder'; Help = 'UNC or local path of the wheelhouse (must exist).' }
+        @{ Key = 'RequirementsInPath'; Type = 'file'; Label = 'requirements.in'; Help = 'Where the packages you ask for are listed.' }
+        @{ Key = 'LocalRequirementsPath'; Type = 'file'; Label = 'requirements.txt'; Help = 'The resolved, pinned file that Update-Wheelhouse merges.' }
+        @{ Key = 'PythonVersion'; Type = 'string'; Label = 'Python version'; Help = 'Target version, for example 3.14.' }
+        @{ Key = 'Platform'; Type = 'choice'; Label = 'Platform'; Options = @('win_amd64', 'win_arm64', 'win32'); Help = 'Wheel platform tag.' }
+        @{ Key = 'MinimumPackageAgeDays'; Type = 'int'; Label = 'Cooldown (days)'; Min = 0; Max = 3650; Help = 'A version must be on PyPI this long before it is downloaded.' }
+        @{ Key = 'VulnerabilityServices'; Type = 'multichoice'; Label = 'Vulnerability services'; Options = @('osv', 'pypi'); Help = 'pip-audit services used for every audit.' }
+        @{ Key = 'ReportRetentionMonths'; Type = 'int'; Label = 'Report retention (months)'; Min = 1; Max = 1200; Help = 'Logs and reports older than this are removed.' }
+        @{ Key = 'SmtpServer'; Type = 'string'; Label = 'SMTP server'; Help = 'Empty: alerts are saved as HTML instead of emailed.' }
+        @{ Key = 'MailTo'; Type = 'string'; Label = 'Alert recipient'; Help = 'Where vulnerability alerts go.' }
+        @{ Key = 'MailFrom'; Type = 'string'; Label = 'Alert sender'; Help = 'From address of alert mails.' }
+    )
+    foreach ($item in $schema) { [PSCustomObject]$item }
+}
+
+function ConvertTo-WheelhouseSettingValue {
+    # Validates and converts one value coming from the UI. Returns the value to store;
+    # throws ArgumentException with a readable message otherwise.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Key,
+
+        [AllowNull()]
+        $Value
+    )
+
+    $definition = Get-WheelhouseSettingSchema | Where-Object { $_.Key -eq $Key } | Select-Object -First 1
+    if (-not $definition) {
+        throw [System.ArgumentException]::new("Unknown setting: '$Key'.")
+    }
+    $fail = { param($Text) throw [System.ArgumentException]::new("$($definition.Label): $Text") }
+
+    switch ($definition.Type) {
+        'int' {
+            $number = 0
+            if (-not [int]::TryParse([string]$Value, [ref]$number)) { & $fail 'must be a whole number.' }
+            if ($number -lt $definition.Min -or $number -gt $definition.Max) { & $fail "must be between $($definition.Min) and $($definition.Max)." }
+            return $number
+        }
+        'choice' {
+            if ($definition.Options -notcontains [string]$Value) { & $fail "must be one of: $($definition.Options -join ', ')." }
+            if ($Key -eq 'Platform') {
+                # Same mapping Update-Requirement.ps1 needs; throws for an unsupported tag.
+                try { [void](ConvertTo-UvPythonPlatform -Platform ([string]$Value)) } catch { & $fail $_.Exception.Message }
+            }
+            return [string]$Value
+        }
+        'multichoice' {
+            # foreach (not @()) flattens the list on every PowerShell version.
+            $items = @(foreach ($item in @($Value)) { [string]$item })
+            if ($items.Count -eq 0) { & $fail 'select at least one.' }
+            foreach ($item in $items) {
+                if ($definition.Options -notcontains $item) { & $fail "'$item' is not one of: $($definition.Options -join ', ')." }
+            }
+            return , @($items | Select-Object -Unique)
+        }
+        { $_ -in 'path', 'file' } {
+            $text = ([string]$Value).Trim()
+            if ($text -eq '' -or $text -match '["<>|*?]' -or $text -match '[\x00-\x1f]') { & $fail 'enter a valid path.' }
+            if ($definition.Type -eq 'path' -and -not (Test-Path -Path $text -PathType Container)) { & $fail "folder not found or not reachable: $text" }
+            return $text
+        }
+        default {
+            $text = ([string]$Value).Trim()
+            if ($text -match '[\x00-\x1f]' -or $text.Length -gt 300) { & $fail 'contains invalid characters or is too long.' }
+            switch ($Key) {
+                'PythonVersion' { if ($text -notmatch '^\d+\.\d+$') { & $fail 'use the form 3.14.' } }
+                'SmtpServer' { if ($text -ne '' -and $text -notmatch '^[A-Za-z0-9.\-]+(:\d+)?$') { & $fail 'enter a host name or IP address, optionally with :port.' } }
+                { $_ -in 'MailTo', 'MailFrom' } { if ($text -ne '' -and $text -notmatch '^[^@\s;,]+@[^@\s;,]+$') { & $fail 'enter an email address.' } }
+            }
+            return $text
+        }
+    }
+}

@@ -40,7 +40,11 @@ function Invoke-CandidateIntake {
         [string]$PythonVersion,
 
         [Parameter(Mandatory)]
-        [string]$Platform
+        [string]$Platform,
+
+        # Entries of config\denylist.json. Blocked packages are rejected before any other check.
+        [AllowEmptyCollection()]
+        [object[]]$Denylist = @()
     )
 
     $remaining = @{} + $Packages
@@ -54,16 +58,27 @@ function Invoke-CandidateIntake {
         $remaining.Remove($Name)
     }
 
+    # --- 0. Denylist ---------------------------------------------------------------
+    foreach ($name in @($remaining.Keys)) {
+        $blocked = Get-DenylistMatch -Name $name -Version $remaining[$name] -Denylist $Denylist
+        if ($blocked) {
+            $why = if ($blocked.reason) { ": $($blocked.reason)" } else { '' }
+            & $reject $name "denylist ($($blocked.version), $($blocked.source))$why"
+        }
+    }
+
     # --- 1. Vulnerability audit ------------------------------------------------
     # Report files are named after the candidate file: Report_PreDownload-<group>-candidates-...
     $workFolder = Join-Path ([System.IO.Path]::GetTempPath()) ("wheelhouse-intake-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $workFolder -Force | Out-Null
     try {
-        $candidateFile = Join-Path $workFolder "$GroupName-candidates.txt"
-        Set-Content -Path $candidateFile -Value @($remaining.Keys | Sort-Object | ForEach-Object { "$_==$($remaining[$_])" }) -Encoding ascii
+        if ($remaining.Count -gt 0) {
+            $candidateFile = Join-Path $workFolder "$GroupName-candidates.txt"
+            Set-Content -Path $candidateFile -Value @($remaining.Keys | Sort-Object | ForEach-Object { "$_==$($remaining[$_])" }) -Encoding ascii
 
-        $results = Invoke-GroupAudit -GroupFile $candidateFile -Services $Services -Stage 'PreDownload' -ReportsFolder $ReportsFolder
-        foreach ($result in $results) { $auditResults.Add($result) }
+            $results = Invoke-GroupAudit -GroupFile $candidateFile -Services $Services -Stage 'PreDownload' -ReportsFolder $ReportsFolder
+            foreach ($result in $results) { $auditResults.Add($result) }
+        }
     }
     finally {
         Remove-Item -Path $workFolder -Recurse -Force -ErrorAction SilentlyContinue

@@ -121,8 +121,19 @@ $compileArgs = @(
     "-o", $candidatePath
 )
 
+# Steer the resolver away from versions on the denylist (config\denylist.json).
+# Intake rejects them anyway; this lets uv pick a different version where one fits.
+$constraintsPath = Join-Path $targetFolder "requirements.constraints.tmp"
+[string[]]$constraintLines = Get-DenylistConstraintLine -Denylist @(Read-WheelhouseDenylist)
+if ($constraintLines.Count -gt 0) {
+    Set-Content -Path $constraintsPath -Value $constraintLines -Encoding ascii
+    $compileArgs += @("--constraints", $constraintsPath)
+    Write-Log "Excluding $($constraintLines.Count) denylisted version(s) from resolution."
+}
+
 Write-Log "Resolving with uv (binary wheels only, $($cfg.PythonVersion) / $uvPlatform)..."
 Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs
+Remove-Item -Path $constraintsPath -Force -ErrorAction SilentlyContinue
 
 if ($LASTEXITCODE -ne 0) {
     Write-Log "uv pip compile FAILED (exit code $LASTEXITCODE). Review the output above." "ERROR"

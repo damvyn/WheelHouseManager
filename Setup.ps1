@@ -5,7 +5,9 @@
 
 .DESCRIPTION
     Copies Jobs\ (the WheelhouseManager module, Update-Wheelhouse.ps1,
-    Update-Requirement.ps1, Test-Wheelhouse.ps1, Send-VulnerabilityAlert.ps1) and
+    Update-Requirement.ps1, Test-Wheelhouse.ps1, Test-WheelhousePackage.ps1,
+    Invoke-WheelhouseScan.ps1, Start-WheelhouseUI.ps1, Send-VulnerabilityAlert.ps1; the module
+    folder includes the UI's Web\ files) and
     Invoke-WheelhousePipeline.ps1 (deployed to the destination root, not Jobs\)
     from next to this script into -DestinationPath, creates config\settings.psd1
     if it doesn't exist yet, and creates an empty Input\requirements.in and

@@ -122,11 +122,19 @@ $title = 'Wheelhouse maintenance script'
 $outcome = $null
 $exitCode = 0
 $auditResults = [System.Collections.Generic.List[object]]::new()
+$lock = $null
 
 try {
     $reportsFolder = Start-WheelhouseRun -WheelhousePath $cfg.WheelhousePath -Title $title -LogPrefix 'Log' -RetentionMonths $cfg.ReportRetentionMonths
 
+    # Only one operation at a time may change the manifest and the group files
+    # (the UI's remove/quarantine actions take the same lock).
+    $lock = Enter-WheelhouseLock -WheelhousePath $cfg.WheelhousePath
+
     Confirm-PythonAndTooling
+
+    $denylist = @(Read-WheelhouseDenylist)
+    if ($denylist.Count -gt 0) { Write-Log "Denylist: $($denylist.Count) blocked package entr(y/ies) will be rejected at intake." }
 
     # -----------------------------------------------------------------------
     # Step 1: manifest integrity check - must pass before anything else happens
@@ -244,8 +252,9 @@ try {
                 MinimumAgeDays = $cfg.MinimumPackageAgeDays
                 PythonVersion  = $cfg.PythonVersion
                 Platform       = $cfg.Platform
+                Denylist       = $denylist
             }
-            $intake = Invoke-CandidateIntake @intakeParams
+            $intake =Invoke-CandidateIntake @intakeParams
             foreach ($result in $intake.AuditResults) { $auditResults.Add($result) }
 
             if ($intake.Accepted.Count -gt 0) { $anyDownloadHappened = $true }
@@ -311,19 +320,10 @@ try {
         Write-Log 'No downloads occurred this run - manifest left unchanged.'
     }
 
-    Write-Log 'Starting Microsoft Defender scan on the wheelhouse folder...'
-    if (Get-Command Start-MpScan -ErrorAction SilentlyContinue) {
-        try {
-            Start-MpScan -ScanPath $cfg.WheelhousePath -ScanType CustomScan -ErrorAction Stop
-            Write-Log 'Microsoft Defender scan completed.' 'OK'
-        }
-        catch {
-            Write-Log "Microsoft Defender scan failed: $($_.Exception.Message)" 'ERROR'
-        }
-    }
-    else {
-        Write-Log 'Start-MpScan cmdlet is not available on this machine. Skipping Defender scan.' 'WARN'
-    }
+    # A failed or unavailable scan is logged but does not fail the run (as before);
+    # a detection does.
+    $scan = Invoke-WheelhouseDefenderScan -Path $cfg.WheelhousePath -ReportsFolder $reportsFolder
+    if ($scan.Status -eq 'Threat') { $overallPassed = $false }
 
     if (-not $overallPassed) {
         $exitCode = 1
@@ -336,6 +336,7 @@ catch {
     $outcome = 'ABORTED'
 }
 finally {
+    Exit-WheelhouseLock -Lock $lock
     Stop-WheelhouseRun -Title $title -Outcome $outcome
 }
 

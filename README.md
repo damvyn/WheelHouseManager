@@ -3,6 +3,7 @@
 ## ❓What does it do?
 This project creates a standalone index for Python packages and provide management functionalities:
 - Add new packages and dependencies
+- Manage everything from a local web UI (audit, scan, add, remove/quarantine, denylist, settings)
 - Run OSV and PyPi audit
 - Run antivirus scan (Defender)
 - Build Requirements.txt according to specified rules
@@ -35,10 +36,15 @@ Jobs/
     WheelhouseManager/             # PowerShell module with all shared functions - imported by every script
         WheelhouseManager.psd1     #   module manifest (exported function list)
         WheelhouseManager.psm1     #   loads Functions\*.ps1
-        Functions/                 #   Common, Settings, Requirements, Manifest, Audit, Alert, Run
+        Functions/                 #   Common, Settings, Requirements, Manifest, Audit, Intake, Alert, Run,
+                                   #   Denylist, Package, Scan, Ui
+        Web/                       #   index.html, app.js, style.css - the browser side of the UI
     Update-Requirement.ps1         # Resolves Input\requirements.in -> Input\requirements.txt
     Update-Wheelhouse.ps1          # Merge + per-group audit/cooldown/download/manifest/Defender
     Test-Wheelhouse.ps1            # Audit-only check - this is what the Scheduled Task runs
+    Test-WheelhousePackage.ps1     # Audit the whole index or chosen packages (no alert) - used by the UI
+    Invoke-WheelhouseScan.ps1      # Defender scan of the whole wheelhouse or chosen wheel files - used by the UI
+    Start-WheelhouseUI.ps1         # Starts the local web UI (localhost only)
     Send-VulnerabilityAlert.ps1    # Parses audit reports, emails or saves an HTML alert
 
 Tests/
@@ -439,11 +445,55 @@ console log / `Report_Integrity_*.json` / the Scheduled Task's failure status, n
 
 ---
 
-## 9. Design note: the `WheelhouseManager` module and future scripts
+## 9. Web UI - `Start-WheelhouseUI.ps1`
+
+A local browser interface for everything above. It runs on the manager server only
+(`http://localhost:8765/`) and is a thin layer over the same scripts and module functions.
+
+```powershell
+C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1          # opens the browser; Ctrl+C or the "Stop UI" button stops it
+C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -Port 9000 -NoBrowser
+```
+
+Run it from an **elevated** PowerShell if you want to use the Defender scan (`Start-MpScan` needs
+administrator rights); everything else works without elevation.
+
+| Tab | What it does |
+|---|---|
+| **Packages** | Every wheel in `manifest.json` with its groups, latest audit result, latest Defender result and denylist flag. Select rows, then **Audit selected / Audit all**, **Scan selected / Scan all**, **Quarantine** or **Delete**. |
+| **Add packages** | Appends the entries to `Input\requirements.in`, then runs `Update-Requirement.ps1` and `Update-Wheelhouse.ps1` (audit, cooldown, download). "Resolve only" stops at `requirements.txt` so it can be reviewed first. Rejected packages are listed with the reason. |
+| **Quarantine** | Packages moved to `<wheelhouse>\_quarantine\`. **Restore** verifies the file hash and puts the package back into the manifest and its group files. |
+| **Denylist** | Edit `config\denylist.json` (see below). |
+| **Settings** | Edit `config\settings.psd1` with validation. |
+| **Jobs** | Audits, scans and adds run as background jobs (one at a time); their log is shown live and a job can be cancelled. |
+
+**Removing a package.** *Quarantine* and *Delete* remove the pin from every group file and the wheel
+from `manifest.json`, then move the file to `_quarantine\<id>\` (quarantine) or delete it. The
+order is chosen so clients never see a pin without a wheel, and a failure part-way undoes the earlier steps.
+
+**Denylist.** `config\denylist.json` lists packages that must never enter the wheelhouse, either an exact
+version or `*` for every version. Quarantining or deleting a package adds its exact version
+automatically, so the next `Update-Wheelhouse.ps1` does not download it again. A blocked package is
+rejected at intake before the audit (the reason is in `Report_Rejected_*.json`), and
+`Update-Requirement.ps1` passes the blocked versions to `uv` as constraints. Restoring a quarantined
+package removes the entry that quarantining created. The file is also editable by hand; a damaged file stops
+the run instead of being treated as empty.
+
+**Locking.** Anything that changes the manifest or the group files (`Update-Wheelhouse.ps1`, remove,
+quarantine, restore) holds `<wheelhouse>\.wheelhouse.lock`; a second operation is refused with a clear message.
+
+**Security.** The server listens on `localhost` / `127.0.0.1` only. Each start generates a random session
+token that is part of the URL the script opens (the page and every API call need it); requests with another
+`Host`, a foreign `Origin` or a non-JSON body are refused. Package names and file names are validated against
+the manifest before they reach a command line. Use the UI on the manager server itself - do not publish the port.
+
+---
+
+## 10. Design note: the `WheelhouseManager` module and future scripts
 
 `Jobs\WheelhouseManager` holds every helper function used across the project, split by domain
-(`Functions\Settings.ps1`, `Requirements.ps1`, `Manifest.ps1`, `Audit.ps1`, `Alert.ps1`,
-`Run.ps1`, `Common.ps1`). Every script loads it with
+(`Functions\Settings.ps1`, `Requirements.ps1`, `Manifest.ps1`, `Audit.ps1`, `Intake.ps1`, `Alert.ps1`,
+`Run.ps1`, `Denylist.ps1`, `Package.ps1`, `Scan.ps1`, `Ui.ps1`, `Common.ps1`). Every script loads it with
 `Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager')`.
 
 Many functions are entirely generic - `Invoke-PipAudit`, `Read-RequirementFile`,
