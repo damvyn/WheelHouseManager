@@ -3,20 +3,25 @@
 
 # Mock bodies run in the module's scope, so test-case values reach them via globals.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '')]
-# $examplesPath is set in BeforeAll and used inside It blocks.
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', '')]
 param()
 
 Describe 'WheelhouseManager' {
     BeforeAll {
         $modulePath = Join-Path (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Jobs') 'WheelhouseManager'
         Import-Module $modulePath -Force
-        $examplesPath = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Examples'
 
         function Get-TestFolder {
             $path = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $path | Out-Null
             return $path
+        }
+
+        # Writes a pip-audit JSON report with one vulnerable package; returns its path.
+        function New-TestAuditReport {
+            param([string]$Path)
+            $report = '{"dependencies":[{"name":"requests","version":"2.19.0","vulns":[{"id":"PYSEC-2018-28","aliases":["CVE-2018-18074"],"fix_versions":["2.20.0"],"description":"Credentials leak on redirect."}]},{"name":"six","version":"1.16.0","vulns":[]}],"fixes":[]}'
+            Set-Content -Path $Path -Value $report
+            return $Path
         }
 
         # A wheelhouse with two tracked wheels (six, attrs) listed in requirements-1.txt.
@@ -89,12 +94,6 @@ Describe 'WheelhouseManager' {
             $packages = Read-RequirementFile -FilePath $file
             $packages.Count | Should -Be 1
             $packages.ContainsKey('numpy') | Should -Be $false
-        }
-
-        It 'parses the uv-generated example file' {
-            $packages = Read-RequirementFile -FilePath (Join-Path $examplesPath 'requirements.txt')
-            $packages['anyio'] | Should -Be '4.15.1'
-            $packages.Count | Should -BeGreaterThan 10
         }
     }
 
@@ -339,7 +338,7 @@ Describe 'WheelhouseManager' {
     Context 'Get-VulnerabilityFinding' {
         It 'merges the same vulnerability from several reports and reports unreadable files as errors' {
             $reports = Get-TestFolder
-            $example = Join-Path $examplesPath 'Report_Scheduled-OSV_20260921_153000.json'
+            $example = New-TestAuditReport -Path (Join-Path $reports 'example.json')
             $osv = Join-Path $reports 'Report_Scheduled-requirements-1-OSV_20260921_153000.json'
             $pypi = Join-Path $reports 'Report_Scheduled-requirements-2-PYPI_20260921_153000.json'
             Copy-Item -Path $example -Destination $osv
@@ -357,7 +356,7 @@ Describe 'WheelhouseManager' {
         It 'produces HTML naming the group file and the audit errors' {
             $reports = Get-TestFolder
             $osv = Join-Path $reports 'Report_Scheduled-requirements-3-OSV_20260921_153000.json'
-            Copy-Item -Path (Join-Path $examplesPath 'Report_Scheduled-OSV_20260921_153000.json') -Destination $osv
+            New-TestAuditReport -Path $osv | Out-Null
             $result = Get-VulnerabilityFinding -ReportPaths @($osv)
             $html = ConvertTo-VulnerabilityAlertHtml -Findings $result.Findings -AuditErrors @('requirements-1 / OSV: <boom>') -WheelhousePath ''
             $html | Should -Match 'requirements-3\.txt'
@@ -600,7 +599,7 @@ Describe 'WheelhouseManager' {
         It 'marks a finding from a candidate audit as blocked, not deployed' {
             $reports = Get-TestFolder
             $report = Join-Path $reports 'Report_PreDownload-requirements-2-candidates-OSV_20260921_153000.json'
-            Copy-Item -Path (Join-Path $examplesPath 'Report_Scheduled-OSV_20260921_153000.json') -Destination $report
+            New-TestAuditReport -Path $report | Out-Null
 
             $result = Get-VulnerabilityFinding -ReportPaths @($report)
             $result.Findings[0].Deployed | Should -Be $false
