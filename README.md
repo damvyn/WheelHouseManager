@@ -1,376 +1,186 @@
-﻿# Wheelhouse Manager
+# Wheelhouse Manager
 
-## ❓What does it do?
-This project creates a standalone index for Python packages and provide management functionalities:
-- Add new packages and dependencies
-- Manage everything from a local web UI (audit, scan, add, remove/quarantine, denylist, settings)
-- Run OSV and PyPi audit
-- Run antivirus scan (Defender)
-- Build Requirements.txt according to specified rules
-- Generate scan reports
-- Send email alerts
+Wheelhouse Manager gives locked-down Windows computers a **private, audited source of Python
+packages**. Instead of installing from the internet (PyPI), clients install only from a shared
+folder of pre-approved wheel files - the *wheelhouse*. The manager decides what goes into that
+folder, checks every package before it gets there, and keeps checking it afterwards.
 
----
+What it does for you:
 
-## ⚙️ How does it work?
+- **Adds packages safely.** You name the packages you need; the manager resolves every
+  dependency for your target Python version and platform, and lets a package in only after it
+  passed every check: denylist, known vulnerabilities (OSV and PyPI advisories), a cooldown
+  period for brand-new releases, PyPI's "yanked" flag, a hash comparison with what PyPI
+  publishes, and a Microsoft Defender scan.
+- **Keeps watching what is already published.** A package that was clean when it was added can
+  become vulnerable, yanked or detected as malware later. A weekly check finds that and sends one
+  alert that says what is affected and what to do.
+- **Lets you act quickly.** Quarantine (reversible) or delete a package, block versions on a
+  denylist, restore from quarantine, or fast-track an urgent security fix.
+- **Gives you a web UI** on the manager server for all of the above, plus email (or HTML file)
+  alerts and a full audit trail of reports and logs.
 
-This project has two independent parts:
+Contents
 
-1. **Client-side installation** on Windows hosts use uv package manager (`Client Install/`),
-   which locks clients to a single, internal, audited package source.
-2. **Wheelhouse Manager** (`Setup.ps1`, `Invoke-WheelhousePipeline.ps1`, `Jobs/`), which
-   prepares, approves, populates, and continuously audits that internal package source
-   (the "wheelhouse").
-
-### Repository layout
-
-```
-Client Install/
-    UV_Installer.ps1              # Installs the uv binaries
-    Startup_UV.ps1                 # Locks down uv configuration (GPO computer startup script)
-
-Setup.ps1                          # Deploys the manager to a local folder (run once, safe to re-run)
-Invoke-WheelhousePipeline.ps1      # Orchestrator: Update-Wheelhouse.ps1 + Send-VulnerabilityAlert.ps1
-
-Jobs/
-    WheelhouseManager/             # PowerShell module with all shared functions - imported by every script
-        WheelhouseManager.psd1     #   module manifest (exported function list)
-        WheelhouseManager.psm1     #   loads Functions\*.ps1
-        Functions/                 #   Common, Settings, Requirements, Manifest, Audit, Intake, Alert, Run,
-                                   #   Denylist, Package, Scan, Ui
-        Web/                       #   index.html, app.js, style.css - the browser side of the UI
-    Update-Requirement.ps1         # Resolves Input\requirements.in -> Input\requirements.txt
-    Update-Wheelhouse.ps1          # Merge + per-group audit/cooldown/download/manifest/Defender
-    Test-Wheelhouse.ps1            # Audit-only check - this is what the Scheduled Task runs
-    Test-WheelhousePackage.ps1     # Audit the whole index or chosen packages (no alert) - used by the UI
-    Invoke-WheelhouseScan.ps1      # Defender scan of the whole wheelhouse or chosen wheel files - used by the UI
-    Start-WheelhouseUI.ps1         # Starts the local web UI (localhost only)
-    Send-VulnerabilityAlert.ps1    # Parses audit reports, emails or saves an HTML alert
-
-Tests/
-    WheelhouseManager.Tests.ps1    # Pester tests for the module (Invoke-Pester -Path .\Tests)
-PSScriptAnalyzerSettings.psd1      # Lint settings (Invoke-ScriptAnalyzer -Path . -Recurse -Settings ...)
-```
-
-`Setup.ps1` and `Invoke-WheelhousePipeline.ps1` live at the project root; everything in
-`Jobs/` must stay together in one folder (the scripts import `WheelhouseManager` and locate
-each other via `$PSScriptRoot`). The two files in `Client Install/` are deployed through a different
-mechanism entirely (see section 1) and are unrelated to the manager's own folder layout.
+1. [How it works](#1-how-it-works)
+2. [Requirements](#2-requirements)
+3. [Installation](#3-installation)
+4. [Configuration](#4-configuration)
+5. [Using it: step-by-step guides](#5-using-it-step-by-step-guides)
+6. [The web UI](#6-the-web-ui)
+7. [Script reference](#7-script-reference)
+8. [Alerts, reports and logs](#8-alerts-reports-and-logs)
+9. [Exit codes](#9-exit-codes)
+10. [Troubleshooting](#10-troubleshooting)
+11. [Security](#11-security)
+12. [Limitations](#12-limitations)
+13. [For developers](#13-for-developers)
 
 ---
 
-## 1. Installing uv on client machines
+## 1. How it works
 
-Two scripts, from `Client Install/`, each with a different deployment mechanism.
+### The two parts
 
-### 1.1 `Client Install/UV_Installer.ps1` - installs the uv binaries
-
-It is a simple example of deployment script. It:
-* Extracts `uv-x86_64-pc-windows-msvc.zip` (must sit next to the script) into
-   `C:\Program Files\astral.sh\uv`.
-* Skips reinstalling if a version stamp file already matches the target version.
-* Creates **hardlinks** for `uv.exe`, `uvw.exe`, `uvx.exe` into `C:\Windows\System32` instead of
-  modifying the system `PATH` - `System32` is already on `PATH` for every user, and hardlinks
-  work here because both locations are on the same volume.
-- Logs to `%WinDir%\Logs\Astral-uv-<version>_Script.txt`.
-
-Deploy this through deployment system as a standard application package.
-
-### 1.2 `Client Install/Startup_UV.ps1` - locks down configuration via Group Policy
-
-**Runs as a Group Policy Computer Startup Script**, not a login script or a manually-run tool:
-
-* Computer startup scripts run as **SYSTEM**, at boot, **before any user logs on** - so the
-  environment variables and `uv.toml` are guaranteed to be in place before any user session ever
-  touches `uv`.
-* Because it's a *machine* policy, a standard user cannot override it - `Startup_UV.ps1` writes
-  to `%ProgramData%\uv\uv.toml`, which ordinary users can't modify.
-
-What it sets, all at machine scope:
-
-| Setting | Value | Purpose |
+| Part | Runs on | What it does |
 |---|---|---|
-| `UV_PYTHON_DOWNLOADS` | `never` | Blocks `uv python install` from ever downloading a Python interpreter |
-| `UV_PYTHON_PREFERENCE` | `only-system` | Never resolve to a uv-managed Python; only pre-installed interpreters |
-| `UV_LINK_MODE` | `copy` | Cache and target venv are on different filesystems (local cache vs. FSLogix/network profile) |
-| `UV_CACHE_DIR` | `C:\uv-cache` | Local, ephemeral cache (not on the roaming/FSLogix profile) |
-| `UV_NO_INDEX` | `true` | Blocks the default PyPI index entirely |
-| `%ProgramData%\uv\uv.toml` | flat index pointing at the wheelhouse | The **only** package source clients can use |
+| **Client install** (`Client Install\`) | Every client computer | Installs `uv` and configures it, through Group Policy, so the wheelhouse is its **only** package source. Users cannot change this. |
+| **Manager** (`Setup.ps1`, `Invoke-WheelhousePipeline.ps1`, `Jobs\`) | One manager / build server | Prepares, checks, publishes and monitors the wheelhouse. Has the web UI. |
 
-**Before deploying:** edit the placeholder in `Startup_UV.ps1`:
+The two parts only share the wheelhouse folder: the manager writes it, clients read it.
 
-```powershell
-'url = "\\\\server\\pathToWheelHouse"',
+```
+  You                      Manager server                                 Wheelhouse share         Clients
+  ---                      --------------                                 ----------------         -------
+  requirements.in  --->  resolve (uv) ---> review ---> checks + publish  --->  *.whl            ---> uv pip install ...
+  ("numpy", "pandas>=2")  requirements.txt              (see below)            requirements-N.txt
+                                                                               manifest.json
+                         weekly check (Scheduled Task) <-- re-checks everything published
+                         web UI (localhost)
 ```
 
-Replace `\\server\pathToWheelHouse` with your actual wheelhouse UNC path.
+### The life of a package
 
-### GPO deployment steps
+1. **Requested.** You add `numpy` (or `pandas>=2`) to `Input\requirements.in`, by hand or in the
+   UI.
+2. **Resolved.** `Update-Requirement.ps1` turns that into exact pins (`numpy==2.3.1` plus every
+   dependency) in `Input\requirements.txt`, using only versions that have a wheel for your target
+   Python and platform and that are older than the cooldown.
+3. **Reviewed.** You (or whoever approves changes) read `requirements.txt`.
+4. **Checked and published.** `Update-Wheelhouse.ps1` takes each new pin through these checks,
+   in order. A package that fails one is **rejected with the reason** and never reaches the
+   wheelhouse; the others carry on:
 
-1. Edit the wheelhouse path placeholder in `Client Install\Startup_UV.ps1`.
-2. Open **Group Policy Management Console**, create or edit a GPO linked to the VDI OU.
-3. **Computer Configuration → Policies → Windows Settings → Scripts (Startup/Shutdown) → Startup**,
-   add `Startup_UV.ps1` under the **PowerShell Scripts** tab.
-4. Ensure `UV_Installer.ps1` is deployed to the same machines.
-5. Run `gpupdate /force` on a test machine (or reboot it) and confirm:
-   ```powershell
-   Test-Path "C:\Windows\System32\uv.exe"
-   $env:UV_NO_INDEX
-   Get-Content "$env:ProgramData\uv\uv.toml"
-   ```
+   | Check | Rejected when |
+   |---|---|
+   | Denylist | The name/version is blocked (`config\denylist.json`). |
+   | Vulnerability audit | `pip-audit` (OSV and PyPI) knows a vulnerability, or the audit could not be completed. |
+   | Yanked | The release was withdrawn ("yanked") on PyPI. |
+   | Cooldown | The release is newer than `MinimumPackageAgeDays` (default 10). The reason says when it becomes eligible. |
+   | Download | No wheel exists for the target Python / platform. |
+   | Verification | The downloaded file is not one PyPI lists for the release, its sha256 differs from PyPI's, or the file itself is yanked or newer than the cooldown. |
+   | Defender | Microsoft Defender detects something in the download. |
+
+   Downloads wait in a staging folder on the manager server until they passed everything. Only
+   then are they copied to the share, so clients never see an unchecked file.
+5. **Published.** The wheel is in the wheelhouse, recorded with its SHA256 in `manifest.json`, and
+   its pin is listed in a group file. Clients can install it.
+6. **Monitored.** Every week `Test-Wheelhouse.ps1` re-checks everything that is published:
+   files unchanged (hash), new vulnerabilities, yanked on PyPI since, denylisted since, and -
+   optionally - Defender with the latest signatures. Anything it finds goes into one alert.
+7. **Taken out (if needed).** You quarantine or delete the package. Its pin is removed and the
+   version is denylisted so it is not downloaded again. Quarantine can be undone.
+
+**Nothing is removed automatically.** A package flagged by the weekly check stays installable
+until an administrator acts on the alert. The one exception: a wheel that Microsoft Defender
+deletes or quarantines itself is cleaned out of the manifest and group files by the next
+`Update-Wheelhouse.ps1` run (and denylisted).
+
+### Key terms
+
+| Term | Meaning |
+|---|---|
+| **Wheelhouse** | The shared folder of `.whl` files clients install from (a UNC path such as `\\server\share\wheelhouse`). |
+| **Pin** | An exact `name==version`, e.g. `numpy==2.3.1`. |
+| **Group file** | `requirements-1.txt`, `requirements-2.txt`, ... in the wheelhouse. Each lists pins; one file never holds two versions of the same package, so a second version of a package goes into another group. The manager uses them to audit what is published. |
+| **Manifest** | `manifest.json` in the wheelhouse: every published wheel with its SHA256. Any change to a wheel is detected. |
+| **Cooldown** | Minimum age of a release before it is accepted (`MinimumPackageAgeDays`). Protects against freshly published malicious or broken releases. |
+| **Denylist** | `config\denylist.json`: versions (or `*` for all versions) that must never enter the wheelhouse. |
+| **Quarantine** | `<wheelhouse>\_quarantine\`: removed packages kept for later restore. |
 
 ---
 
-## 2. Installing dependencies on the build server
+## 2. Requirements
 
-The build server (separate from the VDI clients) needs Python, pip, uv (as a resolver only),
-and pip-audit.
+**Manager server** (Windows):
+
+- Windows PowerShell 5.1 or PowerShell 7.
+- Python matching the clients' target version (default 3.14), with `pip`. `pip-audit` is
+  installed automatically if missing.
+- `uv` (used only to resolve requirements): `python -m pip install --upgrade uv`.
+- Write access to the wheelhouse share.
+- Network access to `pypi.org` and `files.pythonhosted.org` (metadata and downloads) and
+  `api.osv.dev` (vulnerability data).
+- **Administrator rights for Microsoft Defender scans** (`Start-MpScan`). Everything else works
+  without elevation; without it, downloads are published with a warning instead of being scanned
+  (see `RequireDefenderScanAtIntake`).
+- Optional: an SMTP relay for email alerts. Without one, alerts are saved as HTML files.
+
+**Clients** (Windows): a deployment tool for `UV_Installer.ps1`, Group Policy for
+`Startup_UV.ps1`, and read access to the wheelhouse share. Python itself must already be
+installed on the clients (uv is not allowed to download interpreters).
+
+---
+
+## 3. Installation
+
+### 3.1 Prepare the manager server
 
 ```powershell
 python -m pip install --upgrade pip
 python -m pip install --upgrade uv pip-audit
+python --version; uv --version; pip-audit --version
 ```
 
-Confirm: `python --version`, `uv --version`, `pip-audit --version`.
+The manager keeps `pip` and `pip-audit` up to date itself on every run; it does not update `uv`.
 
-The wheelhouse scripts (`Update-Wheelhouse.ps1`, `Test-Wheelhouse.ps1`) self-check and
-self-update `pip` and `pip-audit` on every run, and install `pip-audit` if it is missing (see
-`Confirm-PythonAndTooling` in `Jobs\WheelhouseManager\Functions\Audit.ps1`), but don't
-self-update `uv`. The cooldown policy applies only to packages that go into the wheelhouse,
-not to this tooling.
+### 3.2 Deploy the manager - `Setup.ps1`
 
----
-
-## 3. Deploying the manager - `Setup.ps1`
-
-Run once to deploy everything into a working folder, and again any time you want to redeploy
-an updated script package. **Idempotent**: always refreshes the code in `Jobs\` and the root
-scripts, but never touches your `config\settings.psd1` values or your `Input\requirements.in`/
-`.txt` - those are your data, not code.
+From a copy of this repository:
 
 ```powershell
 .\Setup.ps1 -WheelhousePath "\\server\share\wheelhouse"
-```
 
-```powershell
-# Custom destination folder (default is C:\WheelHouseManager)
+# Another destination (default: C:\WheelHouseManager)
 .\Setup.ps1 -DestinationPath "D:\WheelHouseManager" -WheelhousePath "\\server\share\wheelhouse"
 ```
+
+`Setup.ps1` is safe to re-run - do so to deploy a newer version. It always replaces the code in
+`Jobs\`, but never overwrites your settings, denylist or `Input\` files.
 
 Result:
 
 ```
 C:\WheelHouseManager\
+    Invoke-WheelhousePipeline.ps1   update + alert in one call
+    Jobs\                           the scripts and the WheelhouseManager module (keep together)
     config\
-        settings.psd1
+        settings.psd1               your settings
+        denylist.json               blocked packages (created on first use)
     Input\
-        requirements.in
-        requirements.txt
-    Jobs\
-        WheelhouseManager\
-        Update-Requirement.ps1
-        Update-Wheelhouse.ps1
-        Test-Wheelhouse.ps1
-        Send-VulnerabilityAlert.ps1
-    Invoke-WheelhousePipeline.ps1
+        requirements.in             what you ask for
+        requirements.txt            resolved pins, waiting to be published
+    staging\                        downloads waiting for their checks (emptied after each run)
+    logs\ui\                        output of jobs started from the web UI
 ```
 
-### `config\settings.psd1`
+The wheelhouse share gets `manifest.json`, the group files, `reports\` and `_quarantine\` as
+they are needed.
 
-Every script's optional parameters fall back to this file if not passed explicitly, so you
-don't need to repeat `-WheelhousePath` (or anything else) on every call.
+### 3.3 Schedule the weekly check - `Test-Wheelhouse.ps1`
 
-```powershell
-@{
-    WheelhousePath        = '\\server\share\wheelhouse'
-    RequirementsInPath     = 'C:\WheelHouseManager\Input\requirements.in'
-    LocalRequirementsPath  = 'C:\WheelHouseManager\Input\requirements.txt'
-    PythonVersion          = '3.14'
-    Platform                = 'win_amd64'
-    MinimumPackageAgeDays   = 10
-    VulnerabilityServices   = @('osv', 'pypi')
-    ReportRetentionMonths   = 6
-    SmtpServer              = ''
-    MailTo                  = 'servicedesk@company.com'
-    MailFrom                = 'NoReply@company.com'
-}
-```
-
-Precedence everywhere: **explicit `-Parameter`** > **this file** > **the built-in default**.
-All built-in defaults live in one place, `Get-WheelhouseDefaultSetting`
-(`Jobs\WheelhouseManager\Functions\Settings.ps1`); `Setup.ps1` writes exactly those values into
-a new `settings.psd1`. A key missing from an older `settings.psd1` (e.g. `ReportRetentionMonths`)
-simply falls back to its built-in default.
-
-`ReportRetentionMonths`: `Log_*.txt`, `Report_*.json` and `Alert_*.html` files in
-`<wheelhouse>\reports` older than this are deleted at the start of every
-`Update-Wheelhouse.ps1` / `Test-Wheelhouse.ps1` run. Edit it directly, or let `Setup.ps1 -WheelhousePath ...` update just that one key
-without touching the rest.
-
----
-
-## 4. Preparing packages - `Update-Requirement.ps1`
-
-Edit `Input\requirements.in` (unpinned names, or version ranges), then resolve it:
-
-```powershell
-cd C:\WheelHouseManager\Jobs
-.\Update-Requirement.ps1
-```
-
-Defaults to `Input\requirements.in` / `Input\requirements.txt` under the manager root, and to
-the `PythonVersion` / `Platform` / `MinimumPackageAgeDays` from `settings.psd1`. It works in
-two steps, so that the result can always be downloaded by `Update-Wheelhouse.ps1` later
-(binary wheels only, for exactly that Python version and platform):
-
-1. **Resolve with uv, binary wheels only, for the target platform:**
-   ```powershell
-   uv pip compile Input\requirements.in --exclude-newer "10 days" --python-version 3.14 `
-       --python-platform x86_64-pc-windows-msvc --only-binary :all: -o <temporary file>
-   ```
-   Without `--only-binary` uv would accept versions that only exist as source archives
-   (e.g. `numpy==1.26.4` has no Python 3.14 wheel), which `pip download --only-binary` can't fetch.
-2. **Verify with pip:** uv ignores upper bounds on `Requires-Python` (e.g. `pyqtdarktheme2`
-   declares `<3.14`), so the resolved file is checked with `pip install --dry-run --no-deps
-   --only-binary=:all: --python-version 3.14 --platform win_amd64` - the same rules as the
-   later download. Every unavailable package is listed, not just the first.
-
-Only a result that passes both steps replaces `Input\requirements.txt`. Otherwise the existing
-`requirements.txt` is left untouched, the rejected result is saved as
-`Input\requirements.rejected.txt` for review, and the script exits with code 1 - remove the
-listed packages from `requirements.in` (or constrain them to a version that supports the target
-Python) and run it again. The check downloads the wheels into pip's cache, so the later
-`Update-Wheelhouse.ps1` download of the same files is fast.
-
-Review the resulting `Input\requirements.txt` and get it approved before the next step.
-
----
-
-## 5. Merging into the wheelhouse - `Update-Wheelhouse.ps1`
-
-**Manual, deliberate action** - taken after `Input\requirements.txt` is approved. Never runs
-unattended (see section 6 for what the Scheduled Task actually runs instead).
-
-```powershell
-cd C:\WheelHouseManager\Jobs
-.\Update-Wheelhouse.ps1
-```
-
-> [!NOTE]
-> a plain run merges `Input\requirements.txt` (see below). Only run it after that file
-> has been approved, or skip the merge explicitly with `-LocalRequirementsPath ""`.
-
-### Why "merge" instead of "replace"
-
-The wheelhouse can hold **multiple versions of the same package** side by side - one user's
-project may need `numpy==2.5.3`, another's `numpy==1.26.4`. Since a single `requirements.txt`
-can't contain two versions of the same package name, the wheelhouse instead holds several
-**group files**: `requirements-1.txt`, `requirements-2.txt`, etc. Merging decides, per package:
-
-| Situation | Result |
-|---|---|
-| Exact duplicate (same name==version already present anywhere) | Skipped, logged |
-| New package name | Candidate for the first group that doesn't already use that name |
-| Same name, different version, already used everywhere | Candidate for a brand-new group file |
-
-A candidate is written into its group file **only after it passed the vulnerability audit, the
-cooldown and the download** - a group file never lists a package whose wheel isn't in the
-wheelhouse (see "What it does" below).
-
-New group files are numbered after the highest existing one (`requirements-1.txt` +
-`requirements-3.txt` -> next is `requirements-4.txt`), so an existing group file is never
-overwritten. Only `requirements.txt` (legacy single group) and `requirements-<number>.txt` count as
-group files - e.g. `requirements-torch.txt` in the wheelhouse folder is ignored.
-
-`-LocalRequirementsPath` defaults to `config\settings.psd1`'s `LocalRequirementsPath` (set by
-`Setup.ps1` to `Input\requirements.txt`), so **a plain run merges that file whenever it has
-content**. If the file is missing or empty - or you pass `-LocalRequirementsPath ""` - nothing
-is merged and the script just processes the wheelhouse's existing group files as-is.
-
-The requirements parser accepts exact pins only (`name==version`), including `uv pip compile`
-output with `# via` comments, extras (`pkg[extra]==1.0`), environment markers
-(`; python_version ...`) and `--hash` lines; extras and markers are dropped, group files only
-record `name==version`. Anything else (unpinned, `-e`, URLs) is skipped with a warning.
-
-### What it does, in order
-
-1. Integrity check (SHA256 vs. `manifest.json`) - stops immediately on any mismatch. Wheel files
-   present in the folder but not tracked by the manifest are reported as a warning.
-2. Merge **plan** for the local requirements file (see above) - nothing is written yet.
-3. For **each** group, the candidates - the planned new packages, plus packages the group
-   already lists without a wheel in the wheelhouse - go through, in order:
-   1. vulnerability audit (OSV + PyPI) of the candidates,
-   2. cooldown check,
-   3. download (`pip download --no-deps --only-binary=:all:`).
-
-   Each package is judged on its own: one that fails a step is **rejected with the reason**
-   and never holds back the others. Only packages whose wheel was downloaded are written into
-   the group file.
-   - A rejected **new** package is not written anywhere - it stays in `Input\requirements.txt`
-     and is simply tried again on the next run (e.g. once its cooldown has passed).
-   - A rejected package that the group **already lists** stays listed (group files are never
-     rewritten automatically) and is reported as "still listed without a wheel" - fix or
-     remove that line by hand.
-
-   Rejections are logged with their reason and saved in
-   `<wheelhouse>\reports\Report_Rejected_<timestamp>.json`; the script then exits with code 1.
-   Every group that already existed is afterwards audited as deployed (no download).
-4. Manifest update: existing entries are kept unchanged; only wheel files that appeared during
-   this run are hashed and added. An untracked wheel that was already in the folder before the
-   run is **never** added automatically - remove it and let the script download it again.
-5. One Microsoft Defender scan of the whole wheelhouse folder.
-
-### Pinned groups: `--no-deps`
-
-Group files come from `uv pip compile`, so every transitive dependency is already pinned in
-them. Both `pip download` and `pip-audit` therefore run with `--no-deps` (pip-audit also with
-`--disable-pip`): exactly the pinned versions are audited, cooldown-checked and downloaded, and
-nothing unpinned is pulled in behind the checks' back. This also means a merge that spreads one
-resolved set across several groups (e.g. a new `numpy` version in a new group) can't break the
-download with a resolver conflict.
-
-### Output
-
-Besides its log, `Update-Wheelhouse.ps1` writes one `Wheelhouse.AuditResult` object per audit
-(`Group`, `Service`, `Status` = `Passed` / `Vulnerable` / `Error`, `ReportPath`, `Message`) to
-the output stream - this is what `Invoke-WheelhousePipeline.ps1` alerts on.
-
----
-
-## 6. Scheduled Task - `Test-Wheelhouse.ps1`
-It only detects and alerts - no merge, no download, no manifest changes, no Defender
-completely unattended on a schedule without risking a silent merge of an unapproved
-`Input\requirements.in` edit.
-
-### What it does
-
-1. Checks `python` / `pip-audit` (installs or upgrades them if needed).
-2. Integrity check (same as above) - aborts on mismatch. Packages that a group file lists but
-   that have no wheel in the wheelhouse are reported as a warning (e.g. entries left over from
-   before candidates were checked before being written).
-3. Runs `pip-audit` against **every** group file, on every configured vulnerability service.
-4. If anything is found **or an audit could not be completed** (network error, tooling
-   failure, ...), calls `Send-VulnerabilityAlert.ps1` once with every such result. A failed
-   audit is never treated as "no vulnerabilities"; the script exits 1 in both cases.
-
-### Manual setup (Task Scheduler GUI)
-
-1. **Create Task** (not "Create Basic Task").
-2. **General**: name it, **Run whether user is logged on or not**.
-3. **Triggers**: Weekly, e.g. Sunday 02:00.
-4. **Actions** → **Start a program**:
-   - Program/script: `powershell.exe`
-   - Arguments:
-     ```
-     -NoProfile -ExecutionPolicy Bypass -File "C:\WheelHouseManager\Jobs\Test-Wheelhouse.ps1"
-     ```
-   (No `-WheelhousePath` needed if `config\settings.psd1` already has it.)
-5. **Settings**: check "Run task as soon as possible after a scheduled start is missed".
-6. Save with an account that has whatever rights `pip-audit`/network access to the wheelhouse
-   requires (no admin rights needed here, unlike a Defender scan - `Test-Wheelhouse.ps1` never
-   runs one).
-
-### PowerShell setup
+This is the job that notices when a published package fails a check later. It only reads and
+alerts - it never downloads or changes anything - so it is safe to run unattended.
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
@@ -379,150 +189,428 @@ $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 2:00AM
 $principal = New-ScheduledTaskPrincipal -UserId "DOMAIN\svc-wheelhouse" -LogonType Password
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
 
-Register-ScheduledTask -TaskName "Wheelhouse Weekly Audit" `
+Register-ScheduledTask -TaskName "Wheelhouse Weekly Check" `
     -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-    -Description "Weekly wheelhouse integrity check and vulnerability audit, alerting on findings."
+    -Description "Weekly wheelhouse integrity, vulnerability, yanked and denylist check with alerts."
+```
+
+Or in the Task Scheduler GUI: **Create Task** -> *Run whether user is logged on or not* -> weekly
+trigger -> action `powershell.exe` with the arguments above -> under Settings, *Run task as soon
+as possible after a scheduled start is missed*.
+
+The account needs network access and read access to the share. To also re-scan with Defender
+every week, set `DefenderScanInScheduledCheck = $true` and run the task with highest privileges
+(administrator).
+
+Task Scheduler's *Last Run Result*: `0` all good, `1` findings (an alert was sent), `2` a check
+could not be completed (also alerted) - see [Exit codes](#9-exit-codes).
+
+### 3.4 Set up the clients
+
+**`Client Install\UV_Installer.ps1`** - deploy it as a normal application package (e.g. with
+your software deployment tool), with `uv-x86_64-pc-windows-msvc.zip` next to it. It extracts uv
+to `C:\Program Files\astral.sh\uv` and creates hardlinks for `uv.exe`, `uvw.exe` and `uvx.exe` in
+`C:\Windows\System32` (already on everybody's `PATH`). It skips the install if the same version is
+already there and logs to `%WinDir%\Logs\Astral-uv-<version>_Script.txt`.
+
+**`Client Install\Startup_UV.ps1`** - a Group Policy **computer startup script**. It runs as
+SYSTEM before anyone logs on, so users cannot override it. It sets, for the whole machine:
+
+| Setting | Value | Purpose |
+|---|---|---|
+| `UV_PYTHON_DOWNLOADS` | `never` | uv may not download Python interpreters |
+| `UV_PYTHON_PREFERENCE` | `only-system` | Only pre-installed Python is used |
+| `UV_LINK_MODE` | `copy` | Cache and virtual environments are on different drives (local cache vs. roaming profile) |
+| `UV_CACHE_DIR` | `C:\uv-cache` | Local cache, not on the roaming profile |
+| `UV_NO_INDEX` | `true` | PyPI is blocked |
+| `%ProgramData%\uv\uv.toml` | flat index at the wheelhouse | The **only** package source |
+
+Steps:
+
+1. Edit the placeholder in `Startup_UV.ps1` - replace `\\server\pathToWheelHouse` in
+   `'url = "\\\\server\\pathToWheelHouse"'` with your wheelhouse UNC path (backslashes doubled).
+2. In Group Policy Management, edit a GPO linked to the clients' OU: **Computer Configuration >
+   Policies > Windows Settings > Scripts (Startup/Shutdown) > Startup > PowerShell Scripts**, add
+   `Startup_UV.ps1`.
+3. Make sure `UV_Installer.ps1` is deployed to the same machines.
+4. On a test client, run `gpupdate /force` (or reboot), then check:
+   ```powershell
+   Test-Path "C:\Windows\System32\uv.exe"
+   $env:UV_NO_INDEX
+   Get-Content "$env:ProgramData\uv\uv.toml"
+   ```
+
+Users then install packages as usual, for example `uv venv` and `uv pip install numpy`; uv only
+sees the wheels in the wheelhouse.
+
+To install a known-good, already audited set in one go, users can also point uv at one of the
+group files on the share:
+
+```powershell
+uv pip install -r \\server\share\wheelhouse\requirements-2.txt
+```
+
+Each group file lists exact versions that were checked together. Pick the group that has the
+versions your project needs (a second version of a package lives in a different group, see
+[5.3](#53-keep-several-versions-of-one-package)). Group files only list pins whose wheel is in the
+wheelhouse, so such an install never fails for a missing file. A package that is later
+quarantined or deleted is removed from its group file too.
+
+---
+
+## 4. Configuration
+
+Settings live in `C:\WheelHouseManager\config\settings.psd1` and can be edited by hand or in the
+UI's **Settings** tab (which validates them). Every script parameter falls back to this file, so
+you rarely need to pass parameters. Order of precedence: **a parameter you pass** > **the
+settings file** > **the built-in default**. A key missing from the file uses its default.
+
+| Setting | Default | What it controls |
+|---|---|---|
+| `WheelhousePath` | (none - required) | The wheelhouse share, e.g. `\\server\share\wheelhouse`. |
+| `RequirementsInPath` | `Input\requirements.in` | What you ask for. |
+| `LocalRequirementsPath` | `Input\requirements.txt` | The resolved pins that `Update-Wheelhouse.ps1` publishes. |
+| `PythonVersion` | `3.14` | Target Python version of the clients. |
+| `Platform` | `win_amd64` | Target platform (`win_amd64`, `win_arm64`, `win32`). |
+| `MinimumPackageAgeDays` | `10` | Cooldown: minimum age of a release before it is accepted. |
+| `VulnerabilityServices` | `osv`, `pypi` | Vulnerability databases used by every audit. |
+| `ReportRetentionMonths` | `6` | Logs, reports and saved alerts older than this are deleted. |
+| `SmtpServer` | (empty) | SMTP relay (`host` or `host:port`). Empty: alerts are saved as HTML files instead of emailed. |
+| `MailTo` / `MailFrom` | `servicedesk@company.com` / `NoReply@company.com` | Alert recipient and sender. |
+| `RequireDefenderScanAtIntake` | `$false` | When a download cannot be scanned (not elevated, Defender missing): `$false` publishes with a warning, `$true` rejects it. A detection always rejects. |
+| `DefenderScanInScheduledCheck` | `$false` | The weekly check also re-scans the whole wheelhouse with Defender (needs an elevated task). |
+
+Example:
+
+```powershell
+@{
+    WheelhousePath               = '\\server\share\wheelhouse'
+    PythonVersion                = '3.14'
+    Platform                     = 'win_amd64'
+    MinimumPackageAgeDays        = 10
+    VulnerabilityServices        = @('osv', 'pypi')
+    SmtpServer                   = 'smtp.company.local'
+    MailTo                       = 'python-admins@company.com'
+    RequireDefenderScanAtIntake  = $true
+    DefenderScanInScheduledCheck = $true
+}
 ```
 
 ---
 
-## 7. Manual runs, end to end
+## 5. Using it: step-by-step guides
+
+All commands assume `cd C:\WheelHouseManager\Jobs` unless noted. Each guide also says how to do
+it in the [web UI](#6-the-web-ui).
+
+### 5.1 Add packages (the normal workflow)
+
+1. **Ask for packages.** Add one requirement per line to `Input\requirements.in` - a name
+   (`numpy`) or a range (`pandas>=2.0`). Keep everything you have ever asked for in the file; it
+   is the full list, not just the new lines.
+2. **Resolve them.**
+   ```powershell
+   .\Update-Requirement.ps1
+   ```
+   This writes `Input\requirements.txt` with exact pins for every package and dependency. If a
+   package has no wheel for your Python/platform, nothing is changed: the problem packages are
+   listed, the attempt is saved as `Input\requirements.rejected.txt`, and you fix
+   `requirements.in` (remove the package or constrain its version) and run it again.
+3. **Review** `Input\requirements.txt` and get it approved if your process requires that.
+4. **Publish.**
+   ```powershell
+   .\Update-Wheelhouse.ps1
+   ```
+   Pins already in the wheelhouse are skipped. Each new pin goes through every check (see
+   [the life of a package](#the-life-of-a-package)). The log ends with what was accepted and what
+   was rejected, and why; the rejections are also saved in
+   `<wheelhouse>\reports\Report_Rejected_<timestamp>.json`.
+
+   Prefer `..\Invoke-WheelhousePipeline.ps1` instead if you also want an alert for whatever the
+   run found (vulnerable candidates, Defender detections, ...).
+
+In the UI: **Add packages** tab -> enter the packages -> **Add and resolve** -> check the
+**Review and publish** card -> **Publish**.
+
+### 5.2 Handle rejected packages
+
+Every rejection has a reason. What to do:
+
+| Reason starts with | Meaning | What to do |
+|---|---|---|
+| `cooldown: published ... (eligible <date>)` | Too new. | Nothing - run `Update-Wheelhouse.ps1` again after that date; the pin stays in `requirements.txt`. For an urgent fix, see 5.6. |
+| `cooldown: could not verify the publish date on PyPI` | PyPI could not be reached, so nothing about the release can be verified. | Check access to `pypi.org`, run again. |
+| `known vulnerability` | An advisory exists for this version. | Change the version in `requirements.in` (e.g. `pkg>=<fixed version>`), resolve again, publish. |
+| `vulnerability audit could not be completed` | Network or tool problem during the audit. | Check access to `pypi.org` / `api.osv.dev`, run again. |
+| `yanked on PyPI` | The release was withdrawn by its authors. | Choose another version. |
+| `no downloadable wheel` | No wheel for your Python/platform. | Choose another version, or drop the package. |
+| `sha256 of ... does not match PyPI` / `not one of the files PyPI lists` | The download differed from what PyPI publishes. **Security event** - an alert is raised. | Do not retry blindly. Check proxies/caches between the server and PyPI. |
+| `Microsoft Defender detected` | Malware detection in the download. **Security event.** | Do not use this version. Review the detection in Defender. |
+| `denylist` | The version is blocked. | Remove the entry from the denylist if the block is no longer wanted. |
+| `the Defender scan could not be completed` | `RequireDefenderScanAtIntake` is on and the run was not elevated. | Run from an elevated PowerShell. |
+
+A rejected **new** pin is simply tried again on the next run. A rejected pin that a group file
+**already lists** (e.g. a hand-edited group file) is reported as "still listed without a wheel" -
+fix or remove that line in the group file.
+
+### 5.3 Keep several versions of one package
+
+Pin the second version in `requirements.in` (for example `numpy==1.26.4` while `numpy==2.3.1` is
+published). It goes into another group file automatically (`requirements-2.txt`, ...), because one
+group file cannot list two versions of a package. Both wheels are then in the wheelhouse.
+
+### 5.4 Check the wheelhouse on demand
 
 ```powershell
-cd C:\WheelHouseManager\Jobs
+.\Test-Wheelhouse.ps1                   # the weekly check now, with alert
+.\Test-Wheelhouse.ps1 -DefenderScan     # ... and a Defender re-scan (elevated PowerShell)
+.\Test-WheelhousePackage.ps1                                   # audit everything, no alert
+.\Test-WheelhousePackage.ps1 -Package numpy==2.3.1,pandas==2.2.3   # audit chosen packages
+.\Invoke-WheelhouseScan.ps1                                    # Defender scan of everything (elevated)
+.\Invoke-WheelhouseScan.ps1 -File numpy-2.3.1-cp314-cp314-win_amd64.whl
+```
 
-# 1. Edit Input\requirements.in, then resolve it
-.\Update-Requirement.ps1
+In the UI: **Packages** tab -> **Audit all / Audit selected**, **Scan all / Scan selected**. The
+table shows each package's latest audit and scan result.
 
-# 2. Review/approve Input\requirements.txt, then merge + process
-.\Update-Wheelhouse.ps1
+### 5.5 Respond to an alert
 
-# Optional: run just the audit + alert combo on demand, same as the Scheduled Task
-.\Test-Wheelhouse.ps1
+An alert (email, or `<wheelhouse>\reports\Alert_<timestamp>.html`) can contain three sections:
 
-# Optional: run Update-Wheelhouse.ps1 AND automatically alert on whatever it finds, in one call
+**Packages that need attention** - each row has a recommended action:
+
+| Kind | What happened | What to do |
+|---|---|---|
+| `Yanked` | A published version was withdrawn on PyPI. | Read the yank reason. Pin another version, resolve, publish, then quarantine this one. |
+| `Denylisted` | A published version is on the denylist (blocked after it was published). | Quarantine or delete it - the denylist only stops new downloads. |
+| `DefenderThreat` | Defender detects a published wheel. | Quarantine it now, then review the detection. |
+| `DefenderRemoved` | Defender removed a published wheel itself. | Review the detection. `Update-Wheelhouse.ps1` cleans up the pin and denylists the version. |
+| `IntakeBlocked` | A download did not match PyPI or was detected - nothing was published. | Investigate before trying that version again. |
+
+**Vulnerability findings** - package, version, advisory ID (CVE/GHSA), description, fix
+version, the group file(s) that list it and the exact wheel file(s). A finding marked *Blocked
+before download* was a candidate that never reached the wheelhouse - just change
+`requirements.in`. For a published package:
+
+1. Quarantine (or delete) it - UI **Packages** tab. This removes the pin, the manifest entry and
+   the file, and denylists that version.
+2. Put the fixed version in `requirements.in` (e.g. `requests>=2.32.4`), run
+   `Update-Requirement.ps1`, review, run `Update-Wheelhouse.ps1`.
+3. If the fix is newer than the cooldown, see 5.6.
+
+**Audits or checks that could not be completed** - the affected packages were *not* checked. Look
+at the run log (`<wheelhouse>\reports\Log_Audit_*.txt`), fix the cause (usually network) and run
+`Test-Wheelhouse.ps1` again.
+
+An **integrity failure** (a wheel's hash changed, or a file disappeared without a Defender
+detection) is not alerted by email: the script stops immediately, exit code 2, details in
+`Report_Integrity_*.json`. Treat it as possible tampering: compare the file, restore it from
+quarantine or backup, or remove the package and publish it again.
+
+### 5.6 Publish an urgent security fix (skip the cooldown for one package)
+
+```powershell
+.\Update-Requirement.ps1 -MinimumPackageAgeDays 0      # only if the fix is newer than the cooldown
+.\Update-Wheelhouse.ps1 -ExpeditePackage requests==2.32.4 -ExpediteReason "CVE-2026-1234 fix"
+```
+
+Only the expedited pin skips the cooldown (your user name and the reason are logged); every other
+check still applies, and any other too-new pin is rejected and retried later. Don't use
+`Update-Wheelhouse.ps1 -MinimumPackageAgeDays 0` - it lifts the cooldown for every package in
+the run.
+
+### 5.7 Quarantine, delete or restore a package
+
+In the UI, **Packages** tab: select rows -> **Quarantine** (reversible) or **Delete** (permanent,
+asks for confirmation). Both remove the pin from every group file and the manifest first - so
+clients never see a pin without a wheel - then move or delete the file, and add the version to the
+denylist. If a step fails, the earlier steps are undone.
+
+**Restore**: **Quarantine** tab -> **Restore**. The file's hash must be unchanged; the package goes
+back into the manifest and its group files, and the denylist entry that quarantining created is
+removed (an entry you added by hand stays).
+
+### 5.8 Block a package
+
+UI **Denylist** tab -> name, version (or `*` for all versions) and reason -> **Add**. Or edit
+`config\denylist.json`. A blocked version:
+
+- is refused by the UI's Add tab (when you enter that exact pin, or the entry blocks every version),
+- is steered around when resolving (exact versions are passed to uv as `name!=version`),
+- is rejected first at intake.
+
+A blocked version that is already published stays installable until you quarantine it; the weekly
+check reports it as `Denylisted`.
+
+### 5.9 Use the update and the alert together - `Invoke-WheelhousePipeline.ps1`
+
+```powershell
 cd C:\WheelHouseManager
 .\Invoke-WheelhousePipeline.ps1
+.\Invoke-WheelhousePipeline.ps1 -SmtpServer 10.0.0.25
 ```
 
-`Invoke-WheelhousePipeline.ps1` collects the `Wheelhouse.AuditResult` objects returned by
-`Update-Wheelhouse.ps1` (exactly this run's audits - no guessing by file timestamps) and feeds
-every vulnerable or failed one into `Send-VulnerabilityAlert.ps1`. It passes only the
-parameters you give it; everything else each child script resolves from `settings.psd1` itself.
-Like `Update-Wheelhouse.ps1`, it merges `Input\requirements.txt` by default - pass
-`-LocalRequirementsPath ""` to skip that.
+Runs `Update-Wheelhouse.ps1`, then sends one alert for exactly this run's findings. It takes the
+same parameters as `Update-Wheelhouse.ps1` plus the alert ones.
 
----
-
-## 8. What happens when a vulnerability is detected
-
-1. The relevant `pip-audit` step exits non-zero; findings are written to
-   `Report_<Scheduled|PreDownload>-<group>-<OSV|PYPI>_<timestamp>.json`. If `pip-audit` fails
-   without a usable report, the audit is reported as an **error**, not as clean.
-2. **During `Update-Wheelhouse.ps1`**: a vulnerable candidate is rejected before download and
-   is never written into a group file; the other candidates carry on. The alert marks such a
-   finding as "Blocked before download" (nothing to quarantine).
-3. **During `Test-Wheelhouse.ps1`'s scheduled check**: nothing is downloaded or removed (it
-   never downloads anything at all) - this is purely detection.
-4. Either way, `pip-audit --fix --dry-run` output is captured too (suggested safe versions,
-   informational only - never applied automatically, since that would bypass the cooldown
-   policy and change a requirements file without review).
-5. `Send-VulnerabilityAlert.ps1` emails an HTML summary (if `SmtpServer` is configured) or saves
-   it as `<wheelhouse>\reports\Alert_<timestamp>.html` - each finding includes the CVE/GHSA ID,
-   description, suggested fix version, the group file(s) that pin it (e.g. `requirements-2.txt`),
-   and the exact wheel filename(s) to quarantine (resolved from `manifest.json`). The same
-   vulnerability reported by OSV and PyPI appears once. Audits that could not be completed are
-   listed in a separate section of the same alert.
-6. **Nothing is quarantined or deleted automatically.** An admin reviews the alert and decides
-   whether to update `Input\requirements.in`, re-resolve, get it approved, and re-run
-   `Update-Wheelhouse.ps1` - subject to the same cooldown policy, or an explicit low
-   `-MinimumPackageAgeDays` override for urgent cases.
-
-An integrity-check failure (tampering/corruption) is a **separate** failure mode from a
-vulnerability finding - it stops the relevant script immediately and is only visible via the
-console log / `Report_Integrity_*.json` / the Scheduled Task's failure status, not via
-`Send-VulnerabilityAlert.ps1` (which only understands `pip-audit`'s report format).
-
----
-
-## 9. Web UI - `Start-WheelhouseUI.ps1`
-
-A local browser interface for everything above. It runs on the manager server only
-(`http://localhost:8765/`) and is a thin layer over the same scripts and module functions.
+### 5.10 Only retry what is pending, without merging anything new
 
 ```powershell
-C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1          # opens the browser; Ctrl+C or the "Stop UI" button stops it
+.\Update-Wheelhouse.ps1 -LocalRequirementsPath ""
+```
+
+Skips `Input\requirements.txt` and only (re)processes pins the group files already list but whose
+wheel is missing - for example after a network problem.
+
+### 5.11 Change the target Python version or platform
+
+Change `PythonVersion` / `Platform`, then run `Update-Requirement.ps1` and `Update-Wheelhouse.ps1`.
+Pins whose wheel does not fit the new target are treated as missing and downloaded for it.
+
+### 5.12 Upgrade the manager
+
+Get the new version of this repository and run `Setup.ps1` again with the same
+`-DestinationPath`. Your settings, denylist, `Input\` files and the wheelhouse are not touched.
+
+---
+
+## 6. The web UI
+
+```powershell
+C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1                     # opens the browser
 C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -Port 9000 -NoBrowser
 ```
 
-Run it from an **elevated** PowerShell if you want to use the Defender scan (`Start-MpScan` needs
-administrator rights); everything else works without elevation.
+The UI runs on the manager server only (`http://localhost:8765/`). Keep the PowerShell window open
+while you use it; stop it with Ctrl+C or the **Stop UI** button. Start it from an **elevated**
+PowerShell to use Defender scans. The top bar shows the wheelhouse path, the target Python, and
+whether Defender is available and the session is elevated.
 
-| Tab | What it does |
+| Tab | What you can do |
 |---|---|
-| **Packages** | Every wheel in `manifest.json` with its groups, latest audit result, latest Defender result and denylist flag. Select rows, then **Audit selected / Audit all**, **Scan selected / Scan all**, **Quarantine** or **Delete**. |
-| **Add packages** | Appends the entries to `Input\requirements.in`, then runs `Update-Requirement.ps1` and `Update-Wheelhouse.ps1` (audit, cooldown, download). "Resolve only" stops at `requirements.txt` so it can be reviewed first. Rejected packages are listed with the reason. |
-| **Quarantine** | Packages moved to `<wheelhouse>\_quarantine\`. **Restore** verifies the file hash and puts the package back into the manifest and its group files. |
-| **Denylist** | Edit `config\denylist.json` (see below). |
-| **Settings** | Edit `config\settings.psd1` with validation. |
-| **Jobs** | Audits, scans and adds run as background jobs (one at a time); their log is shown live and a job can be cancelled. |
+| **Packages** | See every published wheel with its groups, latest audit and Defender result, and denylist flag; filter by name or status. Select rows to **Audit**, **Scan**, **Quarantine** or **Delete**. |
+| **Add packages** | **1. Add**: enter packages; they are added to `requirements.in` and resolved - nothing is downloaded. **2. Review and publish**: read the resolved `requirements.txt`, then **Publish** (runs every check, then publishes). *Also publish right away* does both at once. The card at the bottom lists the latest rejected packages with their reasons. |
+| **Quarantine** | Quarantined packages; **Restore** one. |
+| **Denylist** | Add or remove blocked versions; shows whether a blocked version is still published. |
+| **Settings** | Edit `settings.psd1` with validation. |
+| **Jobs** | Long actions run as background jobs, one at a time, with a live log and **Cancel**. A job ends as *Succeeded*, *Needs attention* (findings or rejected packages - read the log) or *Failed*. |
 
-**Removing a package.** *Quarantine* and *Delete* remove the pin from every group file and the wheel
-from `manifest.json`, then move the file to `_quarantine\<id>\` (quarantine) or delete it. The
-order is chosen so clients never see a pin without a wheel, and a failure part-way undoes the earlier steps.
-
-**Denylist.** `config\denylist.json` lists packages that must never enter the wheelhouse, either an exact
-version or `*` for every version. Quarantining or deleting a package adds its exact version
-automatically, so the next `Update-Wheelhouse.ps1` does not download it again. A blocked package is
-rejected at intake before the audit (the reason is in `Report_Rejected_*.json`), and
-`Update-Requirement.ps1` passes the blocked versions to `uv` as constraints. Restoring a quarantined
-package removes the entry that quarantining created. The file is also editable by hand; a damaged file stops
-the run instead of being treated as empty.
-
-**Locking.** Anything that changes the manifest or the group files (`Update-Wheelhouse.ps1`, remove,
-quarantine, restore) holds `<wheelhouse>\.wheelhouse.lock`; a second operation is refused with a clear message.
-
-**Security.** The server listens on `localhost` / `127.0.0.1` only. Each start generates a random session
-token that is part of the URL the script opens (the page and every API call need it); requests with another
-`Host`, a foreign `Origin` or a non-JSON body are refused. Package names and file names are validated against
-the manifest before they reach a command line. Use the UI on the manager server itself - do not publish the port.
+The UI does the same as the scripts - it runs them in the background - so the reports and logs
+are the same.
 
 ---
 
-## 10. Design note: the `WheelhouseManager` module and future scripts
+## 7. Script reference
 
-`Jobs\WheelhouseManager` holds every helper function used across the project, split by domain
-(`Functions\Settings.ps1`, `Requirements.ps1`, `Manifest.ps1`, `Audit.ps1`, `Intake.ps1`, `Alert.ps1`,
-`Run.ps1`, `Denylist.ps1`, `Package.ps1`, `Scan.ps1`, `Ui.ps1`, `Common.ps1`). Every script loads it with
-`Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager')`.
+Every parameter is optional when it is set in `settings.psd1`. `Get-Help .\<script>.ps1 -Full`
+shows the details.
 
-Many functions are entirely generic - `Invoke-PipAudit`, `Read-RequirementFile`,
-`Confirm-PythonAndTooling`, `Get-PipAuditReport`, `Resolve-WheelhouseParameter` - and don't
-depend on `manifest.json` or the wheelhouse concept at all. Others - `Read-WheelhouseManifest`,
-`Assert-WheelhouseIntegrity`, `Compare-RequirementsAgainstManifest`, `Get-RequirementMergePlan`
-- are wheelhouse-specific. Every script follows the same shape: resolve parameters with
-`Resolve-WheelhouseParameter`, then `Start-WheelhouseRun` / `try` / `finally
-Stop-WheelhouseRun`; failures are thrown, not `exit`ed from inside functions.
+| Script | Purpose | Main parameters |
+|---|---|---|
+| `Setup.ps1` (repo) | Deploy or upgrade the manager | `-DestinationPath`, `-WheelhousePath` |
+| `Jobs\Update-Requirement.ps1` | `requirements.in` -> `requirements.txt` | `-RequirementsInPath`, `-RequirementsTxtPath`, `-PythonVersion`, `-Platform`, `-MinimumPackageAgeDays` |
+| `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins; audit what is published; Defender scan | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
+| `Invoke-WheelhousePipeline.ps1` (root) | `Update-Wheelhouse.ps1` + one alert | as above, plus `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
+| `Jobs\Test-Wheelhouse.ps1` | Weekly check of everything published, with alert | `-DefenderScan`, `-VulnerabilityServices`, `-SmtpServer`, `-MailTo`, `-MailFrom` |
+| `Jobs\Test-WheelhousePackage.ps1` | Audit all or chosen pins, no alert | `-Package name==ver,...` |
+| `Jobs\Invoke-WheelhouseScan.ps1` | Defender scan of all or chosen wheels (elevated) | `-File name.whl,...` |
+| `Jobs\Send-VulnerabilityAlert.ps1` | Build and send/save an alert (used by the scripts above) | `-ReportPaths`, `-AuditErrors`, `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
+| `Jobs\Start-WheelhouseUI.ps1` | Start the web UI | `-Port`, `-NoBrowser` |
 
-A future script (e.g. one that scans individual users' dev project folders for vulnerable
-dependencies, once their storage location is confirmed) can import the same module and reuse
-the generic functions directly.
+Only one operation at a time may change the wheelhouse (`Update-Wheelhouse.ps1`, quarantine,
+delete, restore). A second one is refused with "Another wheelhouse operation is already
+running" (exit code 3) - just try again later.
 
-When adding a function, add it to `FunctionsToExport` in `WheelhouseManager.psd1` and, if it
-has logic worth protecting, a test in `Tests\WheelhouseManager.Tests.ps1`:
+---
+
+## 8. Alerts, reports and logs
+
+Alerts are emailed when `SmtpServer` is set, otherwise saved as
+`<wheelhouse>\reports\Alert_<timestamp>.html`. Everything below is in `<wheelhouse>\reports\` and
+is deleted after `ReportRetentionMonths`.
+
+| File | Written by | Content |
+|---|---|---|
+| `Log_<ts>.txt`, `Log_Audit_<ts>.txt`, `Log_PackageAudit_<ts>.txt`, `Log_Scan_<ts>.txt` | Update-Wheelhouse, Test-Wheelhouse, Test-WheelhousePackage, Invoke-WheelhouseScan | Full console log of the run |
+| `Report_<Stage>-<group>-<OSV\|PYPI>_<ts>.json` | Every audit | pip-audit result. Stage: `PreDownload` (candidates), `Deployed` (Update-Wheelhouse), `Scheduled` (Test-Wheelhouse), `Manual` (Test-WheelhousePackage) |
+| `Report_PackageAge-<group>_<ts>.json` | Update-Wheelhouse | Cooldown/yanked data per candidate, with the eligible date |
+| `Report_Rejected_<ts>.json` | Update-Wheelhouse | Every rejected pin with category and reason |
+| `Report_Scan_<ts>.json` | Every Defender scan | Status, scanned paths, detections |
+| `Report_Integrity_<ts>.json` | Integrity check | What did not match the manifest |
+| `Alert_<ts>.html` | Send-VulnerabilityAlert | Saved alert (no SMTP server) |
+
+Jobs started from the UI also keep their console output in `C:\WheelHouseManager\logs\ui\`.
+
+---
+
+## 9. Exit codes
+
+All scripts use the same codes - useful for Task Scheduler and your own automation:
+
+| Code | Meaning |
+|---|---|
+| `0` | OK. |
+| `1` | Finished, but **needs attention**: vulnerabilities, rejected packages, threats or other findings. |
+| `2` | **Error**: the run aborted, or a check could not be completed (never reported as clean). |
+| `3` | **Busy**: another wheelhouse operation holds the lock. Try again later. |
+
+---
+
+## 10. Troubleshooting
+
+| Message or symptom | Cause and fix |
+|---|---|
+| `WheelhousePath was not supplied and is not set in config\settings.psd1` | Run `Setup.ps1 -WheelhousePath ...`, or set it in the UI's Settings tab. |
+| `Wheelhouse path does not exist or is not reachable` | Check the share path and the account's access to it. |
+| `Another wheelhouse operation is already running (lock file in use: ...)` | Wait for the other run (or UI job) to finish. The lock is released automatically, even after a crash. |
+| `Wheelhouse integrity check failed - refusing to continue ...` | A published wheel changed or disappeared. See `Report_Integrity_*.json` and section 5.5. |
+| `manifest.json exists but could not be parsed` / `denylist.json exists but could not be parsed` / `quarantine.json could not be parsed` | The file is damaged; it is never treated as empty. Restore it from backup or fix the JSON by hand. |
+| `Wheelhouse has no requirement group files yet, and no local requirements were supplied` | First run: add packages to `requirements.in`, run `Update-Requirement.ps1`, then `Update-Wheelhouse.ps1`. |
+| `Update-Requirement.ps1` writes `requirements.rejected.txt` | A package has no wheel for your Python/platform (or its `Requires-Python` excludes it). Remove it or constrain its version in `requirements.in`. |
+| `Python was not found on this machine` | Install Python on the manager server and make sure `python` is on `PATH`. |
+| `Start-MpScan is not available` / Defender scan result `Error` | Run elevated; check that Microsoft Defender is active. |
+| `-ExpeditePackage needs -ExpediteReason` | Add `-ExpediteReason "..."`. |
+| A package is "still listed without a wheel" | A group file lists a pin that could not be published. Fix the cause shown, or remove the line from the group file. |
+| UI: `Open the address printed by Start-WheelhouseUI.ps1 (it contains the session token)` | Use the full URL from the console; it changes at every start. |
+| UI: `Cannot listen on port 8765` | The UI is already running, or the port is used - use `-Port`. |
+| UI: job *Needs attention* | Normal outcome with findings or rejections - open the log. |
+| No alert email arrives | Check `SmtpServer`; without it, alerts are saved as HTML in `reports\`. `Send-MailMessage` does not support authentication - use an internal relay. |
+
+---
+
+## 11. Security
+
+- **Clients** can only install from the wheelhouse (machine-wide uv configuration, applied before
+  logon).
+- **Every published file** passed the denylist, vulnerability audit, yanked, cooldown, PyPI hash
+  and Defender checks, and is recorded with its SHA256; any later change is detected.
+- **Fail closed**: a check that cannot be completed never counts as passed, and a damaged
+  manifest, denylist or quarantine record stops the run.
+- **Web UI**: listens on `localhost` / `127.0.0.1` only, needs the random session token from the
+  start URL, refuses foreign `Host`/`Origin` headers and non-JSON requests, and validates every
+  package and file name against the manifest. Use it on the manager server itself - do not expose
+  the port.
+- Changes to the wheelhouse are serialized by a lock, and removal steps are undone if one fails.
+
+---
+
+## 12. Limitations
+
+- Wheels only (no source packages), for **one** Python version and platform per manager.
+- Nothing is quarantined automatically when the weekly check finds a problem - an administrator
+  decides.
+- Wheels found in the share that the manager did not publish ("untracked") are reported, but are
+  still visible to clients until removed by hand.
+- Email uses `Send-MailMessage` (no SMTP authentication).
+- Planned improvements are listed in [REFACTOR_PLAN.md](REFACTOR_PLAN.md).
+
+---
+
+## 13. For developers
+
+How the code is built, its rules and how to extend it: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ```powershell
-Invoke-Pester -Path .\Tests
+Invoke-Pester -Path .\Tests                     # needs Pester 5+ (not the 3.4 that ships with Windows)
 Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
 ```
-
-The tests need Pester 5 (`Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck`)
-- the Pester 3.4 that ships with Windows can't run them. `.github/workflows/powershell-tests.yml`
-runs the tests, a parse check and PSScriptAnalyzer on every push, under **both Windows
-PowerShell 5.1 and PowerShell 7**; the scripts target 5.1 (keep source files ASCII - 5.1 reads
-BOM-less `.ps1` files as ANSI).
-
-A script run from inside a module function executes in the module's scope, which breaks the
-module's `$script:` variables - so module functions never invoke the `Jobs\*.ps1` scripts
-themselves (see `Get-VulnerabilityAlertParameter`: it builds the parameters, the calling script
-runs `Send-VulnerabilityAlert.ps1`).
