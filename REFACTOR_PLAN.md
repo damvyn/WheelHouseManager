@@ -578,7 +578,7 @@ Acceptance: these scenario tests pass:
 
 - `whm` dispatcher with `status`, `doctor`, `list`, `info`, `help` and the rest; old scripts become wrappers.
 - UI: Overview, Proposals, Waivers, package detail timeline, state legend.
-- `Setup.ps1 -RegisterScheduledTask` plus doctor at the end; new README structure.
+- `Setup.ps1 -RegisterScheduledTask` plus doctor at the end; new README structure. *(Registering the weekly check is already in the UI - Settings tab, `Register-WheelhouseScheduledCheck` - so the Setup switch only needs to call it.)*
 - `Client Install\Test-PythonEnvironment.ps1` (optional, offline).
 
 ### Phase 5 - Performance and hardening (S-M)

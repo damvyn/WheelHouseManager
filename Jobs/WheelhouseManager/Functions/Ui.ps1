@@ -12,6 +12,8 @@ $script:UiWebRoot = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Web'
 $script:UiJobs = [System.Collections.Generic.List[object]]::new()
 $script:UiJobCounter = 0
 $script:UiShutdown = $false
+$script:UiToolStatus = $null
+$script:UiToolStatusTime = [DateTime]::MinValue
 $script:UiMaxJobHistory = 30
 $script:UiMimeTypes = @{
     '.html' = 'text/html; charset=utf-8'
@@ -50,6 +52,20 @@ function Get-WheelhouseUiContext {
         WheelhousePath = $wheelhousePath
         ReportsFolder  = $(if ($wheelhousePath) { Join-Path $wheelhousePath 'reports' } else { '' })
     }
+}
+
+function Get-WheelhouseUiToolStatus {
+    # Get-WheelhouseToolStatus, remembered for 30 seconds: it starts three processes, and the
+    # page asks for the state after every job (a job may have installed pip-audit).
+    [CmdletBinding()]
+    param()
+
+    $now = [DateTime]::UtcNow
+    if ($null -eq $script:UiToolStatus -or ($now - $script:UiToolStatusTime).TotalSeconds -ge 30) {
+        $script:UiToolStatus = @(Get-WheelhouseToolStatus)
+        $script:UiToolStatusTime = $now
+    }
+    return $script:UiToolStatus
 }
 
 function Assert-WheelhouseUiConfigured {
@@ -258,7 +274,15 @@ function Sync-WheelhouseUiJob {
     # Exit codes: see Get-WheelhouseExitCode. 1 is a normal outcome that needs a look
     # (findings, rejected packages); later steps still do not run.
     if ($step.ExitCode -eq 1) {
-        & $finish 'Attention' "$($step.Script) finished with findings or rejected packages. Read the log for details."
+        # What exit code 1 means differs per script; say it in its terms.
+        $meaning = switch ($step.Script) {
+            'Update-Requirement.ps1' { 'could not resolve requirements.in (no fitting wheel, or the check of the result failed); requirements.txt was not changed. The log says which package.' }
+            'Update-Wheelhouse.ps1' { 'finished, but some packages were rejected or need attention.' }
+            'Test-WheelhousePackage.ps1' { 'found vulnerabilities.' }
+            'Invoke-WheelhouseScan.ps1' { 'found a threat.' }
+            default { 'finished with findings. Read the log for details.' }
+        }
+        & $finish 'Attention' "$($step.Script) $meaning"
     }
     elseif ($step.ExitCode -eq 3) {
         & $finish 'Failed' "$($step.Script) did not run: another wheelhouse operation holds the lock. Try again when it has finished."
@@ -456,6 +480,7 @@ function Get-WheelhouseUiRoute {
                         is_admin        = $isAdmin
                         python_version  = [string]$Context.Settings.PythonVersion
                         platform        = [string]$Context.Settings.Platform
+                        tools           = @(Get-WheelhouseUiToolStatus)
                         running_job     = $(if ($running) { ConvertTo-WheelhouseUiJobSummary -Job $running } else { $null })
                     }
                 }
@@ -608,9 +633,40 @@ function Get-WheelhouseUiRoute {
                     $text = [System.IO.File]::ReadAllText($path)
                     $modified = $item.LastWriteTimeUtc.ToString('o')
                 }
-                $pins = @()
-                if ($text.Trim()) { $pins = @((Read-RequirementFile -FilePath $path).Keys | Sort-Object) }
-                return @{ Status = 200; Body = @{ path = $path; text = $text; modified_utc = $modified; pin_count = $pins.Count } }
+                $pins = @{}
+                if ($text.Trim()) { $pins = Read-RequirementFile -FilePath $path }
+                # What publishing would add: pins not in the wheelhouse yet, with the reason if the
+                # latest update rejected them. Without a reachable wheelhouse every pin is pending.
+                $published = @{}
+                $rejected = @{}
+                if ($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container)) {
+                    $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+                    foreach ($entry in $manifest) { $published["$($entry.name)==$($entry.version)"] = $true }
+                    $latest = Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_Rejected_*.json' -File -ErrorAction SilentlyContinue |
+                        Sort-Object Name -Descending | Select-Object -First 1
+                    if ($latest) {
+                        try {
+                            foreach ($item in (Get-Content -Path $latest.FullName -Raw | ConvertFrom-Json)) {
+                                $rejected["$(Get-NormalizedPackageName ([string]$item.Package))==$($item.Version)"] = [string]$item.Reason
+                            }
+                        }
+                        catch { Write-Verbose "Unreadable rejection report: $($latest.Name)" }
+                    }
+                }
+                $pending = foreach ($name in ($pins.Keys | Sort-Object)) {
+                    $key = "$name==$($pins[$name])"
+                    if ($published.ContainsKey($key)) { continue }
+                    @{ name = $name; version = [string]$pins[$name]; rejected = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null }) }
+                }
+                return @{ Status = 200; Body = @{
+                        path            = $path
+                        text            = $text
+                        modified_utc    = $modified
+                        pin_count       = $pins.Count
+                        pending         = @($pending)
+                        published_count = $pins.Count - @($pending).Count
+                    }
+                }
             }
         }
 
@@ -811,6 +867,84 @@ function Get-WheelhouseUiRoute {
 
         @{
             Method  = 'GET'
+            Pattern = '^/api/schedule$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $task = Get-WheelhouseScheduledCheck -ManagerRoot $Context.ManagerRoot
+                $lastCheck = ''
+                if ($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container)) {
+                    try { $lastCheck = [string](Read-WheelhouseCatalog -WheelhousePath $Context.WheelhousePath).ScheduledCheckUtc } catch { $lastCheck = '' }
+                }
+                $drive = Get-WheelhouseNetworkDrive -Path $Context.WheelhousePath
+                $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+                # Plain assignment: one-element lists must stay lists in the JSON.
+                $days = @()
+                if ($task.Registered) { $days = @($task.Days) }
+                return @{ Status = 200; Body = @{
+                        registered            = [bool]$task.Registered
+                        task_name             = $task.TaskName
+                        state                 = $(if ($task.Registered) { $task.State } else { '' })
+                        user                  = $(if ($task.Registered) { $task.User } else { '' })
+                        days                  = $days
+                        time                  = $(if ($task.Registered) { $task.Time } else { '' })
+                        last_run_utc          = $(if ($task.Registered) { $task.LastRunTime } else { '' })
+                        last_result           = $(if ($task.Registered) { $task.LastResultText } else { '' })
+                        next_run_utc          = $(if ($task.Registered) { $task.NextRunTime } else { '' })
+                        for_this_installation = [bool]($task.Registered -and $task.ForThisInstallation)
+                        script                = $task.Script
+                        last_check_utc        = $lastCheck
+                        current_user          = $user
+                        wheelhouse_path       = $Context.WheelhousePath
+                        mapped_drive          = $(if ($drive) { @{ drive = $drive.Drive; unc = $drive.Unc } } else { $null })
+                    }
+                }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/schedule$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $password = [string](Get-UiBodyValue -Body $Body -Name 'password')
+                $secure = [System.Security.SecureString]::new()
+                foreach ($char in $password.ToCharArray()) { $secure.AppendChar($char) }
+                $password = $null
+                $registerParams = @{
+                    DayOfWeek   = [string[]]@(Get-UiBodyValue -Body $Body -Name 'days')
+                    At          = [string](Get-UiBodyValue -Body $Body -Name 'time')
+                    User        = [string](Get-UiBodyValue -Body $Body -Name 'user')
+                    Password    = $secure
+                    ManagerRoot = $Context.ManagerRoot
+                }
+                $task = Register-WheelhouseScheduledCheck @registerParams
+                return @{ Status = 200; Body = @{ registered = $true; next_run_utc = $task.NextRunTime } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/schedule/run$'
+            Handler = {
+                param($Context, $Body, $Match)
+                Start-WheelhouseScheduledCheck
+                return @{ Status = 200; Body = @{ started = $true } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/schedule/remove$'
+            Handler = {
+                param($Context, $Body, $Match)
+                if (-not (Get-UiBodyValue -Body $Body -Name 'confirm')) { throw [System.ArgumentException]::new('Removing the task needs confirm.') }
+                if (-not (Unregister-WheelhouseScheduledCheck)) { throw [System.Collections.Generic.KeyNotFoundException]::new('The weekly check is not registered.') }
+                return @{ Status = 200; Body = @{ removed = $true } }
+            }
+        }
+
+        @{
+            Method  = 'GET'
             Pattern = '^/api/settings$'
             Handler = {
                 param($Context, $Body, $Match)
@@ -857,7 +991,12 @@ function Get-WheelhouseUiRoute {
                     $parsed = Get-Content -Path $latest.FullName -Raw | ConvertFrom-Json
                     $items = @(foreach ($item in $parsed) { $item })
                 }
-                return @{ Status = 200; Body = @{ file = $(if ($latest) { $latest.Name } else { $null }); items = $items } }
+                return @{ Status = 200; Body = @{
+                        file         = $(if ($latest) { $latest.Name } else { $null })
+                        modified_utc = $(if ($latest) { $latest.LastWriteTimeUtc.ToString('o') } else { $null })
+                        items        = $items
+                    }
+                }
             }
         }
 

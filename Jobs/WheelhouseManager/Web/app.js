@@ -73,10 +73,17 @@
     var d = new Date(s);
     return isNaN(d.getTime()) ? s : d.toLocaleDateString();
   }
-  function toast(message, kind) {
-    var el = h('div', { class: 'toast ' + (kind || 'ok') }, message);
+  // A toast with an action ({ label, run }) is a button: clicking it closes it and runs the action.
+  function toast(message, kind, action, sticky) {
+    var el = h('div', { class: 'toast ' + (kind || 'ok') + (action ? ' actionable' : ''), role: action ? 'button' : null, tabindex: action ? '0' : null },
+      message, action ? h('div', { class: 'toast-action' }, action.label + ' >') : null);
+    if (action) {
+      var go = function () { el.remove(); action.run(); };
+      el.addEventListener('click', go);
+      el.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
+    }
     $('toasts').append(el);
-    setTimeout(function () { el.remove(); }, kind === 'bad' ? 9000 : 4500);
+    if (!sticky) { setTimeout(function () { el.remove(); }, action ? 20000 : (kind === 'bad' ? 9000 : 4500)); }
   }
   function fail(err) { toast(err.message || String(err), 'bad'); }
   function pinKey(p) { return p.name + '==' + p.version; }
@@ -118,7 +125,8 @@
     settings: null,
     currentTab: 'packages',
     watchedJob: null,
-    pollTimer: null
+    pollTimer: null,
+    shown: {}
   };
 
   // ---------------------------------------------------------------- header / tabs
@@ -127,25 +135,41 @@
     clear(box);
     var info = state.info;
     if (!info) { return; }
-    box.append(
+    // Element.append() would print a nested list as "[object HTMLSpanElement]": pass a flat list.
+    var parts = [
       h('span', { class: 'mono' }, info.wheelhouse_path || '(wheelhouse folder not set)'),
-      badge('Python ' + info.python_version + ' / ' + info.platform),
+      badge('Target Python ' + info.python_version + ' / ' + info.platform),
       info.defender ? badge('Defender available', 'ok') : badge('Defender not available', 'warn'),
       info.is_admin ? badge('elevated', 'ok') : badge('not elevated', 'warn', 'Defender scans need an elevated PowerShell')
-    );
-    var banner = $('banner');
+    ].concat([].concat(info.tools || []).map(function (t) {
+      return badge(t.name + (t.available ? ' ' + t.version : ' missing'), t.level, t.message || ('Found: ' + t.name + ' ' + t.version));
+    }));
+    parts.forEach(function (p) { box.append(p); });
+    // Every problem that stops something from working, worst first.
+    var problems = [];
     if (!info.configured) {
-      banner.textContent = 'The wheelhouse folder is not set. Open the Settings tab and enter it.';
-      banner.className = 'banner bad';
+      problems.push({ level: 'bad', text: 'The wheelhouse folder is not set. Open the Settings tab and enter it.' });
     } else if (!info.reachable) {
-      banner.textContent = 'The wheelhouse folder does not exist or is not reachable: ' + info.wheelhouse_path;
-      banner.className = 'banner bad';
-    } else {
-      banner.className = 'banner hidden';
+      problems.push({ level: 'bad', text: 'The wheelhouse folder does not exist or is not reachable: ' + info.wheelhouse_path });
     }
+    [].concat(info.tools || []).forEach(function (t) {
+      if (t.level !== 'ok' && t.message) { problems.push({ level: t.level, text: t.message }); }
+    });
+    var banner = $('banner');
+    clear(banner);
+    if (problems.length === 0) {
+      banner.className = 'banner hidden';
+      return;
+    }
+    problems.sort(function (a, b) { return (a.level === 'bad' ? 0 : 1) - (b.level === 'bad' ? 0 : 1); });
+    problems.forEach(function (p) { banner.append(h('div', {}, p.text)); });
+    banner.className = problems[0].level === 'bad' ? 'banner bad' : 'banner';
   }
 
   function showTab(name) {
+    if (state.currentTab === 'settings' && name !== 'settings' && state.settingsDirty &&
+      !window.confirm('Your settings changes are not saved yet. Leave the Settings tab and discard them?')) { return; }
+    state.settingsDirty = false;
     state.currentTab = name;
     Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), function (b) {
       b.classList.toggle('active', b.getAttribute('data-tab') === name);
@@ -155,9 +179,78 @@
     });
     var loaders = {
       packages: loadPackages, add: renderAdd, quarantine: loadQuarantine,
-      denylist: loadDenylist, settings: loadSettings, jobs: loadJobs
+      denylist: loadDenylist, schedule: loadScheduleTab, settings: loadSettings, jobs: loadJobs
     };
-    loaders[name]();
+    return loaders[name]();
+  }
+
+  // One-time messages for the Packages tab, as toasts that stay until clicked (once per page load).
+  function showPackageNotices() {
+    if (state.checkOverdue && !state.shown.checkOverdue) {
+      state.shown.checkOverdue = true;
+      toast('The scheduled check is not running. ' + (state.lastCheck
+        ? 'Test-Wheelhouse.ps1 last completed ' + fmtDate(state.lastCheck) + ', more than ' + state.freshnessDays + ' day(s) ago.'
+        : 'Test-Wheelhouse.ps1 has never completed for this wheelhouse.') +
+        ' New vulnerabilities in published packages go unnoticed until it runs again.', 'bad',
+        { label: 'Set up the weekly check', run: function () { showTab('schedule'); } }, true);
+    }
+    if (state.info && (!state.info.defender || !state.info.is_admin) && !state.shown.defender) {
+      state.shown.defender = true;
+      toast('Defender scans need Microsoft Defender and an elevated PowerShell (Run as administrator) for Start-WheelhouseUI.ps1.', 'warn',
+        { label: 'OK', run: function () { } }, true);
+    }
+  }
+
+  // Brings a card into view and outlines it as the place to look next.
+  function highlight(el) {
+    if (!el) { return; }
+    el.classList.add('next-step');
+    setTimeout(function () { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 50);
+  }
+
+  // Where to look after a job that ended with findings or failed, as a toast action.
+  function jobNextStep(job) {
+    if (job.status === 'Succeeded' || job.status === 'Cancelled' || job.status === 'Running') { return null; }
+    var showLog = { label: 'Open the log', run: function () { watchJob(job.id); } };
+    if (job.status === 'Failed') { return showLog; }
+    // An "add" job resolves first (step 1) and may then publish: only the publish step
+    // produces rejected packages; a resolve that needs attention is explained in the log.
+    var publishing = job.kind === 'update' || (job.kind === 'add' && job.steps > 1 && job.step === job.steps);
+    if (publishing) {
+      return { label: 'Show what needs attention', run: function () { showUpdateResult(job); } };
+    }
+    if (job.kind === 'add') { return { label: 'Open the log to see why', run: function () { watchJob(job.id); } }; }
+    if (job.kind === 'audit') { return { label: 'Show the vulnerable packages', run: function () { showPackagesFiltered('vulnerable', job); } }; }
+    if (job.kind === 'scan') { return { label: 'Show the threats', run: function () { showPackagesFiltered('threat', job); } }; }
+    return showLog;
+  }
+  function showPackagesFiltered(filter, job) {
+    state.statusFilter = filter;
+    var loading = showTab('packages');
+    if (!loading) { return; }
+    loading.then(function () {
+      if (visiblePackages().length === 0) {
+        // Nothing of that kind in the table: the details are in the job's log.
+        state.statusFilter = 'all';
+        renderPackages();
+        toast('No package is marked like that in the table - the details are in the log.', 'bad');
+        watchJob(job.id);
+      }
+    });
+  }
+  // An update needs attention for rejected packages (Add tab), vulnerable published ones
+  // (Packages tab) or notices such as a wheel missing from the share (the log).
+  function showUpdateResult(job) {
+    api('GET', '/api/rejected').then(function (data) {
+      var started = new Date(job.started_utc).getTime();
+      var fresh = data.file && data.items.length > 0 && new Date(data.modified_utc).getTime() >= started - 5000;
+      if (fresh) {
+        state.highlightRejected = true;
+        showTab('add');
+      } else {
+        showPackagesFiltered('vulnerable', job);
+      }
+    }).catch(function () { watchJob(job.id); });
   }
 
   // ---------------------------------------------------------------- packages tab
@@ -238,12 +331,7 @@
       }));
     statusFilter.addEventListener('change', function () { state.statusFilter = statusFilter.value; renderPackages(); });
 
-    if (state.checkOverdue) {
-      root.append(h('div', { class: 'card warn-card' }, h('strong', {}, 'The scheduled check is not running. '),
-        state.lastCheck ? 'Test-Wheelhouse.ps1 last completed ' + fmtDate(state.lastCheck) + ', more than ' + state.freshnessDays + ' day(s) ago.'
-          : 'Test-Wheelhouse.ps1 has never completed for this wheelhouse.',
-        ' New vulnerabilities in published packages go unnoticed until it runs again - check its Scheduled Task.'));
-    }
+    showPackageNotices();
     var toolbar = h('div', { class: 'toolbar' },
       h('div', { class: 'group' }, filter, statusFilter, h('button', { class: 'btn', type: 'button', onclick: loadPackages }, 'Refresh')),
       h('div', { class: 'group' },
@@ -258,9 +346,7 @@
       h('span', { class: 'muted' }, pins.length + ' selected / ' + visible.length + ' shown / ' + state.pkgs.length + ' files'));
     root.append(toolbar);
 
-    if (state.info && (!state.info.defender || !state.info.is_admin)) {
-      root.append(h('div', { class: 'banner' }, 'Defender scans need Microsoft Defender and an elevated PowerShell (Run as administrator) for Start-WheelhouseUI.ps1.'));
-    }
+
     if (state.untracked.length > 0) {
       root.append(h('div', { class: 'banner' },
         state.untracked.length + ' wheel file(s) are in the folder but not tracked by manifest.json (never added by this tool): ' + state.untracked.join(', ')));
@@ -482,11 +568,18 @@
     loadRejected();
   }
 
-  function loadRequirements() {
+  function loadRequirements(showNextStep) {
     var card = $('requirements-card');
     if (!card) { return; }
     api('GET', '/api/requirements').then(function (data) {
       clear(card);
+      if (showNextStep) {
+        card.classList.add('next-step');
+        card.append(h('p', { class: 'next-hint' }, 'Resolved. Next: review the pins below, then publish them to the wheelhouse.'));
+        setTimeout(function () { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 50);
+      } else {
+        card.classList.remove('next-step');
+      }
       card.append(h('h2', {}, '2. Review and publish'),
         h('p', { class: 'muted' }, 'Resolved pins in ' + (data.path || 'requirements.txt') + (data.modified_utc ? ' (changed ' + fmtDate(data.modified_utc) + ')' : '') +
           '. Publishing runs Update-Wheelhouse.ps1: every new pin is checked against the denylist, audited, checked for the cooldown and for yanked releases, downloaded into a staging folder, verified against the sha256 published on PyPI and scanned with Defender. Only then is it copied into the wheelhouse. Pins already in the wheelhouse are skipped.'));
@@ -494,14 +587,34 @@
         card.append(h('div', { class: 'empty' }, 'requirements.txt is empty - add packages above first.'));
         return;
       }
-      var publish = h('button', { class: 'btn primary', type: 'button' }, 'Publish ' + data.pin_count + ' pin(s) to the wheelhouse');
+      // Only what publishing would add; pins already in the wheelhouse are only counted.
+      var pending = [].concat(data.pending || []);
+      var whole = h('details', {}, h('summary', {}, 'Show the whole requirements.txt (' + data.pin_count + ' pin(s))'), h('pre', { class: 'log review' }, data.text));
+      if (data.published_count > 0) {
+        card.append(h('p', {}, data.published_count + ' pin(s) of requirements.txt are already in the wheelhouse and are not listed here.'));
+      }
+      if (pending.length === 0) {
+        card.append(h('div', { class: 'empty' }, 'Everything in requirements.txt is already in the wheelhouse - there is nothing to publish. Add packages above to resolve new ones.'), whole);
+        return;
+      }
+      card.append(h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'))),
+        h('tbody', {}, pending.map(function (p) {
+          return h('tr', {}, h('td', { class: 'mono' }, p.name + '==' + p.version),
+            h('td', {}, p.rejected ? [badge('rejected last time', 'bad'), ' ', p.rejected] : badge('new', 'ok')));
+        })))));
+      var rejectedCount = pending.filter(function (p) { return p.rejected; }).length;
+      if (rejectedCount > 0) {
+        card.append(h('p', { class: 'muted' }, rejectedCount + ' pin(s) were rejected by the latest update for the reason shown. Publishing again rejects them again unless the reason is gone (for example the cooldown has passed); otherwise change them in requirements.in (step 1).'));
+      }
+      var publish = h('button', { class: 'btn primary', type: 'button' }, 'Publish ' + pending.length + ' pin(s) to the wheelhouse');
       publish.addEventListener('click', function () {
         confirmDialog('Publish requirements.txt?', h('p', {}, 'Every pin that is not yet in the wheelhouse goes through all checks; a package that fails one is rejected with the reason and nothing about it is published.'), 'Publish', false).then(function (ok) {
           if (!ok) { return; }
           startJobRequest(api('POST', '/api/wheelhouse/update', { confirm: true }));
         });
       });
-      card.append(h('pre', { class: 'log' }, data.text), h('div', { class: 'toolbar' }, publish));
+      card.append(h('div', { class: 'toolbar after-output' }, publish), whole);
     }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
   }
 
@@ -511,6 +624,13 @@
       if (!card) { return; }
       clear(card);
       card.append(h('h2', {}, 'Latest rejected packages'));
+      if (state.highlightRejected) {
+        state.highlightRejected = false;
+        card.append(h('p', { class: 'next-hint' }, 'These packages were not published. Each reason says what to change; fix it in requirements.in (step 1) and resolve again, or wait for the date given.'));
+        highlight(card);
+      } else {
+        card.classList.remove('next-step');
+      }
       if (!data.file || data.items.length === 0) {
         card.append(h('p', { class: 'muted' }, 'No package was rejected in the latest update.'));
         return;
@@ -620,11 +740,16 @@
   // ---------------------------------------------------------------- settings tab
   function loadSettings() {
     var root = $('tab-settings');
-    api('GET', '/api/settings').then(function (data) {
+    return api('GET', '/api/settings').then(function (data) {
       clear(root);
+      state.settingsDirty = false;
       var inputs = {};
+      var save = h('button', { class: 'btn primary', type: 'button', disabled: true }, 'Save settings');
+      var discard = h('button', { class: 'btn', type: 'button', disabled: true }, 'Discard changes');
+      var note = h('span', { class: 'muted' }, 'No unsaved changes.');
+      var bar = h('div', { class: 'savebar' }, save, discard, note);
       var card = h('div', { class: 'card' }, h('h2', {}, 'Settings'),
-        h('p', { class: 'muted' }, 'Stored in config\\settings.psd1. Scripts started from the UI use the saved values; an explicit parameter on a manual run still wins.'));
+        h('p', { class: 'muted' }, 'Stored in config\\settings.psd1. Changes take effect only after Save settings. Scripts started from the UI use the saved values; an explicit parameter on a manual run still wins.'));
       data.fields.forEach(function (f) {
         var value = data.values[f.key];
         var control;
@@ -649,8 +774,7 @@
         }
         card.append(h('div', { class: 'field' }, h('label', {}, f.label), h('div', {}, control, h('div', { class: 'help' }, f.help))));
       });
-      var save = h('button', { class: 'btn primary', type: 'button' }, 'Save settings');
-      save.addEventListener('click', function () {
+      var changes = function () {
         var updates = {};
         data.fields.forEach(function (f) {
           var now = inputs[f.key]();
@@ -659,15 +783,116 @@
             updates[f.key] = now;
           }
         });
+        return updates;
+      };
+      var labels = {};
+      data.fields.forEach(function (f) { labels[f.key] = f.label; });
+      var update = function () {
+        var keys = Object.keys(changes());
+        state.settingsDirty = keys.length > 0;
+        save.disabled = discard.disabled = !state.settingsDirty;
+        bar.className = state.settingsDirty ? 'savebar dirty' : 'savebar';
+        note.textContent = state.settingsDirty
+          ? 'Unsaved changes: ' + keys.map(function (k) { return labels[k]; }).join(', ') + '.'
+          : 'No unsaved changes.';
+      };
+      card.addEventListener('input', update);
+      card.addEventListener('change', update);
+      discard.addEventListener('click', function () { loadSettings(); });
+      save.addEventListener('click', function () {
+        var updates = changes();
         if (Object.keys(updates).length === 0) { toast('Nothing changed.'); return; }
         api('POST', '/api/settings', { updates: updates }).then(function (res) {
           toast('Saved: ' + res.saved.join(', '));
+          state.settingsDirty = false;
           refreshState().then(loadSettings);
         }).catch(fail);
       });
-      card.append(h('div', { class: 'toolbar' }, save));
-      root.append(card);
+      root.append(bar, card);
     }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
+  }
+
+  // ---------------------------------------------------------------- schedule tab
+  function loadScheduleTab() {
+    var root = $('tab-schedule');
+    clear(root);
+    var card = h('div', { class: 'card', id: 'schedule-card' }, h('h2', {}, 'Weekly check (Scheduled Task)'), h('p', { class: 'muted' }, 'Loading...'));
+    root.append(card);
+    loadSchedule(card);
+  }
+
+  // The weekly check (Test-Wheelhouse.ps1) as a Windows Scheduled Task.
+  function loadSchedule(card) {
+    api('GET', '/api/schedule').then(function (s) {
+      clear(card);
+      card.append(h('h2', {}, 'Weekly check (Scheduled Task)'),
+        h('p', { class: 'muted' }, 'Test-Wheelhouse.ps1 re-checks everything published and sends the alerts. It should run at least weekly, under an account that can read and write the wheelhouse share.'));
+      if (s.mapped_drive) {
+        var useUnc = h('button', { class: 'btn small', type: 'button' }, 'Use ' + s.mapped_drive.unc);
+        useUnc.addEventListener('click', function () {
+          api('POST', '/api/settings', { updates: { WheelhousePath: s.mapped_drive.unc } }).then(function () {
+            toast('Wheelhouse folder changed to ' + s.mapped_drive.unc + '.');
+            refreshState().then(loadScheduleTab);
+          }).catch(fail);
+        });
+        card.append(h('div', { class: 'banner bad' }, 'The wheelhouse folder is set to ' + s.wheelhouse_path + ', a mapped network drive (' + s.mapped_drive.drive + ' = ' + s.mapped_drive.unc +
+          '). A Scheduled Task does not see the drive mappings of your session, so the weekly check would fail. Use the UNC path instead. ', useUnc));
+      }
+      var status;
+      if (s.registered) {
+        status = h('div', { class: 'kv' },
+          h('div', {}, h('strong', {}, 'Status: '), badge(s.state || 'registered', s.state === 'Disabled' ? 'bad' : 'ok'), s.for_this_installation ? '' : [' ', badge('runs another installation', 'warn', 'The task does not start ' + s.script)]),
+          h('div', {}, h('strong', {}, 'Runs: '), (s.days.length ? [].concat(s.days).join(', ') : 'custom schedule') + (s.time ? ' at ' + s.time : '') + ' as ' + s.user),
+          h('div', {}, h('strong', {}, 'Last run: '), s.last_run_utc ? fmtDate(s.last_run_utc) + ' - ' + s.last_result : 'not yet'),
+          h('div', {}, h('strong', {}, 'Next run: '), s.next_run_utc ? fmtDate(s.next_run_utc) : '-'),
+          h('div', {}, h('strong', {}, 'Last completed check: '), s.last_check_utc ? fmtDate(s.last_check_utc) : 'never'));
+      } else {
+        status = h('div', { class: 'banner' }, 'Not registered yet. Fill in the form below and click Register.');
+      }
+      card.append(status);
+
+      var dayNames = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+      var chosen = s.registered && s.days.length ? [].concat(s.days) : ['Sunday'];
+      var dayBoxes = dayNames.map(function (d) { return { day: d, box: h('input', { type: 'checkbox', checked: chosen.indexOf(d) >= 0 }) }; });
+      var time = h('input', { type: 'time', value: s.time || '02:00' });
+      var user = h('input', { type: 'text', class: 'wide', value: s.user || s.current_user, autocomplete: 'off' });
+      var password = h('input', { type: 'password', class: 'wide', autocomplete: 'new-password', placeholder: 'password of this account' });
+      var register = h('button', { class: 'btn primary', type: 'button' }, s.registered ? 'Update the task' : 'Register the task');
+      register.addEventListener('click', function () {
+        var days = dayBoxes.filter(function (b) { return b.box.checked; }).map(function (b) { return b.day; });
+        register.disabled = true;
+        api('POST', '/api/schedule', { days: days, time: time.value, user: user.value.trim(), password: password.value }).then(function (res) {
+          password.value = '';
+          toast('Weekly check registered' + (res.next_run_utc ? ' - next run ' + fmtDate(res.next_run_utc) : '') + '.');
+          loadSchedule(card);
+        }).catch(function (err) { register.disabled = false; fail(err); });
+      });
+      var form = h('div', {},
+        h('div', { class: 'field' }, h('label', {}, 'Days'), h('div', { class: 'checks' }, dayBoxes.map(function (b) { return h('label', {}, b.box, ' ' + b.day.slice(0, 3)); }))),
+        h('div', { class: 'field' }, h('label', {}, 'Time'), h('div', {}, time, h('div', { class: 'help' }, 'Local time of this server. A run missed while the server was off starts as soon as possible.'))),
+        h('div', { class: 'field' }, h('label', {}, 'Account'), h('div', {}, user, h('div', { class: 'help' }, 'DOMAIN\\user or user@domain. It needs read/write access to the wheelhouse share and network access to PyPI and OSV; no administrator rights. Registering a task for another account needs the UI started as administrator.'))),
+        h('div', { class: 'field' }, h('label', {}, 'Password'), h('div', {}, password, h('div', { class: 'help' }, 'Required so the task can reach the share while nobody is logged on. It is handed to Windows Task Scheduler and not stored or logged by Wheelhouse Manager. Enter it again whenever you update the task or the password changes.'))));
+      var actions = h('div', { class: 'toolbar after-output' }, register);
+      if (s.registered) {
+        var run = h('button', { class: 'btn', type: 'button' }, 'Run now');
+        run.addEventListener('click', function () {
+          api('POST', '/api/schedule/run', {}).then(function () {
+            toast('The weekly check was started by Task Scheduler. Its result appears here and in the Packages tab when it finishes.');
+            setTimeout(function () { loadSchedule(card); }, 3000);
+          }).catch(fail);
+        });
+        var remove = h('button', { class: 'btn danger', type: 'button' }, 'Remove the task');
+        remove.addEventListener('click', function () {
+          confirmDialog('Remove the weekly check?', h('p', {}, 'Published packages are then no longer re-checked automatically and no alerts are sent.'), 'Remove', true).then(function (ok) {
+            if (!ok) { return; }
+            api('POST', '/api/schedule/remove', { confirm: true }).then(function () { toast('Weekly check removed.'); loadSchedule(card); }).catch(fail);
+          });
+        });
+        actions.append(run, remove);
+      }
+      card.append(form, actions);
+
+    }).catch(function (err) { clear(card); card.append(h('h2', {}, 'Weekly check (Scheduled Task)'), h('div', { class: 'empty' }, err.message)); });
   }
 
   // ---------------------------------------------------------------- jobs
@@ -728,7 +953,7 @@
         state.pollTimer = setTimeout(function () { pollJob(false); }, 1500);
       } else {
         state.pollTimer = null;
-        if (!first) { toast(job.title + ': ' + (job.status === 'Succeeded' ? 'finished.' : job.message), job.status === 'Succeeded' ? 'ok' : 'bad'); }
+        if (!first) { toast(job.title + ': ' + (job.status === 'Succeeded' ? 'finished.' : job.message), job.status === 'Succeeded' ? 'ok' : 'bad', jobNextStep(job)); }
         onJobFinished(job);
       }
     }).catch(function (err) {
@@ -740,7 +965,12 @@
   function onJobFinished(job) {
     if (state.currentTab === 'packages') { loadPackages(); }
     else if (state.currentTab === 'jobs') { loadJobs(); }
-    else if (state.currentTab === 'add') { loadRequirements(); loadRejected(); }
+    else if (state.currentTab === 'add') {
+      // After a successful "Add and resolve", the next step is reviewing the result.
+      var next = job.kind === 'add' && job.status === 'Succeeded';
+      loadRequirements(next);
+      loadRejected();
+    }
     refreshState();
   }
 
@@ -783,7 +1013,7 @@
 
     refreshState().then(function (info) {
       if (!info) { return; }
-      var tabs = ['packages', 'add', 'quarantine', 'denylist', 'settings', 'jobs'];
+      var tabs = ['packages', 'add', 'quarantine', 'denylist', 'schedule', 'settings', 'jobs'];
       var wanted = location.hash.replace('#', '');
       if (!info.configured) { showTab('settings'); }
       else { showTab(tabs.indexOf(wanted) >= 0 ? wanted : 'packages'); }

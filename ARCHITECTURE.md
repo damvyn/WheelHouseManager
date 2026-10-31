@@ -284,7 +284,7 @@ flowchart TD
 
 **Loading.** `WheelhouseManager.psm1` sets `$script:ManagerRoot` and dot-sources `Common`,
 `Settings`, `Requirements`, `Manifest`, `Catalog`, `Journal`, `Audit`, `Vulnerability`, `Intake`, `Sync`, `Alert`,
-`Run`, `Denylist`, `Package`, `Scan`, `Ui` (order is for readability; calls resolve at run time).
+`Run`, `Denylist`, `Package`, `Scan`, `Schedule`, `Ui` (order is for readability; calls resolve at run time).
 `Ui.ps1` builds `$script:UiRoutes` at load time. The psd1's
 `FunctionsToExport` is the public surface; CI fails if a listed function is missing.
 
@@ -300,6 +300,7 @@ flowchart TD
 | `SeverityLevels` (`Low` .. `Critical`), `VulnerabilityIdPattern` | Vulnerability | Severity order; what an advisory ID may look like (waivers, OSV lookups) |
 | `QuarantineFolderName` (`_quarantine`), `PackageSpecPattern` | Package | Quarantine location; what `requirements.in` lines the UI may add |
 | `UiWebRoot`, `UiStaticFiles`, `UiMimeTypes` | Ui | Static file whitelist |
+| `UiToolStatus`, `UiToolStatusTime` | Ui | Cached tool check for `GET /api/state` |
 | `UiJobs`, `UiJobCounter`, `UiMaxJobHistory` (30), `UiShutdown` | Ui | In-memory job list and server state (one UI process) |
 | `UiRoutes` | Ui | The API route table (`Get-WheelhouseUiRoute`) |
 
@@ -344,7 +345,7 @@ Resolves `RequirementsInPath`, `RequirementsTxtPath` (setting `LocalRequirements
 3. Pass -> move candidate to `requirements.txt`, delete `.rejected.txt`. Fail -> move candidate to
    `requirements.rejected.txt`, keep `requirements.txt`.
 
-Exit: 0 written; 1 uv or the pip check rejected the result; 2 missing input / python / platform.
+Exit: 0 written; 1 uv or the pip check rejected the result; 2 missing input / python / uv / platform.
 
 ### 7.4 `Update-Wheelhouse.ps1` (the update run)
 Parameters: `WheelhousePath`, `LocalRequirementsPath` (`""` = no merge), `PythonVersion`,
@@ -480,6 +481,8 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Invoke-GroupAudit` | one audit per service, fix suggestions if vulnerable | AuditResult[] (`-NoEnumerate`) | worker, checks, intake, `Invoke-PackageAudit` |
 | `Get-PyPIReleaseInfo` | PyPI JSON API (TLS 1.2 on 5.1): files with sha256, upload time, yanked; release yanked flag; throws if unreadable/empty | `{Files; FirstUploadUtc; Yanked; YankedReason}` | `Test-PackageAge`, `Get-DeployedPackageNotice` |
 | `Test-PackageAge` | release first upload vs. minimum age; `-Expedite` names pass; results carry `EligibleUtc`, `Yanked`, `Release`; unreadable -> failed with `Error` | `@{ TooNew; Results }` | intake |
+| `Invoke-WheelhouseToolProbe` | version reported by `python --version`, `python -m pip_audit --version` or `uv --version`, run as a process with an empty stdin and a 15 s limit (the Store `python.exe` stub can block); `$null` if missing, failing or too slow (mock seam) | string / `$null` | `Get-WheelhouseToolStatus` |
+| `Get-WheelhouseToolStatus` | `{name; available; version; level ok/warn/bad; message}` for python, pip-audit (warn: installed by the first run), uv (needed to resolve `requirements.in`) | objects | UI state |
 | `Get-DeployedPackageNotice` | published versions vs. denylist and PyPI yanked flag (release or deployed file); unreadable -> one aggregated error | `@{ Notices; Errors; Checked = {Package; Version; Yanked; Reason} }` | scheduled check |
 
 ### 8.6 `Intake.ps1`
@@ -551,7 +554,8 @@ Columns: purpose | returns / side effects | callers. All are exported.
 
 ### 8.12 `Ui.ps1`
 See [section 10](#10-web-ui). Functions: `Get-WheelhouseUiContext` (effective settings, read per
-request), `Assert-WheelhouseUiConfigured`, `Get-UiBodyValue`, `Resolve-UiPackageSelection`,
+request), `Get-WheelhouseUiToolStatus` (`Get-WheelhouseToolStatus` cached for 30 s),
+`Assert-WheelhouseUiConfigured`, `Get-UiBodyValue`, `Resolve-UiPackageSelection`,
 `ConvertTo-UiArgument`, `Get-WheelhouseUiRunningJob`, `Start-WheelhouseUiJobStep`,
 `Start-WheelhouseUiJob`, `Sync-WheelhouseUiJob`, `Stop-WheelhouseUiJob`, `Read-UiLogFile`,
 `ConvertTo-WheelhouseUiJobSummary`, `Get-WheelhouseUiRandomToken`, `Test-WheelhouseUiRequest`,
@@ -598,6 +602,23 @@ request), `Assert-WheelhouseUiConfigured`, `Get-UiBodyValue`, `Resolve-UiPackage
 | Function | Purpose | Callers |
 |---|---|---|
 | `Invoke-WheelhouseSync` | the update run (section 9.2); returns `{Outcome Ok/Attention/Error; AuditResults; Notices; Rejected; Published}`; throws when it cannot start | Update-Wheelhouse.ps1 |
+
+### 8.17 `Schedule.ps1`
+
+The weekly check as a Scheduled Task (`$script:ScheduledCheckTaskName` = `Wheelhouse Weekly Check`,
+root task folder, same name as the README's manual instructions). It runs with a stored password
+(`LogonType Password`): only that logon has network credentials for the share - S4U and SYSTEM
+reach it as the computer account. The password is passed straight to `Register-ScheduledTask`
+and never stored or logged.
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Get-WheelhouseScheduledCheckScript` | `<root>\Jobs\Test-Wheelhouse.ps1` | schedule functions |
+| `ConvertTo-ScheduledCheckResultText` | Last Run Result in words (script exit codes, common Task Scheduler codes) | `Get-WheelhouseScheduledCheck` |
+| `Get-WheelhouseNetworkDrive` | for a path on a mapped drive, `{Path; Drive; Unc}` (`Get-PSDrive` DisplayRoot, else `Win32_LogicalDisk`); `$null` for UNC and local paths | UI schedule card |
+| `Get-WheelhouseScheduledCheck` | `{Registered; State; User; Days[] (from the DaysOfWeek mask); Time; LastRunTime; LastResult(Text); NextRunTime; Script; ForThisInstallation}` | UI |
+| `Register-WheelhouseScheduledCheck` | validate days, `HH:mm`, account, password (SecureString); weekly trigger, `-StartWhenAvailable`, `IgnoreNew`, 4 h limit, `RunLevel Limited`, `-Force` (replaces); refused logon -> `ArgumentException`, access denied -> `InvalidOperationException` (needs elevation) | UI |
+| `Start-WheelhouseScheduledCheck` / `Unregister-WheelhouseScheduledCheck` | run now (404 if absent) / remove (`$false` if absent) | UI |
 
 ### 8.16 `Vulnerability.ps1`
 
@@ -801,21 +822,24 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 
 | Route | Body | Action | Status |
 |---|---|---|---|
-| `GET /api/state` | - | path, configured, reachable, defender, is_admin, python/platform, running job | 200 |
+| `GET /api/state` | - | path, configured, reachable, defender, is_admin, python/platform, `tools` (python, pip-audit, uv), running job | 200 |
 | `GET /api/packages` | - | `Get-WheelhousePackage` (denylist, configured services) + `last_check_utc`, `check_overdue` (no completed weekly check within `AuditFreshnessDays`), `audit_freshness_days` | 200 |
 | `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks, findings) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
+| `GET /api/schedule` | - | `Get-WheelhouseScheduledCheck` + `last_check_utc` (catalog), `current_user`, `mapped_drive {drive; unc}` | 200 |
+| `POST /api/schedule` | `{days[], time 'HH:mm', user, password}` | `Register-WheelhouseScheduledCheck` (password -> SecureString at once) | 200 / 400 / 409 |
+| `POST /api/schedule/run`, `POST /api/schedule/remove` | - / `{confirm:true}` | `Start-` / `Unregister-WheelhouseScheduledCheck` | 200 / 400 / 404 / 409 |
 | `GET /api/waivers` | - | every waiver with `expired`, and `max_days` | 200 |
 | `POST /api/waivers/add`, `POST /api/waivers/remove` | `{name, version, id, reason, days}` / `{name, version, id}` | `Add-/Remove-WheelhouseWaiver` + `Set-CatalogFindingWaiver` inside `Update-WheelhouseCatalog -TimeoutSeconds 0` (history at once) | 200 / 400 / 404 / 409 |
 | `POST /api/packages/audit` | `{all}` or `{packages:[{name,version}]}` (<= 500) | job `Test-WheelhousePackage.ps1 [-Package ...]` | 202 |
 | `POST /api/packages/scan` | `{all}` or `{files:[...]}` | job `Invoke-WheelhouseScan.ps1 [-File ...]` | 202 |
 | `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
-| `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review | 200 `{path, text, modified_utc, pin_count}` |
+| `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review, plus `pending` (pins not in the manifest, each with the reason from the latest `Report_Rejected_*` if any) and `published_count` | 200 `{path, text, modified_utc, pin_count}` |
 | `POST /api/wheelhouse/update` | `{confirm:true}` | job `Update-Wheelhouse.ps1` | 202 / 400 |
 | `POST /api/packages/remove` | `{packages (<= 200), mode:'quarantine'\|'delete', reason (<= 400), confirm}` | `Remove-WheelhousePackage` per package; refused while a job runs | 200 `{results}` |
 | `GET /api/quarantine`, `POST /api/quarantine/restore` | `{id, keep_denylist}` | list / `Restore-WheelhousePackage` | 200 |
 | `GET /api/denylist`, `POST /api/denylist/add`, `POST /api/denylist/remove` | `{name, version, reason}` | list (+ `installed`) / add (`manual`) / remove | 200 / 400 / 404 |
 | `GET /api/settings`, `POST /api/settings` | `{updates:{...}}` | schema + values / validate all, then save | 200 / 400 |
-| `GET /api/rejected` | - | newest `Report_Rejected_*.json` | 200 |
+| `GET /api/rejected` | - | newest `Report_Rejected_*.json` (`file`, `modified_utc`, `items`) | 200 |
 | `GET /api/jobs`, `GET /api/jobs/<id>`, `POST /api/jobs/<id>/cancel` | - | list / detail with log / cancel | 200 / 404 |
 | `POST /api/shutdown` | - | stop the loop | 200 |
 
@@ -826,15 +850,35 @@ builds DOM nodes (never `innerHTML` with data); `confirmDialog` / `infoDialog` u
 `<dialog>`. Tabs: Packages (`loadPackages`, `renderPackages`, `runAudit`, `runScan`,
 `removeSelected`, `showHistory` - the per-row History dialog with the findings table and
 `acceptRisk`), Add (`renderAdd`, `loadRequirements`, `loadRejected`),
-Quarantine (`loadQuarantine`), Denylist (`loadDenylist`, then `loadWaivers`), Settings (`loadSettings`, a form
+Quarantine (`loadQuarantine`), Denylist (`loadDenylist`, then `loadWaivers`), Schedule (`loadScheduleTab` ->
+`loadSchedule`), Settings (`loadSettings`, a form
 generated from the schema), Jobs (`loadJobs`, `watchJob`, `pollJob` every 1.5 s, `jobKind`/
 `jobLabel` for Succeeded/Running/Attention/Failed/Cancelled). The CSP forbids inline scripts and
 external resources - keep everything in these three files. Node is not required; to syntax-check
 `app.js` without a browser, parse it with any modern JavaScript engine (`new Function(source)` in
 Deno or a browser console) or an ES5 parser (e.g. Python `esprima` in a throw-away folder) -
 Windows' JScript cannot, because the code uses ES5 reserved-word properties (`.catch`, `class:`).
-The package table shows the worst open severity and the fix-by date (or `overdue`), filters
-`overdue` and `waived`, and a banner when `check_overdue` is set. `fmtDay` formats dates only.
+The package table shows the worst open severity and the fix-by date (or `overdue`) and filters
+`overdue` and `waived`. `showPackageNotices` turns `check_overdue` and a missing Defender/elevation
+into sticky toasts (`toast(..., sticky = true)`, once per page load via `state.shown`); the first
+leads to the Schedule tab. `fmtDay` formats dates only. The review card lists `pending` pins only
+(`GET /api/requirements`) with the latest rejection reason.
+`renderStatus` shows a badge per tool and one top banner listing every blocking problem (wheelhouse
+not set / unreachable, a missing tool), worst first. Settings has a sticky `savebar` (Save /
+Discard, enabled and highlighted only while `state.settingsDirty`); `showTab` asks before leaving
+unsaved settings. `renderStatus` builds a flat node list before `append` (DOM `append` prints a
+nested array as `[object HTMLSpanElement]`). A toast may carry an action (`toast(text, kind,
+{label, run})`): when a job ends with findings or fails, `jobNextStep` makes the toast lead to the
+problem - `showUpdateResult` (a rejected report written since the job started -> Add tab, rejected
+card highlighted; else vulnerable packages), `showPackagesFiltered('vulnerable'|'threat')` (falls
+back to the log when nothing matches), or the job log; for an `add` job only its publish step
+leads to rejected packages, a failed resolve leads to the log. `loadSchedule` renders the Schedule
+tab's card (mapped-drive warning with a one-click switch to the UNC path).
+**Layout:** `body` is a window-high flex column - `.topbar`, `.tabs` (both `flex: 0 0 auto`), the
+scrolling `#page` (`flex: 1`, `overflow: auto`, holds `main`) and `#jobbar` (in the flow, not fixed).
+The job panel therefore takes its own space and never covers the page; scroll `#page`, not the
+window (`scrollIntoView` does). When an `add` job succeeds on the Add tab, `loadRequirements(true)`
+highlights the review card (`next-step`) and scrolls to it. The textarea resizes vertically only.
 
 ---
 
@@ -983,7 +1027,7 @@ Conventions:
   or changed by the file server's antivirus is simulated by deleting or overwriting it; PyPI through
   `Get-PyPIReleaseInfo` or `Invoke-RestMethod`.
 - **UI API tests** call `Invoke-WheelhouseUiApi` directly with a temp manager root and mock
-  `Start-WheelhouseUiJob`. **UI job tests** start real child processes from throw-away scripts.
+  `Start-WheelhouseUiJob` and `Get-WheelhouseToolStatus` (and reset `$script:UiToolStatus`). **UI job tests** start real child processes from throw-away scripts.
 - Use `Get-TestFolder` / `Get-TestWheelhouse` (two tracked wheels in `requirements-1.txt`) for
   isolated folders under `$TestDrive`.
 
@@ -1064,6 +1108,7 @@ Which code runs for each user scenario (user steps are in the README):
 | Publish + alert | `Invoke-WheelhousePipeline.ps1` -> worker -> `Get-VulnerabilityAlertParameter` -> alert script |
 | Urgent fix | worker `-ExpeditePackage` -> intake `-Expedite` -> `Test-PackageAge -Expedite` + file cooldown skip |
 | Weekly check | `Test-Wheelhouse.ps1` -> 9.3 -> `Get-DeployedPackageNotice`, `Invoke-GroupAudit`, `Get-AuditResultSeverity`, `Get-CatalogFindingAlert` -> alert -> `Set-CatalogFindingNotified` |
+| Schedule the weekly check | Schedule tab -> `POST /api/schedule` -> `Register-WheelhouseScheduledCheck` -> `Register-ScheduledTask` |
 | Accept a risk | History dialog -> `POST /api/waivers/add` -> `Add-WheelhouseWaiver` + `Set-CatalogFindingWaiver`; waivers listed on the Denylist tab (`GET /api/waivers`) |
 | Malicious package advisory | check or update: `Get-CatalogMaliciousRecord` -> `Resolve-MaliciousPackage` -> `Remove-WheelhousePackage -Quarantine -LockHeld` |
 | Wheel copied in by hand | check or update: `Move-UntrackedWheelFile` -> `_untracked\<ts>\` |

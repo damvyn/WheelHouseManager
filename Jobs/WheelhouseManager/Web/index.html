@@ -18,10 +18,13 @@
   <button data-tab="add">Add packages</button>
   <button data-tab="quarantine">Quarantine</button>
   <button data-tab="denylist">Denylist</button>
+  <button data-tab="schedule">Schedule</button>
   <button data-tab="settings">Settings</button>
   <button data-tab="jobs">Jobs</button>
 </nav>
 
+<!-- The page scrolls here; the job panel below takes its own space and never covers it. -->
+<div id="page" class="page">
 <main>
   <div id="banner" class="banner hidden"></div>
 
@@ -29,9 +32,11 @@
   <section id="tab-add" class="tab hidden"></section>
   <section id="tab-quarantine" class="tab hidden"></section>
   <section id="tab-denylist" class="tab hidden"></section>
+  <section id="tab-schedule" class="tab hidden"></section>
   <section id="tab-settings" class="tab hidden"></section>
   <section id="tab-jobs" class="tab hidden"></section>
 </main>
+</div>
 
 <aside id="jobbar" class="jobbar hidden">
   <div class="jobbar-head">

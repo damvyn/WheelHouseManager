@@ -488,3 +488,83 @@ function Get-DeployedPackageNotice {
     }
     return @{ Notices = $notices.ToArray(); Errors = [string[]]$errors; Checked = $checked.ToArray() }
 }
+
+function Invoke-WheelhouseToolProbe {
+    # The version a tool reports, or $null if it is missing, fails or does not answer within
+    # 15 seconds (e.g. the Microsoft Store "python.exe" stub waiting for the Store). Mock seam
+    # for Get-WheelhouseToolStatus.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('python', 'pip-audit', 'uv')]
+        [string]$Name
+    )
+
+    $command = Get-Command $(if ($Name -eq 'uv') { 'uv' } else { 'python' }) -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { return $null }
+    $arguments = if ($Name -eq 'pip-audit') { '-m pip_audit --version' } else { '--version' }
+    $process = $null
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new($command.Source, $arguments)
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        # An inherited stdin that never closes (a background job, the UI's host) can keep a
+        # child waiting; give it an empty one.
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.CreateNoWindow = $true
+        $process = [System.Diagnostics.Process]::Start($startInfo)
+        $process.StandardInput.Close()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(15000)) {
+            try { $process.Kill() } catch { Write-Verbose "Could not stop $($command.Source): $($_.Exception.Message)" }
+            return $null
+        }
+        if ($process.ExitCode -ne 0) { return $null }
+        $text = (($stdout.Result + "`n" + $stderr.Result) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($text -match '(\d+(\.\d+)+)') { return $Matches[1] }
+        return [string]$text
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($process) { $process.Dispose() }
+    }
+}
+
+function Get-WheelhouseToolStatus {
+    # Whether the tools the scripts need are usable by the account running the UI:
+    # python (every audit, download and check), pip-audit (installed by the first run if
+    # missing) and uv (resolving requirements.in). One { name; available; version; level
+    # ok|warn|bad; message } per tool.
+    [CmdletBinding()]
+    param()
+
+    $python = Invoke-WheelhouseToolProbe -Name 'python'
+    $pipAudit = if ($python) { Invoke-WheelhouseToolProbe -Name 'pip-audit' } else { $null }
+    $uv = Invoke-WheelhouseToolProbe -Name 'uv'
+
+    [PSCustomObject]@{
+        name      = 'python'
+        available = [bool]$python
+        version   = [string]$python
+        level     = $(if ($python) { 'ok' } else { 'bad' })
+        message   = $(if ($python) { '' } else { 'Python was not found on the PATH of the account running the UI. Audits, publishing, scans of new downloads and the weekly check cannot run. Install Python on this server and restart the UI.' })
+    }
+    [PSCustomObject]@{
+        name      = 'pip-audit'
+        available = [bool]$pipAudit
+        version   = [string]$pipAudit
+        level     = $(if ($pipAudit) { 'ok' } elseif ($python) { 'warn' } else { 'bad' })
+        message   = $(if ($pipAudit) { '' } elseif ($python) { 'pip-audit is not installed for this Python. The first audit or update installs it (needs access to PyPI).' } else { 'pip-audit cannot run without Python.' })
+    }
+    [PSCustomObject]@{
+        name      = 'uv'
+        available = [bool]$uv
+        version   = [string]$uv
+        level     = $(if ($uv) { 'ok' } else { 'bad' })
+        message   = $(if ($uv) { '' } else { 'uv was not found on the PATH of the account running the UI. Adding packages (resolving requirements.in with Update-Requirement.ps1) does not work. Install uv on this server and restart the UI.' })
+    }
+}

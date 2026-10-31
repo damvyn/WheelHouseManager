@@ -170,7 +170,7 @@ Describe 'WheelhouseManager' {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
         Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded, WhmIntakeCandidates, WhmScanDetections, WhmUiJobSteps,
             WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI, WhmScannedPath,
-            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline -Scope Global -ErrorAction SilentlyContinue
+            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline, WhmTask, WhmTaskRegistered, WhmTaskError, WhmTaskCalls -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -502,6 +502,127 @@ Describe 'WheelhouseManager' {
             $result = Invoke-PipAudit -RequirementsFilePath (Join-Path $reports 'requirements-1.txt') -ReportsFolder $reports -Stage 'Scheduled' -Service 'osv'
             $result.Status | Should -Be $Expected
             $result.Group | Should -Be 'requirements-1'
+        }
+    }
+
+    Context 'Tool status' {
+        It 'reports python, pip-audit and uv with what is affected when one is missing' {
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-WheelhouseToolProbe -MockWith { if ($Name -eq 'python') { '3.14.7' } else { $null } }
+            $tools = @(Get-WheelhouseToolStatus)
+            ($tools | ForEach-Object { "$($_.name)=$($_.level)" }) -join ',' | Should -Be 'python=ok,pip-audit=warn,uv=bad'
+            $tools[0].version | Should -Be '3.14.7'
+            $tools[1].message | Should -Match 'installs it'
+            $tools[2].message | Should -Match 'Adding packages'
+
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-WheelhouseToolProbe -MockWith { $null }
+            $none = @(Get-WheelhouseToolStatus)
+            $none[0].level | Should -Be 'bad'
+            $none[1].level | Should -Be 'bad'
+        }
+
+        It 'answers $null for a tool that is not on PATH' {
+            $saved = $env:PATH
+            try {
+                $env:PATH = (Get-TestFolder)
+                Invoke-WheelhouseToolProbe -Name 'uv' | Should -BeNullOrEmpty
+            }
+            finally {
+                $env:PATH = $saved
+            }
+        }
+    }
+
+    Context 'Weekly check as a Scheduled Task' {
+        BeforeEach {
+            $global:WhmTask = $null
+            $global:WhmTaskRegistered = $null
+            $global:WhmTaskError = $null
+            $global:WhmTaskCalls = [System.Collections.Generic.List[string]]::new()
+            Mock -ModuleName WheelhouseManager -CommandName Get-ScheduledTask -MockWith { $global:WhmTask }
+            Mock -ModuleName WheelhouseManager -CommandName Get-ScheduledTaskInfo -MockWith {
+                [PSCustomObject]@{ LastRunTime = [datetime]'2026-10-25 02:00'; LastTaskResult = 1; NextRunTime = [datetime]'2026-11-01 02:00' }
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Register-ScheduledTask -MockWith {
+                if ($global:WhmTaskError) { throw $global:WhmTaskError }
+                $global:WhmTaskRegistered = @{ TaskName = $TaskName; User = $User; Password = $Password; Execute = $Action.Execute; Arguments = $Action.Arguments; RunLevel = [string]$RunLevel }
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Start-ScheduledTask -MockWith { $global:WhmTaskCalls.Add("start $TaskName") }
+            Mock -ModuleName WheelhouseManager -CommandName Unregister-ScheduledTask -MockWith { $global:WhmTaskCalls.Add("remove $TaskName") }
+            $script:repoRoot = Split-Path -Path $PSScriptRoot -Parent
+            $script:taskPassword = [System.Security.SecureString]::new()
+            foreach ($char in 'secret'.ToCharArray()) { $script:taskPassword.AppendChar($char) }
+        }
+
+        It 'registers Test-Wheelhouse.ps1 of this installation with the given account' {
+            $params = @{ DayOfWeek = @('Sunday', 'Wednesday'); At = '02:30'; User = 'CONTOSO\svc-wheelhouse'; Password = $script:taskPassword; ManagerRoot = $script:repoRoot; PowerShellPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' }
+            Mock -ModuleName WheelhouseManager -CommandName Get-ScheduledTask -MockWith { if ($global:WhmTaskRegistered) { $global:WhmTask } }
+            [void](Register-WheelhouseScheduledCheck @params)
+            $global:WhmTaskRegistered.TaskName | Should -Be 'Wheelhouse Weekly Check'
+            $global:WhmTaskRegistered.User | Should -Be 'CONTOSO\svc-wheelhouse'
+            $global:WhmTaskRegistered.Password | Should -Be 'secret'
+            $global:WhmTaskRegistered.RunLevel | Should -Be 'Limited'
+            $global:WhmTaskRegistered.Execute | Should -Match 'powershell\.exe$'
+            $global:WhmTaskRegistered.Arguments | Should -Match ([regex]::Escape((Join-Path $script:repoRoot 'Jobs\Test-Wheelhouse.ps1')))
+        }
+
+        It 'refuses invalid input and explains refused logons' {
+            $base = @{ DayOfWeek = @('Sunday'); At = '02:00'; User = 'CONTOSO\svc'; Password = $script:taskPassword; ManagerRoot = $script:repoRoot }
+            $bad = $base.Clone(); $bad.DayOfWeek = @('Funday')
+            { Register-WheelhouseScheduledCheck @bad } | Should -Throw '*day of the week*'
+            $bad = $base.Clone(); $bad.At = '25:00'
+            { Register-WheelhouseScheduledCheck @bad } | Should -Throw '*HH:mm*'
+            $bad = $base.Clone(); $bad.User = 'bad"user'
+            { Register-WheelhouseScheduledCheck @bad } | Should -Throw '*DOMAIN\user*'
+            $bad = $base.Clone(); $bad.Password = [System.Security.SecureString]::new()
+            { Register-WheelhouseScheduledCheck @bad } | Should -Throw '*password*'
+            $global:WhmTaskRegistered | Should -BeNullOrEmpty
+
+            $global:WhmTaskError = 'The user name or password is incorrect. (0x8007052E)'
+            $refused = $null
+            try { Register-WheelhouseScheduledCheck @base } catch { $refused = $_.Exception }
+            $refused | Should -BeOfType [System.ArgumentException]
+            $global:WhmTaskError = 'Access is denied. (0x80070005)'
+            try { Register-WheelhouseScheduledCheck @base } catch { $refused = $_.Exception }
+            $refused | Should -BeOfType [System.InvalidOperationException]
+            $refused.Message | Should -Match 'administrator'
+        }
+
+        It 'reads the task back: days, time, account, last result' {
+            Get-WheelhouseScheduledCheck -ManagerRoot $script:repoRoot | ForEach-Object { $_.Registered } | Should -Be $false
+            $script = Join-Path $script:repoRoot 'Jobs\Test-Wheelhouse.ps1'
+            $global:WhmTask = [PSCustomObject]@{
+                TaskName  = 'Wheelhouse Weekly Check'; TaskPath = '\'; State = 'Ready'
+                Principal = [PSCustomObject]@{ UserId = 'CONTOSO\svc' }
+                Triggers  = @([PSCustomObject]@{ DaysOfWeek = 9; StartBoundary = '2026-11-01T02:30:00' })
+                Actions   = @([PSCustomObject]@{ Execute = 'powershell.exe'; Arguments = "-NoProfile -File `"$script`"" })
+            }
+            $task = Get-WheelhouseScheduledCheck -ManagerRoot $script:repoRoot
+            $task.Registered | Should -Be $true
+            $task.Days -join ',' | Should -Be 'Sunday,Wednesday'
+            $task.Time | Should -Be '02:30'
+            $task.User | Should -Be 'CONTOSO\svc'
+            $task.LastResultText | Should -Match 'alert was sent'
+            $task.ForThisInstallation | Should -Be $true
+            (Get-WheelhouseScheduledCheck -ManagerRoot (Get-TestFolder)).ForThisInstallation | Should -Be $false
+
+            Start-WheelhouseScheduledCheck
+            Unregister-WheelhouseScheduledCheck | Should -Be $true
+            $global:WhmTaskCalls -join ';' | Should -Be 'start Wheelhouse Weekly Check;remove Wheelhouse Weekly Check'
+            $global:WhmTask = $null
+            Unregister-WheelhouseScheduledCheck | Should -Be $false
+            { Start-WheelhouseScheduledCheck } | Should -Throw '*not registered*'
+        }
+
+        It 'finds the UNC path behind a mapped network drive' {
+            Mock -ModuleName WheelhouseManager -CommandName Get-PSDrive -MockWith { [PSCustomObject]@{ Name = 'Z'; DisplayRoot = '\\srv\share' } }
+            $drive = Get-WheelhouseNetworkDrive -Path 'Z:\wheelhouse'
+            $drive.Drive | Should -Be 'Z:'
+            $drive.Unc | Should -Be '\\srv\share\wheelhouse'
+            (Get-WheelhouseNetworkDrive -Path 'Z:\').Unc | Should -Be '\\srv\share'
+            Get-WheelhouseNetworkDrive -Path '\\srv\share\wheelhouse' | Should -BeNullOrEmpty
+            Mock -ModuleName WheelhouseManager -CommandName Get-PSDrive -MockWith { [PSCustomObject]@{ Name = 'C'; DisplayRoot = $null } }
+            Mock -ModuleName WheelhouseManager -CommandName Get-CimInstance -MockWith { [PSCustomObject]@{ DriveType = 3; ProviderName = $null } }
+            Get-WheelhouseNetworkDrive -Path 'C:\wheelhouse' | Should -BeNullOrEmpty
         }
     }
 
@@ -2203,6 +2324,12 @@ Describe 'WheelhouseManager' {
 
         BeforeEach {
             $global:WhmUiJobSteps = $null
+            # The state route checks python / pip-audit / uv; no real processes in API tests.
+            & (Get-Module WheelhouseManager) { $script:UiToolStatus = $null }
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseToolStatus -MockWith {
+                [PSCustomObject]@{ name = 'python'; available = $true; version = '3.14.0'; level = 'ok'; message = '' }
+                [PSCustomObject]@{ name = 'uv'; available = $false; version = ''; level = 'bad'; message = 'uv was not found' }
+            }
             Mock -ModuleName WheelhouseManager -CommandName Start-WheelhouseUiJob -MockWith {
                 $global:WhmUiJobSteps = @($Steps | ForEach-Object { "$($_.Script) $($_.Arguments -join ' ')".Trim() })
                 [PSCustomObject]@{ Id = 1; Title = $Title; Kind = $Kind; Status = 'Running'; StepIndex = 0; Steps = @($Steps); Message = ''; ExitCode = $null; StartedUtc = ''; EndedUtc = $null }
@@ -2217,6 +2344,8 @@ Describe 'WheelhouseManager' {
             $state = Invoke-WheelhouseUiApi -Method GET -Path '/api/state' -ManagerRoot $m.Root
             $state.Body.configured | Should -Be $true
             $state.Body.reachable | Should -Be $true
+            @($state.Body.tools).Count | Should -Be 2
+            @($state.Body.tools | Where-Object { $_.name -eq 'uv' })[0].level | Should -Be 'bad'
         }
 
         It 'adds and removes waivers and shows findings with their deadline' {
@@ -2252,6 +2381,44 @@ Describe 'WheelhouseManager' {
             (Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9"}')).Status | Should -Be 200
             (Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9"}')).Status | Should -Be 404
             @((Invoke-WheelhouseUiApi -Method GET -Path '/api/packages/attrs/23.1.0/history' -ManagerRoot $m.Root).Body.record.findings)[0].status | Should -Be 'Open'
+        }
+
+        It 'lists only the resolved pins that are not in the wheelhouse yet, with the last rejection' {
+            $m = Get-TestManager
+            $resolved = Join-Path $m.Root 'requirements.txt'
+            Set-Content -Path $resolved -Value @('six==1.16.0', 'attrs==23.1.0', 'requests==2.32.3', 'numpy==2.3.1')
+            Set-WheelhouseSetting -SettingsPath (Join-Path $m.Root 'config\settings.psd1') -Updates @{ LocalRequirementsPath = $resolved }
+            New-Item -ItemType Directory -Path (Join-Path $m.Wheelhouse 'reports') -Force | Out-Null
+            Set-Content -Path (Join-Path $m.Wheelhouse 'reports\Report_Rejected_20261101_100000.json') -Value '[{"Group":"requirements-1","Package":"requests","Version":"2.32.3","Category":"vulnerability","Reason":"known vulnerability GHSA-9hjg"}]'
+            $body = (Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root).Body
+            $body.pin_count | Should -Be 4
+            $body.published_count | Should -Be 2
+            (@($body.pending) | ForEach-Object { "$($_.name)==$($_.version)" }) -join ',' | Should -Be 'numpy==2.3.1,requests==2.32.3'
+            @($body.pending | Where-Object { $_.name -eq 'requests' })[0].rejected | Should -Match 'GHSA-9hjg'
+            @($body.pending | Where-Object { $_.name -eq 'numpy' })[0].rejected | Should -BeNullOrEmpty
+        }
+
+        It 'shows, registers and removes the weekly check task' {
+            $m = Get-TestManager
+            $global:WhmTaskRegistered = $null
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseScheduledCheck -MockWith { [PSCustomObject]@{ Registered = $false; TaskName = 'Wheelhouse Weekly Check'; Script = 'x' } }
+            Mock -ModuleName WheelhouseManager -CommandName Register-WheelhouseScheduledCheck -MockWith {
+                $global:WhmTaskRegistered = @{ Days = @($DayOfWeek); At = $At; User = $User; Password = [System.Net.NetworkCredential]::new('', $Password).Password }
+                [PSCustomObject]@{ NextRunTime = '2026-11-01T01:00:00Z' }
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Unregister-WheelhouseScheduledCheck -MockWith { $false }
+            $status = Invoke-WheelhouseUiApi -Method GET -Path '/api/schedule' -ManagerRoot $m.Root
+            $status.Status | Should -Be 200
+            $status.Body.registered | Should -Be $false
+            $status.Body.current_user | Should -Not -BeNullOrEmpty
+            $status.Body.mapped_drive | Should -BeNullOrEmpty
+
+            $saved = Invoke-WheelhouseUiApi -Method POST -Path '/api/schedule' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"days":["Sunday"],"time":"03:00","user":"CONTOSO\\svc","password":"pw"}')
+            $saved.Status | Should -Be 200
+            $global:WhmTaskRegistered.Password | Should -Be 'pw'
+            $global:WhmTaskRegistered.Days -join ',' | Should -Be 'Sunday'
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/schedule/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')).Status | Should -Be 400
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/schedule/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"confirm":true}')).Status | Should -Be 404
         }
 
         It 'answers 409 when the wheelhouse is not configured' {
@@ -2459,7 +2626,7 @@ Describe 'WheelhouseManager' {
             $job = Start-WheelhouseUiJob -Title 'findings' -Kind 'test' -Context $script:uiContext -Steps @(@{ Script = 'findings.ps1'; Arguments = @() }, @{ Script = 'ok.ps1'; Arguments = @() })
             Wait-UiJob -Job $job
             $job.Status | Should -Be 'Attention'
-            $job.Message | Should -Match 'findings or rejected packages'
+            $job.Message | Should -Match 'findings.ps1 finished with findings'
             (ConvertTo-WheelhouseUiJobSummary -Job $job -IncludeLog).log | Should -Not -Match 'hello from ok'
         }
 

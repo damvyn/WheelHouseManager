@@ -37,13 +37,17 @@
   }
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; }
+html, body { margin: 0; height: 100%; }
+/* Header, tabs, the scrolling page and the job panel stack in one window-high column: the job
+   panel takes its own space at the bottom, so it never covers the page. */
 body {
   font: 14px/1.45 system-ui, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
-  padding-bottom: 60px;
+  display: flex; flex-direction: column; height: 100vh; overflow: hidden;
 }
+.topbar, .tabs { flex: 0 0 auto; }
+.page { flex: 1 1 auto; min-height: 0; overflow: auto; padding-bottom: 24px; }
 .hidden { display: none !important; }
 .spacer { flex: 1; }
 .muted { color: var(--muted); }
@@ -88,12 +92,12 @@ main { padding: 16px 20px; max-width: 1400px; margin: 0 auto; }
 .btn.ghost { background: transparent; }
 .btn.small { padding: 3px 9px; font-size: 12.5px; }
 
-input[type=text], input[type=number], select, textarea {
+input[type=text], input[type=number], input[type=password], input[type=time], select, textarea {
   font: inherit; padding: 6px 9px; border-radius: 6px; border: 1px solid var(--line);
   background: var(--panel); color: var(--text);
 }
-textarea { width: 100%; min-height: 110px; font-family: Consolas, "Cascadia Mono", monospace; }
-input[type=text].wide { width: 100%; }
+textarea { display: block; width: 100%; max-width: 100%; min-height: 110px; resize: vertical; font-family: Consolas, "Cascadia Mono", monospace; }
+input[type=text].wide, input[type=password].wide { width: 100%; }
 
 .table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
 table { width: 100%; border-collapse: collapse; }
@@ -120,8 +124,8 @@ td.num { text-align: right; white-space: nowrap; }
 .checks label { display: inline-flex; gap: 5px; align-items: center; margin-right: 14px; font-weight: 400; padding: 0; }
 
 .jobbar {
-  position: fixed; left: 0; right: 0; bottom: 0; background: var(--panel); border-top: 2px solid var(--accent);
-  box-shadow: 0 -4px 16px rgba(0,0,0,.12); z-index: 5;
+  flex: 0 0 auto; background: var(--panel); border-top: 2px solid var(--accent);
+  box-shadow: 0 -4px 16px rgba(0,0,0,.12);
 }
 .jobbar-head { display: flex; gap: 10px; align-items: center; padding: 8px 20px; }
 .log {
@@ -140,5 +144,24 @@ dialog ul { max-height: 160px; overflow: auto; padding-left: 18px; margin: 8px 0
 .toast { padding: 10px 14px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 4px 14px rgba(0,0,0,.18); max-width: 420px; }
 .toast.ok { border-left: 4px solid var(--ok); }
 .toast.bad { border-left: 4px solid var(--bad); }
+.toast.warn { border-left: 4px solid var(--warn); }
+details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .result-list { margin: 8px 0 0; padding-left: 18px; }
 .result-list .bad { color: var(--bad); }
+/* Settings: the save bar stays visible while the form scrolls. */
+.savebar {
+  position: sticky; top: 0; z-index: 5; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  padding: 10px 16px; margin-bottom: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+}
+.savebar.dirty { background: var(--warn-bg); border-color: var(--warn); }
+.savebar.dirty .muted { color: var(--warn); font-weight: 600; }
+/* Add tab: space between the resolved pins and the publish button; the step to do next. */
+.log.review { border-radius: 8px; }
+.toolbar.after-output { margin-top: 14px; }
+.card.next-step { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.next-hint { font-weight: 600; color: var(--accent); }
+/* A toast that leads somewhere: click to close it and go there. */
+.toast.actionable { cursor: pointer; }
+.toast.actionable:hover, .toast.actionable:focus { outline: 2px solid var(--accent); }
+.toast-action { margin-top: 6px; font-weight: 600; color: var(--accent); }
+.kv { display: grid; gap: 4px; margin: 8px 0 12px; }

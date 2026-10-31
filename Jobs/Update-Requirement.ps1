@@ -100,6 +100,10 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     Write-Log "Python was not found on this machine - it is needed to verify the resolved packages." "ERROR"
     exit 2
 }
+if (-not (Get-Command uv -CommandType Application -ErrorAction SilentlyContinue)) {
+    Write-Log "uv was not found on the PATH of this account - it resolves requirements.in. Install uv (https://docs.astral.sh/uv/) on this server; requirements.txt was not changed." "ERROR"
+    exit 2
+}
 
 try {
     $uvPlatform = ConvertTo-UvPythonPlatform -Platform $cfg.Platform

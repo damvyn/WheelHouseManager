@@ -44,6 +44,7 @@ CI (`.github/workflows/powershell-tests.yml`) runs on `windows-latest` under **b
 - `Denylist`: `config\denylist.json` (blocked name/version, `*` = every version);
 - `Package`: inventory with audit/scan status, remove/quarantine/restore, `Add-RequirementInLine`;
 - `Scan`: Defender scan (`Invoke-WheelhouseDefenderScan`);
+- `Schedule`: the weekly check as a Scheduled Task (`Register-WheelhouseScheduledCheck` with an account and password - never stored or logged; `Get-WheelhouseNetworkDrive` for the mapped-drive warning);
 - `Ui`: the HTTP API (route table `Get-WheelhouseUiRoute`, dispatcher `Invoke-WheelhouseUiApi`), background jobs and the `HttpListener` loop.
 
 Static UI files live in `Jobs/WheelhouseManager/Web/` (plain HTML/JS/CSS, no build step) and deploy with the module folder.

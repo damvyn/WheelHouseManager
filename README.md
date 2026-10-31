@@ -213,8 +213,19 @@ there (including the latest audit and scan results); nothing needs to be done by
 
 ### 3.3 Schedule the weekly check - `Test-Wheelhouse.ps1`
 
-This is the job that notices when a published package fails a check later. It only reads and
-alerts - it never downloads or changes anything - so it is safe to run unattended.
+This is the job that notices when a published package fails a check later. It never downloads
+anything, so it is safe to run unattended.
+
+**From the UI (easiest):** **Schedule** tab -> *Weekly check (Scheduled Task)*: choose the days and
+time, enter the account (`DOMAIN\user`) and its password, and click **Register the task**. The card
+then shows the task's state, last run with its result, next run and when a check last completed;
+**Run now** starts it at once, **Remove the task** deletes it. The password goes to Windows Task
+Scheduler only - the manager does not store or log it. Registering a task for another account
+than your own needs the UI started as administrator. If the wheelhouse folder is set to a mapped
+drive (`Z:\`), the card warns you and offers to switch to the UNC path: a Scheduled Task does not
+see the drive mappings of your session.
+
+**Or with PowerShell:**
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
@@ -555,16 +566,20 @@ C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -Port 9000 -NoBrowser
 The UI runs on the manager server only (`http://localhost:8765/`). Keep the PowerShell window open
 while you use it; stop it with Ctrl+C or the **Stop UI** button. Start it from an **elevated**
 PowerShell to use Defender scans. The top bar shows the wheelhouse path, the target Python, and
-whether Defender is available and the session is elevated.
+whether Defender is available and the session is elevated, and whether Python, pip-audit and uv
+can be found. A banner at the top names anything that stops something from working - for example
+*The wheelhouse folder is not set*, or *uv was not found ... Adding packages does not work* - and
+what to do about it.
 
 | Tab | What you can do |
 |---|---|
 | **Packages** | See every published wheel with its groups, latest audit (for a vulnerable one: worst severity and fix-by date, or *overdue*) and Defender result, a *yanked* badge if PyPI withdrew it, and the denylist flag; filter by name or status (vulnerable, fix overdue, risk accepted, threat, never audited/scanned, yanked, denylisted, file missing). Select rows to **Audit**, **Scan**, **Quarantine** or **Delete**; **History** shows one version's state, checks, vulnerabilities (with **Accept risk** / **Remove waiver**) and history. A banner warns when the weekly check has not run for `AuditFreshnessDays`. |
-| **Add packages** | **1. Add**: enter packages; they are added to `requirements.in` and resolved - nothing is downloaded. **2. Review and publish**: read the resolved `requirements.txt`, then **Publish** (runs every check, then publishes). *Also publish right away* does both at once. The card at the bottom lists the latest rejected packages with their reasons. |
+| **Add packages** | **1. Add**: enter packages; they are added to `requirements.in` and resolved - nothing is downloaded. **2. Review and publish**: lists only the resolved pins that are **not yet in the wheelhouse** (pins already published are only counted; the whole `requirements.txt` is behind *Show the whole requirements.txt*), each marked *new* or *rejected last time* with the reason, then **Publish** (runs every check, then publishes). *Also publish right away* does both at once. When resolving succeeds, the page scrolls to step 2 and highlights it. A running job's log is shown in a panel at the bottom of the window (**Hide log** / **Show log**); it takes its own space, so it never covers the page. The card at the bottom lists the latest rejected packages with their reasons. |
 | **Quarantine** | Quarantined packages; **Restore** one. |
 | **Denylist** | Add or remove blocked versions; shows whether a blocked version is still published. Below it, **Accepted risks** lists every waiver with its reason and expiry, and lets you remove one. |
-| **Settings** | Edit `settings.psd1` with validation. |
-| **Jobs** | Long actions run as background jobs, one at a time, with a live log and **Cancel**. A job ends as *Succeeded*, *Needs attention* (findings or rejected packages - read the log) or *Failed*. |
+| **Schedule** | Register, update, run or remove the weekly check's Scheduled Task (see 3.3). |
+| **Settings** | Edit `settings.psd1` with validation. The **Save settings** bar stays at the top of the page; it turns yellow and lists the changed settings until you save or discard them, and leaving the tab with unsaved changes asks first. |
+| **Jobs** | Long actions run as background jobs, one at a time, with a live log and **Cancel**. A job ends as *Succeeded*, *Needs attention* (findings or rejected packages) or *Failed*. The message shown when a job ends is clickable: it takes you to what needs attention - the rejected packages, the vulnerable packages or Defender threats in the table, or the log. Important notices (the weekly check is not running, Defender scans unavailable) appear the same way, once per page load, and stay until you click them; the first one takes you to the **Schedule** tab. |
 
 The UI does the same as the scripts - it runs them in the background - so the reports and logs
 are the same.
@@ -657,6 +672,10 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
 | A package is "still listed without a wheel" | A group file lists a pin that could not be published. Fix the cause shown, or remove the line from the group file. |
 | UI: `Open the address printed by Start-WheelhouseUI.ps1 (it contains the session token)` | Use the full URL from the console; it changes at every start. |
 | UI: `Cannot listen on port 8765` | The UI is already running, or the port is used - use `-Port`. |
+| UI: *Task Scheduler refused the account or password* | Wrong password, or the account may not log on as a batch job (a domain policy). Check both, or ask for the *Log on as a batch job* right. |
+| UI: *Windows denied the change ... needs an elevated PowerShell* | You registered the task for another account, or someone else created it. Start `Start-WheelhouseUI.ps1` as administrator. |
+| Weekly check *Last run*: *the account could not log on (password changed?)* | The account's password changed. Enter the new one and click **Update the task**. |
+| UI banner: *Python was not found* / *uv was not found* | The account running `Start-WheelhouseUI.ps1` cannot find the tool on its `PATH`. Install it (or add it to `PATH`) and restart the UI. A missing pip-audit is only a warning: the first audit or update installs it. |
 | UI: job *Needs attention* | Normal outcome with findings or rejections - open the log. |
 | No alert email arrives | Check `SmtpServer`; without it, alerts are saved as HTML in `reports\`. `Send-MailMessage` does not support authentication - use an internal relay. The weekly check alerts only when something changed: a finding that was already alerted and is not yet due is not alerted again (exit code 1 still shows it is open). |
 | `OSV lookup failed: ... severities not in the cache count as High in this run` | The manager server cannot reach `api.osv.dev`. Nothing else is affected; severities are looked up again next run. |
