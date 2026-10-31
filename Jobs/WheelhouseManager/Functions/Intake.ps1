@@ -3,27 +3,28 @@
 # ---------------------------------------------------------------------------
 
 function Invoke-CandidateIntake {
-    # Takes the packages that are about to enter one group file through every check and
-    # decides per package:
-    #   Accepted - passed everything; its wheel is now in the wheelhouse (see Published).
-    #   Rejected - failed a step (with the reason and a category); nothing about it
-    #              reached the wheelhouse.
-    # A package that fails never holds back the others. The caller writes only the
-    # accepted packages into the group file and Published into the manifest, so a group
-    # file never lists a package whose wheel was not published.
+    # First half of intake: takes the packages that are about to enter one group file
+    # through every check, without the write lock and without touching the wheelhouse,
+    # and decides per package:
+    #   Verified - passed everything; its downloaded files wait in the staging folder.
+    #   Rejected - failed a step (with the reason and a category).
+    # A package that fails never holds back the others. Publish-CandidateIntake then
+    # publishes the verified ones (and deletes the staging folder), so a group file
+    # never lists a package whose wheel was not published.
     #
     # Order: denylist -> vulnerability audit -> PyPI release data (yanked, cooldown) ->
     # download into a staging folder outside the wheelhouse -> every downloaded file
     # checked against PyPI (sha256, yanked, its own upload date) -> Defender scan of the
-    # staged files -> publish (copied in under a temporary name, then renamed). Clients
-    # never see a file that has not passed every check.
+    # staged files. Clients never see a file that has not passed every check.
     #
     # Candidates are the new pins from the local requirements file for this group,
     # plus pins the group already lists that still have no wheel in the wheelhouse.
-    # Returns @{ Accepted = @{name=version}; Rejected = [PSCustomObject]@{Name;Version;Reason;Category}, ...;
-    #            AuditResults = Wheelhouse.AuditResult, ...; Published = manifest entries, ... }.
+    # Returns @{ Packages = the candidates; Rejected = [PSCustomObject]@{Name;Version;Reason;Category}, ...;
+    #            AuditResults = Wheelhouse.AuditResult, ...; Verified = @{name = staged FileInfo[]};
+    #            StagingPath = the staging folder, or $null when nothing was verified;
+    #            Scan = the Defender scan of the staged files, or $null }.
     # Categories: denylist, vulnerability, audit-error, pypi-metadata, yanked, cooldown,
-    # no-wheel, download, integrity, defender, publish.
+    # no-wheel, download, integrity, defender (publish adds denylist and publish).
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -32,9 +33,6 @@ function Invoke-CandidateIntake {
 
         [Parameter(Mandatory)]
         [string]$GroupName,
-
-        [Parameter(Mandatory)]
-        [string]$WheelhousePath,
 
         [Parameter(Mandatory)]
         [string]$ReportsFolder,
@@ -71,8 +69,6 @@ function Invoke-CandidateIntake {
     $remaining = @{} + $Packages
     $rejected = [System.Collections.Generic.List[object]]::new()
     $auditResults = [System.Collections.Generic.List[object]]::new()
-    $published = [System.Collections.Generic.List[object]]::new()
-    $accepted = @{}
     $nowUtc = (Get-Date).ToUniversalTime()
 
     $reject = {
@@ -163,11 +159,12 @@ function Invoke-CandidateIntake {
     }
 
     if ($remaining.Count -eq 0) {
-        return @{ Accepted = $accepted; Rejected = $rejected.ToArray(); AuditResults = $auditResults.ToArray(); Published = $published.ToArray() }
+        return @{ Packages = @{} + $Packages; Rejected = $rejected.ToArray(); AuditResults = $auditResults.ToArray(); Verified = @{}; StagingPath = $null; Scan = $null }
     }
 
     # --- 3. Download into the staging folder ---------------------------------------
     $staging = Join-Path $StagingRoot ([guid]::NewGuid().ToString('N'))
+    $scan = $null
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
     try {
         Write-Log "Downloading $($remaining.Count) candidate(s) of $GroupName into a staging folder - nothing is published before every check passed..."
@@ -290,36 +287,180 @@ function Invoke-CandidateIntake {
             }
         }
 
-        # --- 6. Publish ---------------------------------------------------------------
-        foreach ($name in @($filesByName.Keys | Sort-Object)) {
-            $done = [System.Collections.Generic.List[object]]::new()
-            try {
-                foreach ($file in $filesByName[$name]) {
-                    $done.Add((Publish-StagedWheel -Path $file.FullName -WheelhousePath $WheelhousePath))
+    }
+    catch {
+        Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+
+    if ($filesByName.Count -eq 0) {
+        Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+        $staging = $null
+    }
+    return @{
+        Packages     = @{} + $Packages
+        Rejected     = $rejected.ToArray()
+        AuditResults = $auditResults.ToArray()
+        Verified     = $filesByName
+        StagingPath  = $staging
+        # The Defender scan of the staged files ($null if nothing was scanned).
+        Scan         = $scan
+    }
+}
+
+function Publish-CandidateIntake {
+    # Second half of intake: publishes what Invoke-CandidateIntake verified, under the
+    # write lock (taken here unless -LockHeld; waits up to -TimeoutSeconds):
+    #   1. the denylist is read again - a version blocked while the checks ran is rejected;
+    #   2. a journal records what is about to be published;
+    #   3. each package's staged files are copied in (Publish-StagedWheel);
+    #   4. Complete-WheelhousePublishJournal adds them to the manifest and lists the pins
+    #      of -Additions in -GroupFile - the same step that finishes an interrupted publish;
+    #   5. the catalog marks them Published and the history records it.
+    # Always deletes the staging folder. Returns @{ Accepted = @{name=version};
+    # Rejected = [...] (categories denylist, publish); Published = manifest entries;
+    # Manifest = the manifest afterwards ($null if nothing was verified) }.
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Intake,
+
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [Parameter(Mandatory)]
+        [string]$GroupFile,
+
+        # name -> version of the new pins to list in -GroupFile once published. Other
+        # verified packages are pins the group already lists (their wheel was missing).
+        [hashtable]$Additions = @{},
+
+        [string]$DenylistPath = (Get-WheelhouseDenylistPath),
+
+        # name -> text added to the "Published" history entry (e.g. why the cooldown was skipped).
+        [hashtable]$EventDetail = @{},
+
+        [switch]$LockHeld,
+
+        [ValidateRange(0, 3600)]
+        [int]$TimeoutSeconds = 300
+    )
+
+    $accepted = @{}
+    $rejected = [System.Collections.Generic.List[object]]::new()
+    $published = [System.Collections.Generic.List[object]]::new()
+    $manifestAfter = $null
+    $verified = $Intake.Verified
+    $versions = $Intake.Packages
+    $groupName = Split-Path -Path $GroupFile -Leaf
+
+    try {
+        if (-not $verified -or $verified.Count -eq 0 -or -not $PSCmdlet.ShouldProcess($GroupFile, 'Publish verified candidates')) {
+            return @{ Accepted = $accepted; Rejected = $rejected.ToArray(); Published = $published.ToArray(); Manifest = $null }
+        }
+
+        $lock = if ($LockHeld) { $null } else { Open-WheelhouseWrite -WheelhousePath $WheelhousePath -TimeoutSeconds $TimeoutSeconds -DenylistPath $DenylistPath }
+        try {
+            # 1. Blocked while the checks ran?
+            $denylist = @(Read-WheelhouseDenylist -Path $DenylistPath)
+            $plans = [ordered]@{}
+            foreach ($name in @($verified.Keys | Sort-Object)) {
+                $blocked = Get-DenylistMatch -Name $name -Version $versions[$name] -Denylist $denylist
+                if ($blocked) {
+                    $why = if ($blocked.reason) { ": $($blocked.reason)" } else { '' }
+                    $rejected.Add([PSCustomObject]@{ Name = $name; Version = $versions[$name]; Category = 'denylist'; Reason = "denylisted while the checks ran ($($blocked.version), $($blocked.source))$why" })
+                    continue
                 }
+                $plans[$name] = @(foreach ($file in $verified[$name]) {
+                        $info = Get-WheelFileInfo -FileName $file.Name
+                        [PSCustomObject]@{
+                            name           = $(if ($info) { $info.Name } else { $name })
+                            version        = $(if ($info) { $info.Version } else { $versions[$name] })
+                            file           = $file.Name
+                            sha256         = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+                            python_tag     = $(if ($info) { $info.PythonTag } else { '' })
+                            abi_tag        = $(if ($info) { $info.AbiTag } else { '' })
+                            platform_tag   = $(if ($info) { $info.PlatformTag } else { '' })
+                            downloaded_utc = (Get-Date).ToUniversalTime().ToString('o')
+                        }
+                    })
             }
-            catch {
-                $failure = $_.Exception.Message
-                foreach ($item in $done) {
-                    if ($item.Created) { Remove-Item -LiteralPath (Join-Path $WheelhousePath $item.Entry.file) -Force -ErrorAction SilentlyContinue }
+
+            if ($plans.Count -gt 0) {
+                # 2. Journal - a crash from here on is finished by the next writer.
+                $plannedAdditions = @(foreach ($name in $plans.Keys) { if ($Additions.ContainsKey($name)) { [ordered]@{ name = $name; version = $versions[$name] } } })
+                $journal = New-WheelhouseJournal -WheelhousePath $WheelhousePath -Operation 'publish' -Data ([ordered]@{
+                        group_file = $GroupFile
+                        entries    = @(foreach ($name in $plans.Keys) { $plans[$name] })
+                        additions  = $plannedAdditions
+                    })
+
+                # 3. Copy the files in.
+                foreach ($name in @($plans.Keys)) {
+                    $done = [System.Collections.Generic.List[object]]::new()
+                    try {
+                        foreach ($file in $verified[$name]) {
+                            $done.Add((Publish-StagedWheel -Path $file.FullName -WheelhousePath $WheelhousePath))
+                        }
+                    }
+                    catch {
+                        $failure = $_.Exception.Message
+                        foreach ($item in $done) {
+                            if ($item.Created) { Remove-Item -LiteralPath (Join-Path $WheelhousePath $item.Entry.file) -Force -ErrorAction SilentlyContinue }
+                        }
+                        $rejected.Add([PSCustomObject]@{ Name = $name; Version = $versions[$name]; Category = 'publish'; Reason = "could not be copied into the wheelhouse: $failure" })
+                        continue
+                    }
+                    $accepted[$name] = $versions[$name]
+                    foreach ($item in $done) { $published.Add($item.Entry) }
                 }
-                & $reject $name 'publish' "could not be copied into the wheelhouse: $failure"
-                continue
+
+                # 4. Manifest and group file.
+                $completeData = @{
+                    group_file = $GroupFile
+                    entries    = $published.ToArray()
+                    additions  = @($plannedAdditions | Where-Object { $accepted.ContainsKey($_.name) })
+                }
+                Complete-WheelhousePublishJournal -WheelhousePath $WheelhousePath -Data $completeData
+
+                # 5. Catalog and history.
+                $changes = @(foreach ($name in @($accepted.Keys | Sort-Object)) {
+                        $files = @($published | Where-Object { $_.name -eq $name } | ForEach-Object { $_.file })
+                        $where = if ($Additions.ContainsKey($name)) { "added to $groupName" } else { "wheel for the pin already listed in $groupName" }
+                        $extra = if ($EventDetail.ContainsKey($name)) { "; $($EventDetail[$name])" } else { '' }
+                        [PSCustomObject]@{
+                            Name    = $name
+                            Version = $accepted[$name]
+                            State   = 'Published'
+                            Action  = 'Published'
+                            Detail  = "$where; $($files -join ', ') verified against PyPI's sha256$extra"
+                        }
+                    })
+                # A completed intake scan found nothing in what is now published: record it as
+                # the version's scan result (a scan that could not run records nothing).
+                $intakeScan = $null
+                if ($Intake.Scan -and $Intake.Scan.Status -in 'Clean', 'Threat' -and $published.Count -gt 0) {
+                    $intakeScan = [PSCustomObject]@{
+                        Status       = 'Clean'
+                        ScannedPaths = @($published | ForEach-Object { Join-Path $WheelhousePath $_.file })
+                        Threats      = @()
+                    }
+                }
+                Set-WheelhouseCatalogState -WheelhousePath $WheelhousePath -Change $changes -ScanResult $intakeScan
+                Remove-WheelhouseJournal -Path $journal
             }
-            $accepted[$name] = $remaining[$name]
-            foreach ($item in $done) { $published.Add($item.Entry) }
+            $manifestAfter = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+        }
+        finally {
+            Exit-WheelhouseLock -Lock $lock
         }
     }
     finally {
-        Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+        if ($Intake.StagingPath) { Remove-Item -Path $Intake.StagingPath -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
-    return @{
-        Accepted     = $accepted
-        Rejected     = $rejected.ToArray()
-        AuditResults = $auditResults.ToArray()
-        Published    = $published.ToArray()
-    }
+    return @{ Accepted = $accepted; Rejected = $rejected.ToArray(); Published = $published.ToArray(); Manifest = $manifestAfter }
 }
 
 function Publish-StagedWheel {

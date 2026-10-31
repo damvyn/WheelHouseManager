@@ -419,7 +419,9 @@ function Get-DeployedPackageNotice {
     # Re-checks what is already published against conditions that can change after
     # intake: the denylist (an entry added later) and PyPI's yanked flag (the release or
     # one of the deployed files). Returns @{ Notices = Wheelhouse.Notice, ...; Errors =
-    # string, ... }. A release whose PyPI data cannot be read is an error, never "not yanked".
+    # string, ...; Checked = { Package; Version; Yanked; Reason }, ... (every version whose
+    # PyPI data was read) }. A release whose PyPI data cannot be read is an error, never
+    # "not yanked".
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -435,6 +437,7 @@ function Get-DeployedPackageNotice {
 
     $notices = [System.Collections.Generic.List[object]]::new()
     $unreadable = [System.Collections.Generic.List[string]]::new()
+    $checked = [System.Collections.Generic.List[object]]::new()
 
     $pins = [ordered]@{}
     foreach ($entry in ($Manifest | Sort-Object name, version)) {
@@ -465,11 +468,14 @@ function Get-DeployedPackageNotice {
             continue
         }
         $yankedFiles = @($release.Files | Where-Object { $_.Yanked -and $files -contains $_.FileName })
-        if ($release.Yanked -or $yankedFiles.Count -gt 0) {
-            $reason = @($release.YankedReason) + @($yankedFiles | ForEach-Object { $_.YankedReason }) | Where-Object { $_ } | Select-Object -First 1
+        $isYanked = $release.Yanked -or $yankedFiles.Count -gt 0
+        $reason = ''
+        if ($isYanked) {
+            $reason = [string](@($release.YankedReason) + @($yankedFiles | ForEach-Object { $_.YankedReason }) | Where-Object { $_ } | Select-Object -First 1)
             $text = if ($reason) { "Yanked on PyPI: $reason" } else { 'Yanked on PyPI (no reason given).' }
             $notices.Add((New-WheelhouseNotice -Kind 'Yanked' -Package $name -Version $version -File $files -Message $text))
         }
+        $checked.Add([PSCustomObject]@{ Package = $name; Version = $version; Yanked = $isYanked; Reason = $reason })
     }
 
     foreach ($notice in $notices) {
@@ -480,5 +486,5 @@ function Get-DeployedPackageNotice {
         $errors = @("PyPI yanked check could not be completed for $($unreadable.Count) package(s): $($unreadable -join '; ')")
         Write-Log $errors[0] 'ERROR'
     }
-    return @{ Notices = $notices.ToArray(); Errors = [string[]]$errors }
+    return @{ Notices = $notices.ToArray(); Errors = [string[]]$errors; Checked = $checked.ToArray() }
 }

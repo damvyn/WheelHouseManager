@@ -26,7 +26,7 @@ function Get-WheelhouseDefaultSetting {
         MailTo                = 'servicedesk@company.com'
         MailFrom              = 'NoReply@company.com'
         RequireDefenderScanAtIntake  = $false
-        DefenderScanInScheduledCheck = $false
+        AutoQuarantine               = $true
     }
 }
 
@@ -247,7 +247,7 @@ function Get-WheelhouseSettingSchema {
         @{ Key = 'MailTo'; Type = 'string'; Label = 'Alert recipient'; Help = 'Where vulnerability alerts go.' }
         @{ Key = 'MailFrom'; Type = 'string'; Label = 'Alert sender'; Help = 'From address of alert mails.' }
         @{ Key = 'RequireDefenderScanAtIntake'; Type = 'bool'; Label = 'Require a Defender scan at intake'; Help = 'On: a new package is rejected when its download cannot be scanned (for example, the run is not elevated). Off: it is published with a warning.' }
-        @{ Key = 'DefenderScanInScheduledCheck'; Type = 'bool'; Label = 'Defender scan in the scheduled check'; Help = 'Test-Wheelhouse.ps1 re-scans the whole wheelhouse with the current signatures. The Scheduled Task must then run elevated.' }
+        @{ Key = 'AutoQuarantine'; Type = 'bool'; Label = 'Take out changed or removed wheels automatically'; Help = 'On: a published wheel that disappeared from the share (e.g. removed by the file server''s antivirus) is taken out of the group files and denylisted; one whose content changed is quarantined. Off: it is only reported, and updates stop until someone acts. An alert is sent either way. Override per run with -AutoQuarantine On|Off.' }
     )
     foreach ($item in $schema) { [PSCustomObject]$item }
 }

@@ -23,9 +23,6 @@ $script:UiStaticFiles = @{
     '/app.js'    = 'app.js'
     '/style.css' = 'style.css'
 }
-$script:UiPackageNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]*$'
-$script:UiPackageVersionPattern = '^[A-Za-z0-9][A-Za-z0-9._+!-]*$'
-$script:UiWheelFilePattern = '^[A-Za-z0-9][A-Za-z0-9._+!-]*\.whl$'
 
 # --- Context -----------------------------------------------------------------
 
@@ -41,7 +38,7 @@ function Get-WheelhouseUiContext {
     $settings = Get-WheelhouseSetting -SettingsPath $settingsPath
     $names = @('WheelhousePath', 'RequirementsInPath', 'LocalRequirementsPath', 'PythonVersion', 'Platform',
         'MinimumPackageAgeDays', 'VulnerabilityServices', 'ReportRetentionMonths', 'SmtpServer', 'MailTo', 'MailFrom',
-        'RequireDefenderScanAtIntake', 'DefenderScanInScheduledCheck')
+        'RequireDefenderScanAtIntake', 'AutoQuarantine')
     $effective = Resolve-WheelhouseParameter -BoundParameters @{} -Name $names -Settings $settings
 
     $wheelhousePath = [string]$effective.WheelhousePath
@@ -108,7 +105,7 @@ function Resolve-UiPackageSelection {
     foreach ($item in $items) {
         $name = [string](Get-UiBodyValue -Body $item -Name 'name')
         $version = [string](Get-UiBodyValue -Body $item -Name 'version')
-        if ($name -notmatch $script:UiPackageNamePattern -or $version -notmatch $script:UiPackageVersionPattern) {
+        if (-not (Test-WheelhousePackageName $name) -or -not (Test-WheelhousePackageVersion $version)) {
             throw [System.ArgumentException]::new('Invalid package name or version in the selection.')
         }
         $normalized = Get-NormalizedPackageName $name
@@ -430,10 +427,412 @@ function Test-WheelhouseUiRequest {
 }
 
 # --- API ---------------------------------------------------------------------
+# One entry per endpoint:
+#   Method, Pattern - matched against the request (named groups reach the handler as $Match)
+#   Wheelhouse      - needs a configured, reachable wheelhouse (Assert-WheelhouseUiConfigured)
+#   Idle            - refused (409, with this message) while a background job runs
+#   Handler         - { param($Context, $Body, $Match) ... } returning @{ Status; Body }
+# Handlers throw ArgumentException (400), KeyNotFoundException (404) or
+# InvalidOperationException (409); Invoke-WheelhouseUiApi maps them.
+
+function Get-WheelhouseUiRoute {
+    # The route table (see above). Every handler takes the same three parameters, used or not.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Uniform route handler signature.')]
+    [CmdletBinding()]
+    param()
+
+    return @(
+        @{
+            Method  = 'GET'
+            Pattern = '^/api/state$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $running = Get-WheelhouseUiRunningJob
+                $isAdmin = ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+                return @{ Status = 200; Body = @{
+                        wheelhouse_path = $Context.WheelhousePath
+                        configured      = [bool]$Context.WheelhousePath
+                        reachable       = [bool]($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container))
+                        defender        = (Test-WheelhouseDefenderAvailable)
+                        is_admin        = $isAdmin
+                        python_version  = [string]$Context.Settings.PythonVersion
+                        platform        = [string]$Context.Settings.Platform
+                        running_job     = $(if ($running) { ConvertTo-WheelhouseUiJobSummary -Job $running } else { $null })
+                    }
+                }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/packages$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $inventoryParams = @{
+                    WheelhousePath = $Context.WheelhousePath
+                    Denylist       = @(Read-WheelhouseDenylist -Path $Context.DenylistPath)
+                    Services       = [string[]]@($Context.Settings.VulnerabilityServices)
+                }
+                $inventory = Get-WheelhousePackage @inventoryParams
+                return @{ Status = 200; Body = @{ packages = @($inventory.Packages); groups = @($inventory.Groups); untracked = @($inventory.Untracked) } }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/packages/(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)/(?<version>[A-Za-z0-9][A-Za-z0-9._+!-]*)/history$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $name = Get-NormalizedPackageName $Match['name']
+                $version = $Match['version']
+                $catalog = Read-WheelhouseCatalog -WheelhousePath $Context.WheelhousePath
+                $record = $catalog.Records["$name==$version"]
+                $events = @(Read-WheelhouseEvent -WheelhousePath $Context.WheelhousePath -Package $name -Version $version -Last 500)
+                if (-not $record -and $events.Count -eq 0) {
+                    throw [System.Collections.Generic.KeyNotFoundException]::new("Nothing is known about $name==$version.")
+                }
+                $state = $null
+                if ($record) {
+                    $state = @{
+                        state         = $record.state
+                        state_since   = $record.state_since
+                        state_reason  = $record.state_reason
+                        groups        = @($record.groups)
+                        files         = @($record.files)
+                        published_utc = $record.published_utc
+                        checks        = $record.checks
+                    }
+                }
+                return @{ Status = 200; Body = @{ name = $name; version = $version; record = $state; events = $events } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/packages/audit$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                if (Get-UiBodyValue -Body $Body -Name 'all') {
+                    $job = Start-WheelhouseUiJob -Title 'Audit: whole index' -Kind 'audit' -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @() })
+                }
+                else {
+                    $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+                    $selection = Resolve-UiPackageSelection -Body $Body -Manifest $manifest
+                    $list = ($selection | ForEach-Object { "$($_.Name)==$($_.Version)" }) -join ','
+                    if ($list.Length -gt 20000) { throw [System.ArgumentException]::new('The selection is too large - use "Audit all" instead.') }
+                    $job = Start-WheelhouseUiJob -Title "Audit: $($selection.Count) selected package(s)" -Kind 'audit' -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @('-Package', $list) })
+                }
+                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/packages/scan$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                if (Get-UiBodyValue -Body $Body -Name 'all') {
+                    $job = Start-WheelhouseUiJob -Title 'Defender scan: all published wheels (local copies)' -Kind 'scan' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @() })
+                }
+                else {
+                    $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+                    $files = [System.Collections.Generic.List[string]]::new()
+                    foreach ($file in @(Get-UiBodyValue -Body $Body -Name 'files')) {
+                        $fileName = [string]$file
+                        if (-not (Test-WheelhouseWheelFileName $fileName)) { throw [System.ArgumentException]::new('Invalid file name in the selection.') }
+                        if (-not ($manifest | Where-Object { $_.file -eq $fileName })) {
+                            throw [System.Collections.Generic.KeyNotFoundException]::new("$fileName is not in the wheelhouse manifest.")
+                        }
+                        if (-not $files.Contains($fileName)) { $files.Add($fileName) }
+                    }
+                    if ($files.Count -eq 0) { throw [System.ArgumentException]::new('Select at least one package.') }
+                    $list = $files -join ','
+                    if ($list.Length -gt 20000) { throw [System.ArgumentException]::new('The selection is too large - use "Scan all" instead.') }
+                    $job = Start-WheelhouseUiJob -Title "Defender scan: $($files.Count) wheel(s) (local copies)" -Kind 'scan' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @('-File', $list) })
+                }
+                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/packages/add$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                $specs = @(foreach ($item in @(Get-UiBodyValue -Body $Body -Name 'specs')) { [string]$item })
+                if ($specs.Count -eq 0) { throw [System.ArgumentException]::new('Enter at least one package.') }
+                if ($specs.Count -gt 100) { throw [System.ArgumentException]::new('Too many packages at once (at most 100).') }
+
+                $addResult = Add-RequirementInLine -Path $Context.Settings.RequirementsInPath -Spec $specs -Denylist @(Read-WheelhouseDenylist -Path $Context.DenylistPath)
+                $job = $null
+                if ($addResult.Added.Count -gt 0) {
+                    $steps = @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
+                    # By default the job stops at requirements.txt, so the resolved pins can
+                    # be reviewed before anything is downloaded. "publish": true also runs
+                    # Update-Wheelhouse.ps1 (audit, cooldown, download) straight away.
+                    if ((Get-UiBodyValue -Body $Body -Name 'publish') -eq $true) { $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() } }
+                    $job = Start-WheelhouseUiJob -Title "Add: $($addResult.Added -join ', ')" -Kind 'add' -Context $Context -Steps $steps
+                }
+                return @{ Status = 200; Body = @{ added = @($addResult.Added); skipped = @($addResult.Skipped); job = $(if ($job) { ConvertTo-WheelhouseUiJobSummary -Job $job } else { $null }) } }
+            }
+        }
+
+        @{
+            Method  = 'GET'
+            Pattern = '^/api/requirements$'
+            Handler = {
+                param($Context, $Body, $Match)
+                # The resolved file Update-Wheelhouse.ps1 merges - shown for review.
+                $path = [string]$Context.Settings.LocalRequirementsPath
+                $text = ''
+                $modified = ''
+                if ($path -and (Test-Path -Path $path -PathType Leaf)) {
+                    $item = Get-Item -Path $path
+                    if ($item.Length -gt 1MB) { throw [System.InvalidOperationException]::new("requirements.txt is too large to show here: $path") }
+                    $text = [System.IO.File]::ReadAllText($path)
+                    $modified = $item.LastWriteTimeUtc.ToString('o')
+                }
+                $pins = @()
+                if ($text.Trim()) { $pins = @((Read-RequirementFile -FilePath $path).Keys | Sort-Object) }
+                return @{ Status = 200; Body = @{ path = $path; text = $text; modified_utc = $modified; pin_count = $pins.Count } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/wheelhouse/update$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                if ((Get-UiBodyValue -Body $Body -Name 'confirm') -ne $true) {
+                    throw [System.ArgumentException]::new('Publishing needs an explicit confirmation.')
+                }
+                $job = Start-WheelhouseUiJob -Title 'Publish: Update-Wheelhouse' -Kind 'update' -Context $Context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() })
+                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/packages/remove$'
+            Wheelhouse = $true
+            Idle       = 'A job is running. Wait for it to finish or cancel it before removing packages.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                $mode = [string](Get-UiBodyValue -Body $Body -Name 'mode')
+                if ($mode -notin 'quarantine', 'delete') { throw [System.ArgumentException]::new("mode must be 'quarantine' or 'delete'.") }
+                if ($mode -eq 'delete' -and (Get-UiBodyValue -Body $Body -Name 'confirm') -ne $true) {
+                    throw [System.ArgumentException]::new('Deleting needs an explicit confirmation.')
+                }
+                $reason = [string](Get-UiBodyValue -Body $Body -Name 'reason')
+                if ($reason.Length -gt 400) { throw [System.ArgumentException]::new('The reason is too long (400 characters at most).') }
+
+                $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+                $selection = Resolve-UiPackageSelection -Body $Body -Manifest $manifest -Max 200
+                $outcomes = foreach ($package in $selection) {
+                    try {
+                        $removeParams = @{ WheelhousePath = $Context.WheelhousePath; Name = $package.Name; Version = $package.Version; Reason = $reason; DenylistPath = $Context.DenylistPath }
+                        if ($mode -eq 'quarantine') { $removeParams['Quarantine'] = $true }
+                        $done = Remove-WheelhousePackage @removeParams
+                        @{ name = $package.Name; version = $package.Version; ok = $true; mode = $mode; quarantine_id = $done.QuarantineId; error = $null }
+                    }
+                    catch {
+                        @{ name = $package.Name; version = $package.Version; ok = $false; mode = $mode; quarantine_id = $null; error = $_.Exception.Message }
+                    }
+                }
+                return @{ Status = 200; Body = @{ results = @($outcomes) } }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/quarantine$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $records = @(Get-QuarantinedPackage -WheelhousePath $Context.WheelhousePath)
+                $items = foreach ($record in $records) {
+                    @{
+                        id              = [string]$record.id
+                        name            = [string]$record.name
+                        version         = [string]$record.version
+                        files           = @($record.files | ForEach-Object { [string]$_.file })
+                        groups          = @($record.groups)
+                        reason          = [string]$record.reason
+                        quarantined_utc = (ConvertTo-IsoTimestamp -Value $record.quarantined_utc)
+                        quarantined_by  = [string]$record.quarantined_by
+                        denylisted      = [bool]$record.denylisted
+                    }
+                }
+                return @{ Status = 200; Body = @{ items = @($items) } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/quarantine/restore$'
+            Wheelhouse = $true
+            Idle       = 'A job is running. Wait for it to finish or cancel it before restoring packages.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                $id = [string](Get-UiBodyValue -Body $Body -Name 'id')
+                if ($id -notmatch '^[A-Za-z0-9._-]+$') { throw [System.ArgumentException]::new('Invalid quarantine id.') }
+                $restoreParams = @{ WheelhousePath = $Context.WheelhousePath; Id = $id; DenylistPath = $Context.DenylistPath }
+                if (Get-UiBodyValue -Body $Body -Name 'keep_denylist') { $restoreParams['KeepDenylist'] = $true }
+                $done = Restore-WheelhousePackage @restoreParams
+                return @{ Status = 200; Body = @{ name = $done.Name; version = $done.Version; denylist_removed = $done.DenylistRemoved } }
+            }
+        }
+
+        @{
+            Method  = 'GET'
+            Pattern = '^/api/denylist$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $entries = @(Read-WheelhouseDenylist -Path $Context.DenylistPath)
+                $manifest = @()
+                if ($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container)) {
+                    $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+                }
+                $items = foreach ($entry in ($entries | Sort-Object name, version)) {
+                    $installed = [bool]($manifest | Where-Object { $_.name -eq $entry.name -and ($entry.version -eq '*' -or $_.version -eq $entry.version) })
+                    @{ name = [string]$entry.name; version = [string]$entry.version; reason = [string]$entry.reason; added_utc = (ConvertTo-IsoTimestamp -Value $entry.added_utc); added_by = [string]$entry.added_by; source = [string]$entry.source; installed = $installed }
+                }
+                return @{ Status = 200; Body = @{ items = @($items) } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/denylist/add$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $entry = Add-WheelhouseDenylistEntry -Name ([string](Get-UiBodyValue -Body $Body -Name 'name')) `
+                    -Version ([string](Get-UiBodyValue -Body $Body -Name 'version')) `
+                    -Reason ([string](Get-UiBodyValue -Body $Body -Name 'reason')) -Source 'manual' -Path $Context.DenylistPath
+                return @{ Status = 200; Body = @{ name = $entry.name; version = $entry.version } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/denylist/remove$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $removed = Remove-WheelhouseDenylistEntry -Name ([string](Get-UiBodyValue -Body $Body -Name 'name')) -Version ([string](Get-UiBodyValue -Body $Body -Name 'version')) -Path $Context.DenylistPath
+                if (-not $removed) { throw [System.Collections.Generic.KeyNotFoundException]::new('No such denylist entry.') }
+                return @{ Status = 200; Body = @{ removed = $true } }
+            }
+        }
+
+        @{
+            Method  = 'GET'
+            Pattern = '^/api/settings$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $schema = @(Get-WheelhouseSettingSchema)
+                $values = @{}
+                foreach ($item in $schema) { $values[$item.Key] = $Context.Settings[$item.Key] }
+                $fields = foreach ($item in $schema) {
+                    $options = @()
+                    if ($item.Options) { $options = @($item.Options) }
+                    @{ key = $item.Key; type = $item.Type; label = $item.Label; help = $item.Help; options = $options; min = $item.Min; max = $item.Max }
+                }
+                return @{ Status = 200; Body = @{ fields = @($fields); values = $values } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/settings$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $updates = @{}
+                $incoming = Get-UiBodyValue -Body $Body -Name 'updates'
+                if ($null -eq $incoming) { throw [System.ArgumentException]::new('No settings were sent.') }
+                foreach ($property in $incoming.PSObject.Properties) {
+                    $updates[$property.Name] = ConvertTo-WheelhouseSettingValue -Key $property.Name -Value $property.Value
+                }
+                if ($updates.Count -eq 0) { throw [System.ArgumentException]::new('No settings were sent.') }
+                Set-WheelhouseSetting -SettingsPath $Context.SettingsPath -Updates $updates
+                Write-Log "Settings changed from the UI: $(($updates.Keys | Sort-Object) -join ', ')" 'WARN'
+                return @{ Status = 200; Body = @{ saved = @($updates.Keys | Sort-Object) } }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/rejected$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $latest = Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_Rejected_*.json' -File -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending | Select-Object -First 1
+                $items = @()
+                if ($latest) {
+                    $parsed = Get-Content -Path $latest.FullName -Raw | ConvertFrom-Json
+                    $items = @(foreach ($item in $parsed) { $item })
+                }
+                return @{ Status = 200; Body = @{ file = $(if ($latest) { $latest.Name } else { $null }); items = $items } }
+            }
+        }
+
+        @{
+            Method  = 'GET'
+            Pattern = '^/api/jobs$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $jobs = @($script:UiJobs | Sort-Object Id -Descending | ForEach-Object { ConvertTo-WheelhouseUiJobSummary -Job $_ })
+                return @{ Status = 200; Body = @{ jobs = $jobs } }
+            }
+        }
+
+        @{
+            Method  = 'GET'
+            Pattern = '^/api/jobs/(?<id>\d+)$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $id = [int]$Match['id']
+                $job = $script:UiJobs | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+                if (-not $job) { throw [System.Collections.Generic.KeyNotFoundException]::new("No job with id $id.") }
+                return @{ Status = 200; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job -IncludeLog) } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/jobs/(?<id>\d+)/cancel$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $job = Stop-WheelhouseUiJob -Id ([int]$Match['id'])
+                return @{ Status = 200; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/shutdown$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $script:UiShutdown = $true
+                return @{ Status = 200; Body = @{ stopping = $true } }
+            }
+        }
+    )
+}
+
+$script:UiRoutes = Get-WheelhouseUiRoute
 
 function Invoke-WheelhouseUiApi {
     # Handles one API call and returns @{ Status = <int>; Body = <object> }. Pure with
     # respect to HTTP: the listener loop only moves bytes, so this is what tests call.
+    # Finds the route in $script:UiRoutes, applies its Wheelhouse/Idle checks, runs it.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -450,272 +849,15 @@ function Invoke-WheelhouseUiApi {
     try {
         Sync-WheelhouseUiJob
         $context = Get-WheelhouseUiContext -ManagerRoot $ManagerRoot
-        $route = "$Method $Path"
 
-        switch -Regex ($route) {
-            '^GET /api/state$' {
-                $running = Get-WheelhouseUiRunningJob
-                $isAdmin = ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-                return @{ Status = 200; Body = @{
-                        wheelhouse_path   = $context.WheelhousePath
-                        configured        = [bool]$context.WheelhousePath
-                        reachable         = [bool]($context.WheelhousePath -and (Test-Path -Path $context.WheelhousePath -PathType Container))
-                        defender          = (Test-WheelhouseDefenderAvailable)
-                        is_admin          = $isAdmin
-                        python_version    = [string]$context.Settings.PythonVersion
-                        platform          = [string]$context.Settings.Platform
-                        running_job       = $(if ($running) { ConvertTo-WheelhouseUiJobSummary -Job $running } else { $null })
-                    }
-                }
-            }
-
-            '^GET /api/packages$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                $inventoryParams = @{
-                    WheelhousePath = $context.WheelhousePath
-                    Denylist       = @(Read-WheelhouseDenylist -Path $context.DenylistPath)
-                    Services       = [string[]]@($context.Settings.VulnerabilityServices)
-                }
-                $inventory = Get-WheelhousePackage @inventoryParams
-                return @{ Status = 200; Body = @{ packages = @($inventory.Packages); groups = @($inventory.Groups); untracked = @($inventory.Untracked) } }
-            }
-
-            '^POST /api/packages/audit$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                if (Get-UiBodyValue -Body $Body -Name 'all') {
-                    $job = Start-WheelhouseUiJob -Title 'Audit: whole index' -Kind 'audit' -Context $context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @() })
-                }
-                else {
-                    $manifest = Read-WheelhouseManifest -WheelhousePath $context.WheelhousePath
-                    $selection = Resolve-UiPackageSelection -Body $Body -Manifest $manifest
-                    $list = ($selection | ForEach-Object { "$($_.Name)==$($_.Version)" }) -join ','
-                    if ($list.Length -gt 20000) { throw [System.ArgumentException]::new('The selection is too large - use "Audit all" instead.') }
-                    $job = Start-WheelhouseUiJob -Title "Audit: $($selection.Count) selected package(s)" -Kind 'audit' -Context $context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @('-Package', $list) })
-                }
-                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
-            }
-
-            '^POST /api/packages/scan$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                if (Get-UiBodyValue -Body $Body -Name 'all') {
-                    $job = Start-WheelhouseUiJob -Title 'Defender scan: whole wheelhouse' -Kind 'scan' -Context $context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @() })
-                }
-                else {
-                    $manifest = Read-WheelhouseManifest -WheelhousePath $context.WheelhousePath
-                    $files = [System.Collections.Generic.List[string]]::new()
-                    foreach ($file in @(Get-UiBodyValue -Body $Body -Name 'files')) {
-                        $fileName = [string]$file
-                        if ($fileName -notmatch $script:UiWheelFilePattern) { throw [System.ArgumentException]::new('Invalid file name in the selection.') }
-                        if (-not ($manifest | Where-Object { $_.file -eq $fileName })) {
-                            throw [System.Collections.Generic.KeyNotFoundException]::new("$fileName is not in the wheelhouse manifest.")
-                        }
-                        if (-not $files.Contains($fileName)) { $files.Add($fileName) }
-                    }
-                    if ($files.Count -eq 0) { throw [System.ArgumentException]::new('Select at least one package.') }
-                    $list = $files -join ','
-                    if ($list.Length -gt 20000) { throw [System.ArgumentException]::new('The selection is too large - use "Scan all" instead.') }
-                    $job = Start-WheelhouseUiJob -Title "Defender scan: $($files.Count) file(s)" -Kind 'scan' -Context $context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @('-File', $list) })
-                }
-                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
-            }
-
-            '^POST /api/packages/add$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                if (Get-WheelhouseUiRunningJob) {
-                    throw [System.InvalidOperationException]::new('Another job is still running. Wait for it to finish or cancel it first.')
-                }
-                $specs = @(foreach ($item in @(Get-UiBodyValue -Body $Body -Name 'specs')) { [string]$item })
-                if ($specs.Count -eq 0) { throw [System.ArgumentException]::new('Enter at least one package.') }
-                if ($specs.Count -gt 100) { throw [System.ArgumentException]::new('Too many packages at once (at most 100).') }
-
-                $addResult = Add-RequirementInLine -Path $context.Settings.RequirementsInPath -Spec $specs -Denylist @(Read-WheelhouseDenylist -Path $context.DenylistPath)
-                $job = $null
-                if ($addResult.Added.Count -gt 0) {
-                    $steps = @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
-                    # By default the job stops at requirements.txt, so the resolved pins can
-                    # be reviewed before anything is downloaded. "publish": true also runs
-                    # Update-Wheelhouse.ps1 (audit, cooldown, download) straight away.
-                    if ((Get-UiBodyValue -Body $Body -Name 'publish') -eq $true) { $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() } }
-                    $job = Start-WheelhouseUiJob -Title "Add: $($addResult.Added -join ', ')" -Kind 'add' -Context $context -Steps $steps
-                }
-                return @{ Status = 200; Body = @{ added = @($addResult.Added); skipped = @($addResult.Skipped); job = $(if ($job) { ConvertTo-WheelhouseUiJobSummary -Job $job } else { $null }) } }
-            }
-
-            '^GET /api/requirements$' {
-                # The resolved file Update-Wheelhouse.ps1 merges - shown for review.
-                $path = [string]$context.Settings.LocalRequirementsPath
-                $text = ''
-                $modified = ''
-                if ($path -and (Test-Path -Path $path -PathType Leaf)) {
-                    $item = Get-Item -Path $path
-                    if ($item.Length -gt 1MB) { throw [System.InvalidOperationException]::new("requirements.txt is too large to show here: $path") }
-                    $text = [System.IO.File]::ReadAllText($path)
-                    $modified = $item.LastWriteTimeUtc.ToString('o')
-                }
-                $pins = @()
-                if ($text.Trim()) { $pins = @((Read-RequirementFile -FilePath $path).Keys | Sort-Object) }
-                return @{ Status = 200; Body = @{ path = $path; text = $text; modified_utc = $modified; pin_count = $pins.Count } }
-            }
-
-            '^POST /api/wheelhouse/update$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                if ((Get-UiBodyValue -Body $Body -Name 'confirm') -ne $true) {
-                    throw [System.ArgumentException]::new('Publishing needs an explicit confirmation.')
-                }
-                $job = Start-WheelhouseUiJob -Title 'Publish: Update-Wheelhouse' -Kind 'update' -Context $context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() })
-                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
-            }
-
-            '^POST /api/packages/remove$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                if (Get-WheelhouseUiRunningJob) {
-                    throw [System.InvalidOperationException]::new('A job is running. Wait for it to finish or cancel it before removing packages.')
-                }
-                $mode = [string](Get-UiBodyValue -Body $Body -Name 'mode')
-                if ($mode -notin 'quarantine', 'delete') { throw [System.ArgumentException]::new("mode must be 'quarantine' or 'delete'.") }
-                if ($mode -eq 'delete' -and (Get-UiBodyValue -Body $Body -Name 'confirm') -ne $true) {
-                    throw [System.ArgumentException]::new('Deleting needs an explicit confirmation.')
-                }
-                $reason = [string](Get-UiBodyValue -Body $Body -Name 'reason')
-                if ($reason.Length -gt 400) { throw [System.ArgumentException]::new('The reason is too long (400 characters at most).') }
-
-                $manifest = Read-WheelhouseManifest -WheelhousePath $context.WheelhousePath
-                $selection = Resolve-UiPackageSelection -Body $Body -Manifest $manifest -Max 200
-                $outcomes = foreach ($package in $selection) {
-                    try {
-                        $removeParams = @{ WheelhousePath = $context.WheelhousePath; Name = $package.Name; Version = $package.Version; Reason = $reason; DenylistPath = $context.DenylistPath }
-                        if ($mode -eq 'quarantine') { $removeParams['Quarantine'] = $true }
-                        $done = Remove-WheelhousePackage @removeParams
-                        @{ name = $package.Name; version = $package.Version; ok = $true; mode = $mode; quarantine_id = $done.QuarantineId; error = $null }
-                    }
-                    catch {
-                        @{ name = $package.Name; version = $package.Version; ok = $false; mode = $mode; quarantine_id = $null; error = $_.Exception.Message }
-                    }
-                }
-                return @{ Status = 200; Body = @{ results = @($outcomes) } }
-            }
-
-            '^GET /api/quarantine$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                $records = @(Get-QuarantinedPackage -WheelhousePath $context.WheelhousePath)
-                $items = foreach ($record in $records) {
-                    @{
-                        id              = [string]$record.id
-                        name            = [string]$record.name
-                        version         = [string]$record.version
-                        files           = @($record.files | ForEach-Object { [string]$_.file })
-                        groups          = @($record.groups)
-                        reason          = [string]$record.reason
-                        quarantined_utc = (ConvertTo-IsoTimestamp -Value $record.quarantined_utc)
-                        quarantined_by  = [string]$record.quarantined_by
-                        denylisted      = [bool]$record.denylisted
-                    }
-                }
-                return @{ Status = 200; Body = @{ items = @($items) } }
-            }
-
-            '^POST /api/quarantine/restore$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                if (Get-WheelhouseUiRunningJob) {
-                    throw [System.InvalidOperationException]::new('A job is running. Wait for it to finish or cancel it before restoring packages.')
-                }
-                $id = [string](Get-UiBodyValue -Body $Body -Name 'id')
-                if ($id -notmatch '^[A-Za-z0-9._-]+$') { throw [System.ArgumentException]::new('Invalid quarantine id.') }
-                $restoreParams = @{ WheelhousePath = $context.WheelhousePath; Id = $id; DenylistPath = $context.DenylistPath }
-                if (Get-UiBodyValue -Body $Body -Name 'keep_denylist') { $restoreParams['KeepDenylist'] = $true }
-                $done = Restore-WheelhousePackage @restoreParams
-                return @{ Status = 200; Body = @{ name = $done.Name; version = $done.Version; denylist_removed = $done.DenylistRemoved } }
-            }
-
-            '^GET /api/denylist$' {
-                $entries = @(Read-WheelhouseDenylist -Path $context.DenylistPath)
-                $manifest = @()
-                if ($context.WheelhousePath -and (Test-Path -Path $context.WheelhousePath -PathType Container)) {
-                    $manifest = Read-WheelhouseManifest -WheelhousePath $context.WheelhousePath
-                }
-                $items = foreach ($entry in ($entries | Sort-Object name, version)) {
-                    $installed = [bool]($manifest | Where-Object { $_.name -eq $entry.name -and ($entry.version -eq '*' -or $_.version -eq $entry.version) })
-                    @{ name = [string]$entry.name; version = [string]$entry.version; reason = [string]$entry.reason; added_utc = (ConvertTo-IsoTimestamp -Value $entry.added_utc); added_by = [string]$entry.added_by; source = [string]$entry.source; installed = $installed }
-                }
-                return @{ Status = 200; Body = @{ items = @($items) } }
-            }
-
-            '^POST /api/denylist/add$' {
-                $entry = Add-WheelhouseDenylistEntry -Name ([string](Get-UiBodyValue -Body $Body -Name 'name')) `
-                    -Version ([string](Get-UiBodyValue -Body $Body -Name 'version')) `
-                    -Reason ([string](Get-UiBodyValue -Body $Body -Name 'reason')) -Source 'manual' -Path $context.DenylistPath
-                return @{ Status = 200; Body = @{ name = $entry.name; version = $entry.version } }
-            }
-
-            '^POST /api/denylist/remove$' {
-                $removed = Remove-WheelhouseDenylistEntry -Name ([string](Get-UiBodyValue -Body $Body -Name 'name')) -Version ([string](Get-UiBodyValue -Body $Body -Name 'version')) -Path $context.DenylistPath
-                if (-not $removed) { throw [System.Collections.Generic.KeyNotFoundException]::new('No such denylist entry.') }
-                return @{ Status = 200; Body = @{ removed = $true } }
-            }
-
-            '^GET /api/settings$' {
-                $schema = @(Get-WheelhouseSettingSchema)
-                $values = @{}
-                foreach ($item in $schema) { $values[$item.Key] = $context.Settings[$item.Key] }
-                $fields = foreach ($item in $schema) {
-                    $options = @()
-                    if ($item.Options) { $options = @($item.Options) }
-                    @{ key = $item.Key; type = $item.Type; label = $item.Label; help = $item.Help; options = $options; min = $item.Min; max = $item.Max }
-                }
-                return @{ Status = 200; Body = @{ fields = @($fields); values = $values } }
-            }
-
-            '^POST /api/settings$' {
-                $updates = @{}
-                $incoming = Get-UiBodyValue -Body $Body -Name 'updates'
-                if ($null -eq $incoming) { throw [System.ArgumentException]::new('No settings were sent.') }
-                foreach ($property in $incoming.PSObject.Properties) {
-                    $updates[$property.Name] = ConvertTo-WheelhouseSettingValue -Key $property.Name -Value $property.Value
-                }
-                if ($updates.Count -eq 0) { throw [System.ArgumentException]::new('No settings were sent.') }
-                Set-WheelhouseSetting -SettingsPath $context.SettingsPath -Updates $updates
-                Write-Log "Settings changed from the UI: $(($updates.Keys | Sort-Object) -join ', ')" 'WARN'
-                return @{ Status = 200; Body = @{ saved = @($updates.Keys | Sort-Object) } }
-            }
-
-            '^GET /api/rejected$' {
-                Assert-WheelhouseUiConfigured -Context $context
-                $latest = Get-ChildItem -Path $context.ReportsFolder -Filter 'Report_Rejected_*.json' -File -ErrorAction SilentlyContinue |
-                    Sort-Object Name -Descending | Select-Object -First 1
-                $items = @()
-                if ($latest) {
-                    $parsed = Get-Content -Path $latest.FullName -Raw | ConvertFrom-Json
-                    $items = @(foreach ($item in $parsed) { $item })
-                }
-                return @{ Status = 200; Body = @{ file = $(if ($latest) { $latest.Name } else { $null }); items = $items } }
-            }
-
-            '^GET /api/jobs$' {
-                $jobs = @($script:UiJobs | Sort-Object Id -Descending | ForEach-Object { ConvertTo-WheelhouseUiJobSummary -Job $_ })
-                return @{ Status = 200; Body = @{ jobs = $jobs } }
-            }
-
-            '^GET /api/jobs/(?<id>\d+)$' {
-                $id = [int]$Matches['id']
-                $job = $script:UiJobs | Where-Object { $_.Id -eq $id } | Select-Object -First 1
-                if (-not $job) { throw [System.Collections.Generic.KeyNotFoundException]::new("No job with id $id.") }
-                return @{ Status = 200; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job -IncludeLog) } }
-            }
-
-            '^POST /api/jobs/(?<id>\d+)/cancel$' {
-                $job = Stop-WheelhouseUiJob -Id ([int]$Matches['id'])
-                return @{ Status = 200; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
-            }
-
-            '^POST /api/shutdown$' {
-                $script:UiShutdown = $true
-                return @{ Status = 200; Body = @{ stopping = $true } }
-            }
-
-            default {
-                return @{ Status = 404; Body = @{ error = "Unknown endpoint: $route" } }
-            }
+        foreach ($route in $script:UiRoutes) {
+            if ($route.Method -ne $Method -or $Path -notmatch $route.Pattern) { continue }
+            $match = $Matches.Clone()
+            if ($route.Wheelhouse) { Assert-WheelhouseUiConfigured -Context $context }
+            if ($route.Idle -and (Get-WheelhouseUiRunningJob)) { throw [System.InvalidOperationException]::new($route.Idle) }
+            return & $route.Handler $context $Body $match
         }
+        return @{ Status = 404; Body = @{ error = "Unknown endpoint: $Method $Path" } }
     }
     catch [System.ArgumentException] {
         return @{ Status = 400; Body = @{ error = $_.Exception.Message } }

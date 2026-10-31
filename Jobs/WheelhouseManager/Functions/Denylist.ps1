@@ -10,8 +10,7 @@
 #   source     'manual' (typed in the UI), 'removed' or 'quarantined' (added
 #              automatically when a package was taken out of the wheelhouse)
 
-$script:DenylistNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]*$'
-$script:DenylistVersionPattern = '^(\*|[A-Za-z0-9][A-Za-z0-9._+!-]*)$'
+# Names and versions follow the shared rules in Common.ps1; a version may also be '*'.
 
 function Get-WheelhouseDenylistPath {
     [CmdletBinding()]
@@ -91,12 +90,12 @@ function Add-WheelhouseDenylistEntry {
         [string]$Path = (Get-WheelhouseDenylistPath)
     )
 
-    if ($Name -notmatch $script:DenylistNamePattern) {
+    if (-not (Test-WheelhousePackageName $Name)) {
         throw [System.ArgumentException]::new("Invalid package name: '$Name'.")
     }
     if ([string]::IsNullOrWhiteSpace($Version)) { $Version = '*' }
     $Version = $Version.Trim()
-    if ($Version -notmatch $script:DenylistVersionPattern) {
+    if ($Version -ne '*' -and -not (Test-WheelhousePackageVersion $Version)) {
         throw [System.ArgumentException]::new("Invalid version: '$Version'. Use an exact version such as 1.2.3, or * for every version.")
     }
     if ($null -eq $Reason) { $Reason = '' }

@@ -91,6 +91,16 @@
     });
   }
 
+  function infoDialog(title, bodyNodes) {
+    var dlg = $('dialog');
+    clear(dlg);
+    var close = h('button', { class: 'btn primary', type: 'button' }, 'Close');
+    close.addEventListener('click', function () { dlg.close(); });
+    dlg.onclose = null;
+    dlg.append(h('h3', {}, title), bodyNodes, h('div', { class: 'actions' }, close));
+    dlg.showModal();
+  }
+
   // ---------------------------------------------------------------- state
   var state = {
     info: null,
@@ -174,6 +184,7 @@
         case 'threat': return p.scan_status === 'Threat';
         case 'unaudited': return p.audit_status === 'Unknown';
         case 'unscanned': return p.scan_status === 'Unknown';
+        case 'yanked': return !!p.yanked;
         case 'denylisted': return p.denylisted !== null;
         case 'missing': return p.file_missing;
         default: return true;
@@ -211,7 +222,7 @@
     });
     var statusFilter = h('select', {},
       [['all', 'All packages'], ['vulnerable', 'Vulnerable'], ['threat', 'Defender threat'], ['unaudited', 'Never audited'],
-        ['unscanned', 'Never scanned'], ['denylisted', 'On the denylist'], ['missing', 'File missing']].map(function (o) {
+        ['unscanned', 'Never scanned'], ['yanked', 'Yanked on PyPI'], ['denylisted', 'On the denylist'], ['missing', 'File missing']].map(function (o) {
         return h('option', { value: o[0], selected: state.statusFilter === o[0] }, o[1]);
       }));
     statusFilter.addEventListener('change', function () { state.statusFilter = statusFilter.value; renderPackages(); });
@@ -264,7 +275,8 @@
         : p.scan_status === 'Clean' ? badge('Clean', 'ok', 'Last scan ' + p.last_scan) : badge('Not scanned');
       return h('tr', { class: state.selected[k] ? 'selected' : '' },
         h('td', {}, box),
-        h('td', {}, h('strong', {}, p.name), p.file_missing ? [' ', badge('file missing', 'bad')] : null),
+        h('td', {}, h('strong', {}, p.name), p.file_missing ? [' ', badge('file missing', 'bad')] : null,
+          p.yanked ? [' ', badge('yanked', 'warn', 'Yanked on PyPI: ' + p.yanked)] : null),
         h('td', { class: 'mono' }, p.version),
         h('td', {}, p.groups.length ? p.groups.join(', ') : h('span', { class: 'muted' }, 'not listed')),
         h('td', {}, auditCell, p.vulnerabilities.length ? h('div', { class: 'mono muted' }, p.vulnerabilities.join(', ')) : null),
@@ -272,12 +284,41 @@
         h('td', {}, p.denylisted !== null ? badge('blocked', 'warn', p.denylisted) : ''),
         h('td', {}, fmtDate(p.downloaded_utc)),
         h('td', { class: 'num' }, fmtBytes(p.size_bytes)),
-        h('td', { class: 'mono' }, p.file));
+        h('td', { class: 'mono' }, p.file),
+        h('td', {}, h('button', { class: 'btn small', type: 'button', onclick: function () { showHistory(p.name, p.version); } }, 'History')));
     });
     root.append(h('div', { class: 'table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, h('th', {}, allBox), h('th', {}, 'Package'), h('th', {}, 'Version'), h('th', {}, 'Groups'),
-        h('th', {}, 'Audit'), h('th', {}, 'Defender'), h('th', {}, 'Denylist'), h('th', {}, 'Downloaded'), h('th', {}, 'Size'), h('th', {}, 'File'))),
+        h('th', {}, 'Audit'), h('th', {}, 'Defender'), h('th', {}, 'Denylist'), h('th', {}, 'Downloaded'), h('th', {}, 'Size'), h('th', {}, 'File'), h('th', {}, ''))),
       h('tbody', {}, rows))));
+  }
+
+  // State, latest checks and the history of one package version (catalog + events.jsonl).
+  function showHistory(name, version) {
+    // Names and versions only contain [A-Za-z0-9._+!-], all literal in a URL path.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || !/^[A-Za-z0-9][A-Za-z0-9._+!-]*$/.test(version)) { return; }
+    api('GET', '/api/packages/' + name + '/' + version + '/history').then(function (data) {
+      var record = data.record;
+      var checks = (record && record.checks) || {};
+      var line = function (label, check, text) {
+        return h('div', {}, h('strong', {}, label + ': '), check ? text(check) + ' (' + fmtDate(check.last_run) + ')' : 'not checked yet');
+      };
+      var summary = h('div', { class: 'card' },
+        record ? h('p', {}, h('strong', {}, 'State: '), record.state, record.state_since ? ' since ' + fmtDate(record.state_since) : '',
+          record.state_reason ? ' - ' + record.state_reason : '') : h('p', { class: 'muted' }, 'Not in the catalog.'),
+        record && record.groups && record.groups.length ? h('div', {}, h('strong', {}, 'Groups: '), [].concat(record.groups).join(', ')) : null,
+        line('Audit', checks.audit, function (c) { return c.status + (c.vulnerabilities && [].concat(c.vulnerabilities).length ? ' - ' + [].concat(c.vulnerabilities).join(', ') : ''); }),
+        line('Defender', checks.scan, function (c) { return c.status; }),
+        line('PyPI', checks.pypi, function (c) { return c.status + (c.reason ? ' - ' + c.reason : ''); }));
+      var events = [].concat(data.events || []);
+      var table = events.length === 0 ? h('p', { class: 'muted' }, 'No history recorded yet.') :
+        h('div', { class: 'table-wrap' }, h('table', {},
+          h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'What'), h('th', {}, 'Who'), h('th', {}, 'Details'))),
+          h('tbody', {}, events.map(function (e) {
+            return h('tr', {}, h('td', {}, fmtDate(e.ts)), h('td', {}, e.action), h('td', {}, e.user), h('td', {}, e.detail));
+          }))));
+      infoDialog(data.name + '==' + data.version, h('div', {}, summary, table));
+    }).catch(fail);
   }
 
   function startJobRequest(promise) {

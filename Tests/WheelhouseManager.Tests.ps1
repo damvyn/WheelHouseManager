@@ -130,6 +130,31 @@ Describe 'WheelhouseManager' {
             [PSCustomObject]@{ Status = $status; Message = "scan $status"; Threats = $threats; ScannedPaths = @($Path) }
         }
 
+        # Both halves of intake, the way Invoke-WheelhouseSync runs them: check, then publish
+        # into <WheelhousePath>\requirements-1.txt with every candidate as a new pin.
+        function Invoke-TestIntake {
+            param([hashtable]$Params)
+            # Intake never touches the wheelhouse; only publishing needs its path.
+            $intakeParams = @{} + $Params
+            $intakeParams.Remove('WheelhousePath')
+            $intake = Invoke-CandidateIntake @intakeParams
+            $publishParams = @{
+                Intake         = $intake
+                WheelhousePath = $Params.WheelhousePath
+                GroupFile      = (Join-Path $Params.WheelhousePath 'requirements-1.txt')
+                Additions      = $Params.Packages
+                DenylistPath   = (Join-Path $Params.WheelhousePath 'denylist.json')
+            }
+            $publish = Publish-CandidateIntake @publishParams
+            return @{
+                Accepted     = $publish.Accepted
+                Rejected     = @($intake.Rejected) + @($publish.Rejected)
+                Published    = $publish.Published
+                AuditResults = $intake.AuditResults
+                Intake       = $intake
+            }
+        }
+
         # Pester 5 can only mock commands that exist; provide a stub on machines
         # without Python so the pip-audit tests still run.
         $script:addedPythonStub = $false
@@ -142,7 +167,7 @@ Describe 'WheelhouseManager' {
     AfterAll {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
         Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded, WhmIntakeCandidates, WhmScanDetections, WhmUiJobSteps,
-            WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI -Scope Global -ErrorAction SilentlyContinue
+            WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI, WhmScannedPath -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -643,7 +668,7 @@ Describe 'WheelhouseManager' {
             $global:WhmNoWheel = @('nowheel')
 
             $params = Get-IntakeParam -Folder $folder -Packages @{ good = '1.0'; vulnpkg = '1.0'; fresh = '1.0'; nowheel = '1.0' }
-            $result = Invoke-CandidateIntake @params
+            $result = Invoke-TestIntake -Params $params
 
             ($result.Accepted.Keys -join ',') | Should -Be 'good'
             $reasons = Get-RejectReason -Result $result
@@ -672,7 +697,7 @@ Describe 'WheelhouseManager' {
             $global:WhmWheelOverride = @{ tampered = 'not what PyPI published' }
 
             $params = Get-IntakeParam -Folder $folder -Packages @{ tampered = '1.0'; fine = '1.0' }
-            $result = Invoke-CandidateIntake @params
+            $result = Invoke-TestIntake -Params $params
 
             ($result.Accepted.Keys -join ',') | Should -Be 'fine'
             (Get-RejectReason -Result $result)['tampered'] | Should -Match '^\[integrity\] sha256 of tampered-1.0-py3-none-any.whl does not match PyPI'
@@ -685,7 +710,7 @@ Describe 'WheelhouseManager' {
             $global:WhmReleases['badfile'] = New-TestRelease -Name 'badfile' -FileYanked
 
             $params = Get-IntakeParam -Folder $folder -Packages @{ gone = '1.0'; badfile = '1.0' }
-            $result = Invoke-CandidateIntake @params
+            $result = Invoke-TestIntake -Params $params
 
             $result.Accepted.Count | Should -Be 0
             $reasons = Get-RejectReason -Result $result
@@ -705,7 +730,7 @@ Describe 'WheelhouseManager' {
             $params = Get-IntakeParam -Folder $folder -Packages @{ late = '1.0'; urgent = '1.0'; other = '1.0' }
             # Expediting a different version than the candidate has no effect.
             $params['Expedite'] = @{ urgent = '1.0'; other = '9.9' }
-            $result = Invoke-CandidateIntake @params
+            $result = Invoke-TestIntake -Params $params
 
             ($result.Accepted.Keys -join ',') | Should -Be 'urgent'
             $reasons = Get-RejectReason -Result $result
@@ -721,7 +746,7 @@ Describe 'WheelhouseManager' {
             $global:WhmThreatPackage = 'evil'
 
             $params = Get-IntakeParam -Folder $folder -Packages @{ evil = '1.0'; clean = '1.0' }
-            $result = Invoke-CandidateIntake @params
+            $result = Invoke-TestIntake -Params $params
             ($result.Accepted.Keys -join ',') | Should -Be 'clean'
             (Get-RejectReason -Result $result)['evil'] | Should -Match '^\[defender\] Microsoft Defender detected Trojan:Test in evil-1.0'
             Test-Path -Path (Join-Path $folder 'evil-1.0-py3-none-any.whl') | Should -Be $false
@@ -730,13 +755,13 @@ Describe 'WheelhouseManager' {
             $global:WhmScanStatus = 'Error'
             $other = Get-TestFolder
             $params = Get-IntakeParam -Folder $other -Packages @{ clean = '1.0' }
-            (Invoke-CandidateIntake @params).Accepted.Count | Should -Be 1
+            (Invoke-TestIntake -Params $params).Accepted.Count | Should -Be 1
 
             # ...and rejected when a scan is required.
             $strict = Get-TestFolder
             $params = Get-IntakeParam -Folder $strict -Packages @{ clean = '1.0' }
             $params['RequireDefenderScan'] = $true
-            $required = Invoke-CandidateIntake @params
+            $required = Invoke-TestIntake -Params $params
             $required.Accepted.Count | Should -Be 0
             (Get-RejectReason -Result $required)['clean'] | Should -Match '^\[defender\] the Defender scan could not be completed'
             @(Get-ChildItem -Path $strict -Filter '*.whl').Count | Should -Be 0
@@ -745,7 +770,7 @@ Describe 'WheelhouseManager' {
         It 'fails closed when PyPI release data is unavailable' {
             $folder = Get-TestFolder
             $params = Get-IntakeParam -Folder $folder -Packages @{ unknown = '1.0' }
-            $result = Invoke-CandidateIntake @params
+            $result = Invoke-TestIntake -Params $params
             $result.Accepted.Count | Should -Be 0
             (Get-RejectReason -Result $result)['unknown'] | Should -Match '^\[pypi-metadata\] cooldown: could not verify'
             $global:WhmIntakeDownloaded | Should -BeNullOrEmpty
@@ -761,7 +786,6 @@ Describe 'WheelhouseManager' {
             $intakeParams = @{
                 Packages       = @{ a = '1'; b = '2' }
                 GroupName      = 'requirements-1'
-                WheelhousePath = $folder
                 ReportsFolder  = $folder
                 Services       = @('osv')
                 MinimumAgeDays = 10
@@ -770,7 +794,8 @@ Describe 'WheelhouseManager' {
             }
             $result = Invoke-CandidateIntake @intakeParams
 
-            $result.Accepted.Count | Should -Be 0
+            $result.Verified.Count | Should -Be 0
+            $result.StagingPath | Should -BeNullOrEmpty
             @($result.Rejected).Count | Should -Be 2
             $result.Rejected[0].Reason | Should -Match 'could not be completed'
         }
@@ -904,7 +929,7 @@ Describe 'WheelhouseManager' {
                 Denylist       = $deny
                 StagingRoot    = (Join-Path $folder 'staging')
             }
-            $result = Invoke-CandidateIntake @intakeParams
+            $result = Invoke-TestIntake -Params $intakeParams
 
             ($result.Accepted.Keys -join ',') | Should -Be 'fine'
             $reasons = @{}
@@ -922,7 +947,6 @@ Describe 'WheelhouseManager' {
             $intakeParams = @{
                 Packages       = @{ evil = '1.0' }
                 GroupName      = 'requirements-1'
-                WheelhousePath = $folder
                 ReportsFolder  = $folder
                 Services       = @('osv')
                 MinimumAgeDays = 10
@@ -931,7 +955,7 @@ Describe 'WheelhouseManager' {
                 Denylist       = @([PSCustomObject]@{ name = 'evil'; version = '*'; reason = ''; source = 'manual' })
             }
             $result = Invoke-CandidateIntake @intakeParams
-            $result.Accepted.Count | Should -Be 0
+            $result.Verified.Count | Should -Be 0
             @($result.Rejected).Count | Should -Be 1
         }
     }
@@ -1037,27 +1061,68 @@ Describe 'WheelhouseManager' {
             (@($offline.Notices).Count, @($offline.Errors).Count) -join ',' | Should -Be '1,0'
         }
 
-        It 'treats a wheel Defender removed as a notice, not an integrity failure' {
+        It 'classifies wheels removed or changed on the share, and still stops on anything else' {
             $wheelhouse = Get-TestWheelhouse
             $reports = Get-TestFolder
             $manifest = Read-WheelhouseManifest -WheelhousePath $wheelhouse
-            $sixPath = Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl'
-            Remove-Item -Path $sixPath
-            $global:WhmScanDetections = @([PSCustomObject]@{ Resource = "file:_$sixPath"; ThreatName = 'Trojan:Test'; ThreatId = '1'; ActionSuccess = $true })
-            Mock -ModuleName WheelhouseManager -CommandName Test-WheelhouseDefenderAvailable -MockWith { $true }
-            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseThreatDetection -MockWith { $global:WhmScanDetections }
+            # The file server's antivirus took six away and "cleaned" attrs.
+            Remove-Item -Path (Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl')
+            Set-Content -Path (Join-Path $wheelhouse 'attrs-23.1.0-py3-none-any.whl') -Value 'cleaned by antivirus'
 
-            # Without the switch it is still an integrity failure (fail closed).
+            $problems = @(Get-WheelhouseIntegrityProblem -Manifest $manifest -WheelhousePath $wheelhouse)
+            ($problems | ForEach-Object { "$($_.Kind):$($_.Entry.name)" } | Sort-Object) -join ',' | Should -Be 'Missing:six,Modified:attrs'
+
+            # Without the switch any problem stops the run (fail closed)...
             { Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports } | Should -Throw '*integrity check failed*'
+            # ...with it, Missing and Modified are handed back to deal with.
+            $changed = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports -AllowChangedFiles)
+            $changed.Count | Should -Be 2
+            @(Get-ChildItem -Path $reports -Filter 'Report_Integrity_*.json').Count | Should -BeGreaterOrEqual 1
 
-            $removed = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports -AllowDefenderRemoved)
-            $removed.Count | Should -Be 1
-            $removed[0].Entry.name | Should -Be 'six'
-            $removed[0].ThreatName | Should -Be 'Trojan:Test'
+            # A broken manifest record still stops it.
+            $broken = @($manifest) + [PSCustomObject]@{ name = 'x'; version = '1'; file = @('a', 'b'); sha256 = 'X' }
+            { Assert-WheelhouseIntegrity -Manifest $broken -WheelhousePath $wheelhouse -ReportsFolder $reports -AllowChangedFiles } | Should -Throw '*integrity check failed*'
+        }
 
-            # A missing file Defender knows nothing about still fails.
-            $global:WhmScanDetections = @()
-            { Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports -AllowDefenderRemoved } | Should -Throw '*integrity check failed*'
+        It 'takes out a missing wheel and quarantines a changed one, or only reports them' {
+            $wheelhouse = Get-TestWheelhouse
+            $reports = Get-TestFolder
+            $denyPath = Join-Path $wheelhouse 'denylist.json'
+            $manifest = Read-WheelhouseManifest -WheelhousePath $wheelhouse
+            Remove-Item -Path (Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl')
+            Set-Content -Path (Join-Path $wheelhouse 'attrs-23.1.0-py3-none-any.whl') -Value 'cleaned by antivirus'
+            $changed = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports -AllowChangedFiles)
+
+            # AutoQuarantine off: nothing changes, the notices say what to do.
+            $reportOnly = @(Resolve-WheelhouseIntegrityProblem -WheelhousePath $wheelhouse -Problem $changed -DenylistPath $denyPath)
+            ($reportOnly | ForEach-Object { "$($_.Kind):$($_.Package)" } | Sort-Object) -join ',' | Should -Be 'FileMissing:six,FileModified:attrs'
+            $reportOnly[0].Message | Should -Match 'AutoQuarantine is off'
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'six==1.16.0,attrs==23.1.0'
+
+            # AutoQuarantine on: both are taken out and blocked.
+            $lock = Open-WheelhouseWrite -WheelhousePath $wheelhouse -DenylistPath $denyPath
+            try {
+                $notices = @(Resolve-WheelhouseIntegrityProblem -WheelhousePath $wheelhouse -Problem $changed -AutoQuarantine -DenylistPath $denyPath)
+            }
+            finally {
+                Exit-WheelhouseLock -Lock $lock
+            }
+            ($notices | Where-Object { $_.Kind -eq 'FileMissing' }).Message | Should -Match "file server's antivirus"
+            Test-Path -Path (Join-Path $wheelhouse 'requirements-1.txt') | Should -Be $true
+            @(Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')).Count | Should -Be 0
+            (Read-WheelhouseManifest -WheelhousePath $wheelhouse).Count | Should -Be 0
+            $deny = @(Read-WheelhouseDenylist -Path $denyPath)
+            ($deny | ForEach-Object { "$($_.name):$($_.source)" } | Sort-Object) -join ',' | Should -Be 'attrs:quarantined,six:removed'
+            # The manager deleted nothing: the history and the denylist say "taken out".
+            ($deny | Where-Object { $_.name -eq 'six' }).reason | Should -Match '\(taken out\)$'
+            (Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'six')[0].action | Should -Be 'TakenOut'
+            # The changed file is kept as evidence; restoring it is refused.
+            $record = @(Get-QuarantinedPackage -WheelhousePath $wheelhouse)[0]
+            $record.name | Should -Be 'attrs'
+            { Restore-WheelhousePackage -WheelhousePath $wheelhouse -Id $record.id -DenylistPath $denyPath } | Should -Throw '*hash changed*'
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Records['six==1.16.0'].state | Should -Be 'Removed'
+            $catalog.Records['attrs==23.1.0'].state | Should -Be 'Quarantined'
         }
 
         It 'lets the lock holder clean up a removed wheel' {
@@ -1072,7 +1137,7 @@ Describe 'WheelhouseManager' {
                 Exit-WheelhouseLock -Lock $lock
             }
             $done.Groups -join ',' | Should -Be 'requirements-1.txt'
-            @(Read-WheelhouseManifest -WheelhousePath $wheelhouse | ForEach-Object { $_.name }) -join ',' | Should -Be 'attrs'
+            @((Read-WheelhouseManifest -WheelhousePath $wheelhouse).name) -join ',' | Should -Be 'attrs'
             (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'attrs==23.1.0'
             (Read-WheelhouseDenylist -Path $denyPath)[0].reason | Should -Match 'Microsoft Defender'
         }
@@ -1116,6 +1181,396 @@ Describe 'WheelhouseManager' {
         }
     }
 
+    Context 'Script hygiene' {
+        It 'never assigns to a validated parameter (variable names are case-insensitive)' {
+            # Regression: "$autoQuarantine = <bool>" in a script with a ValidateSet('On','Off')
+            # -AutoQuarantine parameter failed validation, left the value empty and silently
+            # turned automatic quarantine off.
+            $root = Split-Path -Path $PSScriptRoot -Parent
+            $scripts = @(Get-ChildItem -Path (Join-Path $root 'Jobs') -Filter '*.ps1') + @(Get-ChildItem -Path $root -Filter '*.ps1')
+            $offenders = foreach ($file in $scripts) {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+                if (-not $ast.ParamBlock) { continue }
+                $validated = @($ast.ParamBlock.Parameters | Where-Object {
+                        $_.Attributes | Where-Object { $_.TypeName.Name -like 'Validate*' }
+                    } | ForEach-Object { $_.Name.VariablePath.UserPath })
+                $assignments = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)
+                foreach ($assignment in $assignments) {
+                    $name = $assignment.Left.VariablePath.UserPath
+                    if ($validated | Where-Object { $_ -eq $name }) { "$($file.Name):$($assignment.Extent.StartLineNumber) `$$name" }
+                }
+            }
+            @($offenders) | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Shared validation' {
+        It 'parses pins from arrays and comma/semicolon lists and refuses anything else' {
+            $pins = @(ConvertTo-WheelhousePin -Pin @('Numpy_Core==2.0.1, pandas==2.2.3', 'x==1!2.0+local'))
+            ($pins | ForEach-Object { "$($_.Name)==$($_.Version)" }) -join '|' | Should -Be 'numpy-core==2.0.1|pandas==2.2.3|x==1!2.0+local'
+            @(ConvertTo-WheelhousePin -Pin @()).Count | Should -Be 0
+            { ConvertTo-WheelhousePin -Pin 'numpy>=2' } | Should -Throw -ExceptionType ([System.ArgumentException])
+            { ConvertTo-WheelhousePin -Pin 'a==1;rm -rf' } | Should -Throw -ExceptionType ([System.ArgumentException])
+        }
+
+        It 'accepts bare wheel file names only' {
+            Test-WheelhouseWheelFileName 'six-1.16.0-py3-none-any.whl' | Should -Be $true
+            Test-WheelhouseWheelFileName '..\six-1.16.0-py3-none-any.whl' | Should -Be $false
+            Test-WheelhouseWheelFileName 'sub/six.whl' | Should -Be $false
+            Test-WheelhouseWheelFileName 'six.zip' | Should -Be $false
+        }
+    }
+
+    Context 'Locks' {
+        It 'waits up to the timeout for a busy lock, keeps the sync lock separate, and reports a missing folder' {
+            $wheelhouse = Get-TestFolder
+            $write = Enter-WheelhouseLock -WheelhousePath $wheelhouse
+            try {
+                $started = Get-Date
+                try { Enter-WheelhouseLock -WheelhousePath $wheelhouse -TimeoutSeconds 1 } catch { $busy = $_ }
+                ((Get-Date) - $started).TotalSeconds | Should -BeGreaterOrEqual 0.9
+                $busy.Exception.Data['WheelhouseLockBusy'] | Should -Be $true
+
+                $sync = Enter-WheelhouseLock -WheelhousePath $wheelhouse -Kind sync
+                { Enter-WheelhouseLock -WheelhousePath $wheelhouse -Kind sync } | Should -Throw '*Update-Wheelhouse run is already in progress*'
+                Exit-WheelhouseLock -Lock $sync
+            }
+            finally {
+                Exit-WheelhouseLock -Lock $write
+            }
+            try { Enter-WheelhouseLock -WheelhousePath (Join-Path $wheelhouse 'missing') } catch { $missing = $_ }
+            $missing.Exception.Message | Should -Match 'does not exist'
+            $missing.Exception.Data['WheelhouseLockBusy'] | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Catalog' {
+        It 'is created from the manifest, the group files and the latest reports, then reconciled' {
+            $wheelhouse = Get-TestWheelhouse
+            $reports = Join-Path $wheelhouse 'reports'
+            New-Item -ItemType Directory -Path $reports | Out-Null
+            Set-Content -Path (Join-Path $reports 'Report_Scheduled-requirements-1-OSV_20260101_000000.json') -Value '{"dependencies":[{"name":"six","version":"1.16.0","vulns":[]},{"name":"attrs","version":"23.1.0","vulns":[{"id":"PYSEC-9"}]}]}'
+
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Exists | Should -Be $false
+            Sync-WheelhouseCatalog -Catalog $catalog | Should -Be $true
+            Save-WheelhouseCatalog -Catalog $catalog
+
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            ($catalog.Records.Keys | Sort-Object) -join ',' | Should -Be 'attrs==23.1.0,six==1.16.0'
+            $attrs = $catalog.Records['attrs==23.1.0']
+            $attrs.state | Should -Be 'Published'
+            $attrs.groups -join ',' | Should -Be 'requirements-1.txt'
+            $attrs.files -join ',' | Should -Be 'attrs-23.1.0-py3-none-any.whl'
+            $attrs.checks.audit.status | Should -Be 'Vulnerable'
+            @($attrs.checks.audit.vulnerabilities) -join ',' | Should -Be 'PYSEC-9'
+            (Read-WheelhouseEvent -WheelhousePath $wheelhouse)[0].action | Should -Be 'CatalogCreated'
+
+            # attrs leaves the manifest with a quarantine record, six without one.
+            Save-WheelhouseManifest -Manifest @() -WheelhousePath $wheelhouse
+            Save-QuarantineRecord -WheelhousePath $wheelhouse -Record @([PSCustomObject]@{ id = 'q1'; name = 'attrs'; version = '23.1.0'; files = @(); groups = @() })
+            Sync-WheelhouseCatalog -Catalog $catalog | Should -Be $true
+            $catalog.Records['attrs==23.1.0'].state | Should -Be 'Quarantined'
+            $catalog.Records['six==1.16.0'].state | Should -Be 'Removed'
+            @($catalog.Records['six==1.16.0'].groups).Count | Should -Be 0
+            $events = @(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'Six')
+            $events[0].action | Should -Be 'Reconciled'
+            $events[0].detail | Should -Match 'Published -> Removed'
+            Sync-WheelhouseCatalog -Catalog $catalog | Should -Be $false
+        }
+
+        It 'records audit, scan and PyPI results and their changes' {
+            $wheelhouse = Get-TestWheelhouse
+            $reports = Get-TestFolder
+            Update-WheelhouseCatalog -WheelhousePath $wheelhouse -DenylistPath (Join-Path $reports 'deny.json')
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+
+            $clean = Join-Path $reports 'clean.json'
+            Set-Content -Path $clean -Value '{"dependencies":[{"name":"six","version":"1.16.0","vulns":[]},{"name":"attrs","version":"23.1.0","vulns":[]}]}'
+            $passed = @(
+                [PSCustomObject]@{ Service = 'osv'; Status = 'Passed'; ReportPath = $clean; GroupFile = 'x' },
+                [PSCustomObject]@{ Service = 'pypi'; Status = 'Passed'; ReportPath = $clean; GroupFile = 'x' })
+            Update-CatalogAuditResult -Catalog $catalog -AuditResult $passed
+            $catalog.Records['six==1.16.0'].checks.audit.status | Should -Be 'Passed'
+            $catalog.Records['six==1.16.0'].checks.audit.last_ok | Should -Not -BeNullOrEmpty
+
+            # Only one service ran: one service's Passed is not enough on its own...
+            $fresh = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            Update-CatalogAuditResult -Catalog $fresh -AuditResult @($passed[0])
+            $fresh.Records['six==1.16.0'].checks.audit.status | Should -Be 'Unknown'
+
+            # ...a vulnerability from one service is.
+            $bad = Join-Path $reports 'bad.json'
+            Set-Content -Path $bad -Value '{"dependencies":[{"name":"attrs","version":"23.1.0","vulns":[{"id":"GHSA-1"}]}]}'
+            Update-CatalogAuditResult -Catalog $catalog -AuditResult @([PSCustomObject]@{ Service = 'osv'; Status = 'Vulnerable'; ReportPath = $bad; GroupFile = 'x' })
+            $catalog.Records['attrs==23.1.0'].checks.audit.status | Should -Be 'Vulnerable'
+            @($catalog.Records['attrs==23.1.0'].checks.audit.vulnerabilities) -join ',' | Should -Be 'GHSA-1'
+            (Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'attrs')[0].detail | Should -Match 'Passed -> Vulnerable: GHSA-1'
+
+            # An audit that could not run never turns a status into Passed.
+            $groupFile = Join-Path $wheelhouse 'requirements-1.txt'
+            Update-CatalogAuditResult -Catalog $catalog -AuditResult @([PSCustomObject]@{ Service = 'osv'; Status = 'Error'; ReportPath = 'none'; GroupFile = $groupFile; Message = 'timeout' })
+            $catalog.Records['attrs==23.1.0'].checks.audit.status | Should -Be 'Vulnerable'
+            $catalog.Records['attrs==23.1.0'].checks.audit.services['osv'].error | Should -Be 'timeout'
+
+            # A whole-wheelhouse scan covers every file; a scan of another folder covers none.
+            $attrsPath = Join-Path $wheelhouse 'attrs-23.1.0-py3-none-any.whl'
+            Update-CatalogScanResult -Catalog $catalog -ScanResult ([PSCustomObject]@{ Status = 'Threat'; ScannedPaths = @($wheelhouse); Threats = @([PSCustomObject]@{ Resource = "file:_$attrsPath"; ThreatName = 'X' }) })
+            $catalog.Records['attrs==23.1.0'].checks.scan.status | Should -Be 'Threat'
+            $catalog.Records['six==1.16.0'].checks.scan.status | Should -Be 'Clean'
+            Update-CatalogScanResult -Catalog $catalog -ScanResult ([PSCustomObject]@{ Status = 'Clean'; ScannedPaths = @((Get-TestFolder)); Threats = @() })
+            $catalog.Records['attrs==23.1.0'].checks.scan.status | Should -Be 'Threat'
+            Update-CatalogScanResult -Catalog $catalog -ScanResult ([PSCustomObject]@{ Status = 'Error'; ScannedPaths = @($wheelhouse); Threats = @() })
+            $catalog.Records['attrs==23.1.0'].checks.scan.status | Should -Be 'Threat'
+
+            Update-CatalogPyPIResult -Catalog $catalog -Checked @([PSCustomObject]@{ Package = 'six'; Version = '1.16.0'; Yanked = $true; Reason = 'broken' })
+            Save-WheelhouseCatalog -Catalog $catalog
+
+            # The UI's inventory reads all of it from the catalog.
+            $rows = @{}
+            foreach ($row in (Get-WheelhousePackage -WheelhousePath $wheelhouse).Packages) { $rows[$row.name] = $row }
+            $rows['attrs'].audit_status | Should -Be 'Vulnerable'
+            $rows['attrs'].scan_status | Should -Be 'Threat'
+            $rows['six'].yanked | Should -Be 'broken'
+            $rows['six'].scan_status | Should -Be 'Clean'
+        }
+
+        It 'keeps timestamps ISO through a read and save (PowerShell 7 parses them into [datetime])' {
+            # Regression: [string] of a parsed [datetime] gave "01/01/2026 00:00:00".
+            $wheelhouse = Get-TestWheelhouse
+            Update-WheelhouseCatalog -WheelhousePath $wheelhouse -DenylistPath (Join-Path $wheelhouse 'd.json')
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Records['six==1.16.0'].checks.audit = [ordered]@{
+                status = 'Passed'; last_run = '2026-01-01T00:00:00.0000000Z'; last_ok = '2026-01-01T00:00:00.0000000Z'; vulnerabilities = @()
+                services = [ordered]@{ osv = [ordered]@{ status = 'Passed'; last_run = '2026-01-01T00:00:00.0000000Z'; vulnerabilities = @(); last_error = ''; error = '' } }
+            }
+            Save-WheelhouseCatalog -Catalog $catalog
+
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Records['six==1.16.0'].checks.audit.last_ok | Should -Be '2026-01-01T00:00:00.0000000Z'
+            $failedAudit = [PSCustomObject]@{ Service = 'osv'; Status = 'Error'; ReportPath = 'none'; GroupFile = (Join-Path $wheelhouse 'requirements-1.txt'); Message = 'down' }
+            Update-CatalogAuditResult -Catalog $catalog -AuditResult @($failedAudit) -Services @('osv')
+            # A failed audit records the error but does not count as a fresh audit.
+            $catalog.Records['six==1.16.0'].checks.audit.last_run | Should -Be '2026-01-01T00:00:00.0000000Z'
+            $catalog.Records['six==1.16.0'].checks.audit.services['osv'].error | Should -Be 'down'
+            Save-WheelhouseCatalog -Catalog $catalog
+
+            $raw = Get-Content -Path (Get-WheelhouseCatalogPath -WheelhousePath $wheelhouse) -Raw
+            $raw | Should -Match '"last_ok":\s*"2026-01-01T00:00:00'
+            $raw | Should -Not -Match '01/01/2026'
+        }
+
+        It 'refuses a damaged catalog and skips unreadable history lines' {
+            $wheelhouse = Get-TestFolder
+            Set-Content -Path (Join-Path $wheelhouse 'catalog.json') -Value '{ broken'
+            { Read-WheelhouseCatalog -WheelhousePath $wheelhouse } | Should -Throw '*could not be parsed*'
+
+            Write-WheelhouseEvent -WheelhousePath $wheelhouse -Action 'One' -Package 'a' -Version '1'
+            Add-Content -Path (Join-Path $wheelhouse 'events.jsonl') -Value 'not json'
+            Write-WheelhouseEvent -WheelhousePath $wheelhouse -Action 'Two' -Package 'b' -Version '1'
+            (@(Read-WheelhouseEvent -WheelhousePath $wheelhouse) | ForEach-Object { $_.action }) -join ',' | Should -Be 'Two,One'
+            (@(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'A') | ForEach-Object { $_.action }) -join ',' | Should -Be 'One'
+        }
+    }
+
+    Context 'Journal' {
+        It 'finishes an interrupted publish: manifest and pin only for wheels that arrived intact' {
+            $wheelhouse = Get-TestWheelhouse
+            $denyPath = Join-Path $wheelhouse 'denylist.json'
+            $group = Join-Path $wheelhouse 'requirements-1.txt'
+            # newpkg was copied in; brokenpkg's copy never completed.
+            Set-Content -Path (Join-Path $wheelhouse 'newpkg-1.0-py3-none-any.whl') -Value 'new wheel'
+            Set-Content -Path (Join-Path $wheelhouse 'brokenpkg-1.0-py3-none-any.whl.partial') -Value 'half'
+            $entry = { param($n, $hash) [ordered]@{ name = $n; version = '1.0'; file = "$n-1.0-py3-none-any.whl"; sha256 = $hash; python_tag = 'py3'; abi_tag = 'none'; platform_tag = 'any'; downloaded_utc = '2026-01-01T00:00:00Z' } }
+            $data = [ordered]@{
+                group_file = $group
+                entries    = @((& $entry 'newpkg' (Get-FileHash -Path (Join-Path $wheelhouse 'newpkg-1.0-py3-none-any.whl')).Hash), (& $entry 'brokenpkg' 'ABC'))
+                additions  = @([ordered]@{ name = 'newpkg'; version = '1.0' }, [ordered]@{ name = 'brokenpkg'; version = '1.0' })
+            }
+            [void](New-WheelhouseJournal -WheelhousePath $wheelhouse -Operation 'publish' -Data $data)
+
+            $lock = Open-WheelhouseWrite -WheelhousePath $wheelhouse -DenylistPath $denyPath
+            Exit-WheelhouseLock -Lock $lock
+
+            @((Read-WheelhouseManifest -WheelhousePath $wheelhouse).name) -join ',' | Should -Be 'six,attrs,newpkg'
+            (Get-Content -Path $group) -join ',' | Should -Be 'six==1.16.0,attrs==23.1.0,newpkg==1.0'
+            Test-Path -Path (Join-Path $wheelhouse 'brokenpkg-1.0-py3-none-any.whl.partial') | Should -Be $false
+            @(Get-ChildItem -Path (Get-WheelhouseJournalFolder -WheelhousePath $wheelhouse) -Filter '*.json').Count | Should -Be 0
+            (Read-WheelhouseCatalog -WheelhousePath $wheelhouse).Records['newpkg==1.0'].state | Should -Be 'Published'
+            @(Read-WheelhouseEvent -WheelhousePath $wheelhouse | Where-Object { $_.action -eq 'Recovered' }).Count | Should -Be 1
+        }
+
+        It 'finishes an interrupted quarantine' {
+            $wheelhouse = Get-TestWheelhouse
+            $denyPath = Join-Path $wheelhouse 'denylist.json'
+            $manifest = Read-WheelhouseManifest -WheelhousePath $wheelhouse
+            $folder = Join-Path (Get-WheelhouseQuarantinePath -WheelhousePath $wheelhouse) 'q1'
+            $record = [ordered]@{ id = 'q1'; name = 'six'; version = '1.16.0'; files = @($manifest | Where-Object { $_.name -eq 'six' }); groups = @('requirements-1.txt'); reason = 'test' }
+            [void](New-WheelhouseJournal -WheelhousePath $wheelhouse -Operation 'remove' -Data ([ordered]@{
+                        name = 'six'; version = '1.16.0'; mode = 'Quarantine'; files = @('six-1.16.0-py3-none-any.whl')
+                        groups = @((Join-Path $wheelhouse 'requirements-1.txt')); quarantine_folder = $folder; quarantine_record = $record
+                        deny = $true; deny_reason = 'test (quarantined)'; deny_source = 'quarantined'
+                    }))
+
+            Repair-WheelhouseJournal -WheelhousePath $wheelhouse -DenylistPath $denyPath
+
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'attrs==23.1.0'
+            @((Read-WheelhouseManifest -WheelhousePath $wheelhouse).name) -join ',' | Should -Be 'attrs'
+            Test-Path -Path (Join-Path $folder 'six-1.16.0-py3-none-any.whl') | Should -Be $true
+            @(Get-QuarantinedPackage -WheelhousePath $wheelhouse).Count | Should -Be 1
+            (Get-DenylistMatch -Name 'six' -Version '1.16.0' -Denylist @(Read-WheelhouseDenylist -Path $denyPath)).source | Should -Be 'quarantined'
+            (Read-WheelhouseCatalog -WheelhousePath $wheelhouse).Records['six==1.16.0'].state | Should -Be 'Quarantined'
+        }
+
+        It 'stops, and releases the lock, when a journal cannot be read' {
+            $wheelhouse = Get-TestFolder
+            $folder = Get-WheelhouseJournalFolder -WheelhousePath $wheelhouse
+            New-Item -ItemType Directory -Path $folder | Out-Null
+            Set-Content -Path (Join-Path $folder '20260101_000000_publish_x.json') -Value '{ broken'
+            { Open-WheelhouseWrite -WheelhousePath $wheelhouse -DenylistPath (Join-Path $wheelhouse 'd.json') } | Should -Throw '*could not be read*'
+            Test-Path -Path (Join-Path $wheelhouse '.wheelhouse.lock') | Should -Be $false
+        }
+
+        It 'leaves no journal behind after a normal remove and restore, and records the history' {
+            $wheelhouse = Get-TestWheelhouse
+            $denyPath = Join-Path $wheelhouse 'denylist.json'
+            $done = Remove-WheelhousePackage -WheelhousePath $wheelhouse -Name 'six' -Version '1.16.0' -Quarantine -Reason 'suspicious' -DenylistPath $denyPath
+            (Read-WheelhouseCatalog -WheelhousePath $wheelhouse).Records['six==1.16.0'].state | Should -Be 'Quarantined'
+            [void](Restore-WheelhousePackage -WheelhousePath $wheelhouse -Id $done.QuarantineId -DenylistPath $denyPath)
+            (Read-WheelhouseCatalog -WheelhousePath $wheelhouse).Records['six==1.16.0'].state | Should -Be 'Published'
+            @(Get-ChildItem -Path (Get-WheelhouseJournalFolder -WheelhousePath $wheelhouse) -Filter '*.json').Count | Should -Be 0
+            $actions = @(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'six' | ForEach-Object { $_.action })
+            $actions -join ',' | Should -Be 'Restored,Quarantined'
+            (Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'six')[1].detail | Should -Match 'suspicious'
+        }
+    }
+
+    Context 'Invoke-WheelhouseSync' {
+        BeforeEach {
+            $global:WhmReleases = @{
+                newpkg = (New-TestRelease -Name 'newpkg')
+                attrs  = (New-TestRelease -Name 'attrs' -Version '24.0')
+            }
+            $global:WhmNoWheel = @()
+            $global:WhmWheelOverride = @{}
+            $global:WhmScanStatus = 'Clean'
+            $global:WhmThreatPackage = $null
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-GroupAudit -MockWith {
+                , @([PSCustomObject]@{ PSTypeName = 'Wheelhouse.AuditResult'; Stage = $Stage; Group = 'g'; GroupFile = $GroupFile; Service = 'osv'; Status = 'Passed'; ReportPath = 'none'; Message = 'm' })
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Test-PackageAge -MockWith $script:intakeAgeMock
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -MockWith $script:intakeDownloadMock
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-WheelhouseDefenderScan -MockWith $script:intakeScanMock
+        }
+
+        It 'merges, checks and publishes, a second version into a new group, and records everything' {
+            $wheelhouse = Get-TestWheelhouse
+            $work = Get-TestFolder
+            $local = Join-Path $work 'requirements.txt'
+            Set-Content -Path $local -Value @('newpkg==1.0', 'six==1.16.0', 'attrs==24.0')
+            $syncParams = @{
+                WheelhousePath        = $wheelhouse
+                ReportsFolder         = $work
+                LocalRequirementsPath = $local
+                PythonVersion         = '3.14'
+                Platform              = 'win_amd64'
+                MinimumAgeDays        = 10
+                Services              = @('osv')
+                DenylistPath          = (Join-Path $work 'denylist.json')
+                StagingRoot           = (Join-Path $work 'staging')
+            }
+            $result = Invoke-WheelhouseSync @syncParams
+
+            $result.Outcome | Should -Be 'Ok'
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'six==1.16.0,attrs==23.1.0,newpkg==1.0'
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-2.txt')) -join ',' | Should -Be 'attrs==24.0'
+            $manifest = Read-WheelhouseManifest -WheelhousePath $wheelhouse
+            @($manifest | ForEach-Object { "$($_.name)==$($_.version)" } | Sort-Object) -join ',' |
+                Should -Be 'attrs==23.1.0,attrs==24.0,newpkg==1.0,six==1.16.0'
+            @($result.Published).Count | Should -Be 2
+            @($result.AuditResults | Where-Object { $_.Stage -eq 'Deployed' }).Count | Should -Be 1
+
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Records['attrs==24.0'].state | Should -Be 'Published'
+            $catalog.Records['attrs==24.0'].groups -join ',' | Should -Be 'requirements-2.txt'
+            # The intake scan of the staged download is the published wheel's scan result.
+            $catalog.Records['attrs==24.0'].checks.scan.status | Should -Be 'Clean'
+            @(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'newpkg')[0].action | Should -Be 'Published'
+
+            foreach ($name in '.wheelhouse.lock', '.wheelhouse-sync.lock') { Test-Path -Path (Join-Path $wheelhouse $name) | Should -Be $false }
+            @(Get-ChildItem -Path (Join-Path $work 'staging') -Force).Count | Should -Be 0
+            @(Get-ChildItem -Path (Get-WheelhouseJournalFolder -WheelhousePath $wheelhouse) -Filter '*.json').Count | Should -Be 0
+        }
+
+        It 'takes out a wheel the file server removed and carries on - or stops when AutoQuarantine is off' {
+            $wheelhouse = Get-TestWheelhouse
+            $work = Get-TestFolder
+            Remove-Item -Path (Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl')
+            $syncParams = @{
+                WheelhousePath = $wheelhouse; ReportsFolder = $work; LocalRequirementsPath = ''; PythonVersion = '3.14'; Platform = 'win_amd64'
+                MinimumAgeDays = 10; Services = @('osv'); DenylistPath = (Join-Path $work 'denylist.json'); StagingRoot = (Join-Path $work 'staging')
+            }
+
+            $syncParams['AutoQuarantine'] = $false
+            { Invoke-WheelhouseSync @syncParams } | Should -Throw '*integrity check failed*'
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'six==1.16.0,attrs==23.1.0'
+
+            $syncParams['AutoQuarantine'] = $true
+            $result = Invoke-WheelhouseSync @syncParams
+            $result.Outcome | Should -Be 'Attention'
+            ($result.Notices | ForEach-Object { "$($_.Kind):$($_.Package)" }) -join ',' | Should -Be 'FileMissing:six'
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'attrs==23.1.0'
+            (Get-DenylistMatch -Name 'six' -Version '1.16.0' -Denylist @(Read-WheelhouseDenylist -Path (Join-Path $work 'denylist.json'))).reason | Should -Match "file server's antivirus"
+            (Read-WheelhouseCatalog -WheelhousePath $wheelhouse).Records['six==1.16.0'].state | Should -Be 'Removed'
+            # The share is not virus-scanned by the update run.
+            @(Get-ChildItem -Path $work -Filter 'Report_Scan_*.json').Count | Should -Be 0
+        }
+
+        It 'reports rejections as needing attention and refuses a second run' {
+            $wheelhouse = Get-TestWheelhouse
+            $work = Get-TestFolder
+            $local = Join-Path $work 'requirements.txt'
+            Set-Content -Path $local -Value @('newpkg==1.0')
+            $global:WhmNoWheel = @('newpkg')
+            $syncParams = @{
+                WheelhousePath = $wheelhouse; ReportsFolder = $work; LocalRequirementsPath = $local; PythonVersion = '3.14'; Platform = 'win_amd64'
+                MinimumAgeDays = 10; Services = @('osv'); DenylistPath = (Join-Path $work 'denylist.json'); StagingRoot = (Join-Path $work 'staging')
+            }
+            $result = Invoke-WheelhouseSync @syncParams
+            $result.Outcome | Should -Be 'Attention'
+            $result.Rejected[0].Category | Should -Be 'no-wheel'
+            @(Get-ChildItem -Path $work -Filter 'Report_Rejected_*.json').Count | Should -Be 1
+
+            $sync = Enter-WheelhouseLock -WheelhousePath $wheelhouse -Kind sync
+            try {
+                try { Invoke-WheelhouseSync @syncParams } catch { $busy = $_ }
+            }
+            finally {
+                Exit-WheelhouseLock -Lock $sync
+            }
+            Get-WheelhouseExitCode -ErrorRecord $busy | Should -Be 3
+        }
+
+        It 'does not publish a version that was denylisted while its checks ran' {
+            $wheelhouse = Get-TestWheelhouse
+            $work = Get-TestFolder
+            $denyPath = Join-Path $work 'denylist.json'
+            $intakeParams = @{
+                Packages = @{ newpkg = '1.0' }; GroupName = 'requirements-1'; ReportsFolder = $work; Services = @('osv')
+                MinimumAgeDays = 10; PythonVersion = '3.14'; Platform = 'win_amd64'; StagingRoot = (Join-Path $work 'staging')
+            }
+            $intake = Invoke-CandidateIntake @intakeParams
+            $intake.Verified.Count | Should -Be 1
+            [void](Add-WheelhouseDenylistEntry -Name 'newpkg' -Version '1.0' -Reason 'bad news' -Path $denyPath)
+
+            $publish = Publish-CandidateIntake -Intake $intake -WheelhousePath $wheelhouse -GroupFile (Join-Path $wheelhouse 'requirements-1.txt') -Additions @{ newpkg = '1.0' } -DenylistPath $denyPath
+            $publish.Accepted.Count | Should -Be 0
+            $publish.Rejected[0].Reason | Should -Match 'denylisted while the checks ran.*bad news'
+            Test-Path -Path (Join-Path $wheelhouse 'newpkg-1.0-py3-none-any.whl') | Should -Be $false
+            Test-Path -Path $intake.StagingPath | Should -Be $false
+        }
+    }
+
     Context 'Remove-RequirementFromGroupFile' {
         It 'removes the pin and its hash lines and leaves the rest' {
             $file = Join-Path (Get-TestFolder) 'requirements-1.txt'
@@ -1123,6 +1578,16 @@ Describe 'WheelhouseManager' {
             Remove-RequirementFromGroupFile -GroupFile $file -Name 'ANYIO' -Version '4.0.0' | Should -Be $true
             Remove-RequirementFromGroupFile -GroupFile $file -Name 'six' -Version '9.9' | Should -Be $false
             (Get-Content -Path $file) -join ',' | Should -Be 'six==1.16.0,Other_Pkg==2.0'
+        }
+
+        It 'leaves an empty file when the last pin goes, so the next pin is not preceded by a blank line' {
+            $file = Join-Path (Get-TestFolder) 'requirements-1.txt'
+            Set-Content -Path $file -Value 'six==1.16.0'
+            Remove-RequirementFromGroupFile -GroupFile $file -Name 'six' -Version '1.16.0' | Should -Be $true
+            # (Windows PowerShell 5.1 still writes a UTF-8 BOM - no content, no line.)
+            @(Get-Content -Path $file).Count | Should -Be 0
+            Add-RequirementToGroupFile -GroupFile $file -Name 'attrs' -Version '23.1.0'
+            @(Get-Content -Path $file) -join '|' | Should -Be 'attrs==23.1.0'
         }
     }
 
@@ -1303,8 +1768,11 @@ Describe 'WheelhouseManager' {
             { ConvertTo-WheelhouseSettingValue -Key 'WheelhousePath' -Value (Join-Path $TestDrive 'does-not-exist') } | Should -Throw -ExceptionType ([System.ArgumentException])
             ConvertTo-WheelhouseSettingValue -Key 'WheelhousePath' -Value (Get-TestFolder) | Should -Not -BeNullOrEmpty
             ConvertTo-WheelhouseSettingValue -Key 'RequireDefenderScanAtIntake' -Value $true | Should -Be $true
-            ConvertTo-WheelhouseSettingValue -Key 'DefenderScanInScheduledCheck' -Value 'false' | Should -Be $false
-            { ConvertTo-WheelhouseSettingValue -Key 'DefenderScanInScheduledCheck' -Value 'sometimes' } | Should -Throw -ExceptionType ([System.ArgumentException])
+            ConvertTo-WheelhouseSettingValue -Key 'AutoQuarantine' -Value 'false' | Should -Be $false
+            { ConvertTo-WheelhouseSettingValue -Key 'AutoQuarantine' -Value 'sometimes' } | Should -Throw -ExceptionType ([System.ArgumentException])
+            # Settings hold a bool, command lines On/Off.
+            (@($true, 'On', 'on', 'True', '1', 'Yes') | ForEach-Object { ConvertTo-WheelhouseBoolean $_ }) -join ',' | Should -Be 'True,True,True,True,True,True'
+            (@($false, 'Off', '', $null, 'no') | ForEach-Object { ConvertTo-WheelhouseBoolean $_ }) -join ',' | Should -Be 'False,False,False,False,False'
         }
 
         It 'returns services as an array and refuses an empty or unknown selection' {
@@ -1345,6 +1813,39 @@ Describe 'WheelhouseManager' {
             $status = Get-PackageScanStatus -ReportsFolder $reports -WheelhousePath $wheelhouse -File @('bad-1.0-py3-none-any.whl', 'good-1.0-py3-none-any.whl')
             $status['bad-1.0-py3-none-any.whl'].Status | Should -Be 'Threat'
             $status['good-1.0-py3-none-any.whl'].Status | Should -Be 'Clean'
+        }
+
+        It 'scans hash-checked local copies, reports the share files, and skips changed ones' {
+            $wheelhouse = Get-TestWheelhouse
+            $reports = Join-Path $wheelhouse 'reports'
+            New-Item -ItemType Directory -Path $reports | Out-Null
+            Set-Content -Path (Join-Path $wheelhouse 'attrs-23.1.0-py3-none-any.whl') -Value 'changed on the share'
+            $global:WhmScanDetections = $null
+            Mock -ModuleName WheelhouseManager -CommandName Test-WheelhouseDefenderAvailable -MockWith { $true }
+            # Defender is pointed at the local copy and "finds" six in it.
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-MpScan -MockWith { $global:WhmScannedPath = $Path; $global:WhmScanDetections = @(Get-ChildItem -Path $Path -Filter 'six-*') }
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseThreatDetection -MockWith {
+                @($global:WhmScanDetections | ForEach-Object { [PSCustomObject]@{ Resource = "file:_$($_.FullName)"; ThreatName = 'Trojan:Test'; ThreatId = '1'; ActionSuccess = $true } })
+            }
+
+            $result = Invoke-WheelhouseCopyScan -WheelhousePath $wheelhouse -ReportsFolder $reports -StagingRoot (Join-Path (Get-TestFolder) 'staging')
+
+            $result.Status | Should -Be 'Threat'
+            $result.Threats[0].Resource | Should -Be "file:_$(Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl')"
+            @($result.ScannedPaths) -join ',' | Should -Be (Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl')
+            @($result.NotScanned).Count | Should -Be 1
+            $result.NotScanned[0] | Should -Match 'attrs-23.1.0.*does not match its recorded hash'
+            Test-Path -Path $result.ReportPath | Should -Be $true
+            # Defender scanned the local copy, never the share; recording the result marks the share file.
+            $global:WhmScannedPath | Should -Not -BeLike "$wheelhouse*"
+            $recorded = $result
+            Update-WheelhouseCatalog -WheelhousePath $wheelhouse -DenylistPath (Join-Path $reports 'd.json') -Update ({ param($c) Update-CatalogScanResult -Catalog $c -ScanResult $recorded }.GetNewClosure())
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Records['six==1.16.0'].checks.scan.status | Should -Be 'Threat'
+            $catalog.Records['attrs==23.1.0'].checks.scan | Should -BeNullOrEmpty
+
+            { Invoke-WheelhouseCopyScan -WheelhousePath $wheelhouse -File @('ghost-1.0-py3-none-any.whl') -StagingRoot (Join-Path (Get-TestFolder) 'staging') } |
+                Should -Throw -ExceptionType ([System.Collections.Generic.KeyNotFoundException])
         }
 
         It 'is Clean when the scan finished without detections, and Error when a scan failed' {
@@ -1498,11 +1999,11 @@ Describe 'WheelhouseManager' {
 
         It 'saves on/off settings' {
             $m = Get-TestManager
-            $saved = Invoke-WheelhouseUiApi -Method POST -Path '/api/settings' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"updates":{"DefenderScanInScheduledCheck":true}}')
+            $saved = Invoke-WheelhouseUiApi -Method POST -Path '/api/settings' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"updates":{"AutoQuarantine":false}}')
             $saved.Status | Should -Be 200
-            (Get-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1')).DefenderScanInScheduledCheck | Should -Be $true
+            (Get-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1')).AutoQuarantine | Should -Be $false
             $values = (Invoke-WheelhouseUiApi -Method GET -Path '/api/settings' -ManagerRoot $m.Root).Body.values
-            $values['DefenderScanInScheduledCheck'] | Should -Be $true
+            $values['AutoQuarantine'] | Should -Be $false
             $values['RequireDefenderScanAtIntake'] | Should -Be $false
             (Invoke-WheelhouseUiApi -Method POST -Path '/api/settings' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"updates":{"RequireDefenderScanAtIntake":"maybe"}}')).Status | Should -Be 400
         }
@@ -1525,6 +2026,23 @@ Describe 'WheelhouseManager' {
             $restore = Invoke-WheelhouseUiApi -Method POST -Path '/api/quarantine/restore' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson "{`"id`":`"$($quarantine.Body.items[0].id)`"}")
             $restore.Status | Should -Be 200
             @((Invoke-WheelhouseUiApi -Method GET -Path '/api/denylist' -ManagerRoot $m.Root).Body.items).Count | Should -Be 0
+        }
+
+        It 'shows a package version''s state and history' {
+            $m = Get-TestManager
+            $body = ConvertFrom-TestJson '{"packages":[{"name":"six","version":"1.16.0"}],"mode":"quarantine","reason":"looks odd"}'
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/remove' -ManagerRoot $m.Root -Body $body).Status | Should -Be 200
+
+            $history = Invoke-WheelhouseUiApi -Method GET -Path '/api/packages/Six/1.16.0/history' -ManagerRoot $m.Root
+            $history.Status | Should -Be 200
+            $history.Body.record.state | Should -Be 'Quarantined'
+            $history.Body.events[0].action | Should -Be 'Quarantined'
+            $history.Body.events[0].detail | Should -Match 'looks odd'
+            # The JSON the browser gets keeps lists as lists.
+            ($history.Body | ConvertTo-Json -Depth 8 -Compress) | Should -Match '"events":\['
+
+            (Invoke-WheelhouseUiApi -Method GET -Path '/api/packages/nothing/1.0/history' -ManagerRoot $m.Root).Status | Should -Be 404
+            (Invoke-WheelhouseUiApi -Method GET -Path '/api/packages/six/1.0;x/history' -ManagerRoot $m.Root).Status | Should -Be 404
         }
 
         It 'validates removal requests' {

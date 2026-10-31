@@ -467,7 +467,30 @@ Implemented as listed below, with these decisions:
 Acceptance: a wheel never appears in the share before its hash and AV checks pass, and the
 existing tests plus new ones pass under 5.1 and 7.
 
-### Phase 1 - Foundation: restructure + catalog (M-L)
+### Phase 1 - Foundation: restructure + catalog (M-L) - DONE 2026-10-31
+
+Implemented, with these decisions:
+
+- **Group files are not generated from the catalog.** Clients install from them with
+  `uv pip install -r` (decision D1), so they must stay stable. They remain the source of group
+  membership; the catalog follows them on every write.
+- **Catalog (`catalog.json`) and history (`events.jsonl`) live on the share next to the manifest.**
+  The catalog is derived: it can always be rebuilt from manifest, group files and quarantine. It is
+  created automatically on first use and imports the latest report results and quarantine records.
+- **Locks are split in two.** A short write lock (`Open-WheelhouseWrite` = lock + journal repair)
+  covers every change. A sync lock allows one update run at a time. Intake is split into
+  `Invoke-CandidateIntake` (checks, unlocked) and `Publish-CandidateIntake` (write lock, re-reads
+  manifest and denylist).
+- **The journal covers publish, remove and restore, rolling them forward.** Publish and restore use
+  the same `Complete-*` functions as the repair.
+- **The worker moved into `Invoke-WheelhouseSync`.** `Update-Wheelhouse.ps1` is thin.
+- **Shared validation** (`Test-WheelhousePackageName`, ..., `ConvertTo-WheelhousePin`) replaces five
+  copies. The UI's `switch` became a route table (`Get-WheelhouseUiRoute`) with `Wheelhouse`/`Idle`
+  flags.
+- **UI additions (pulled forward from Phase 4):** a per-package History dialog
+  (`GET /api/packages/<name>/<version>/history`), and a "yanked" badge and filter.
+- **Not done:** the module folder reorganization into Domain/Adapters/Services (section 6.1). Files
+  stay flat by domain; the layering is kept by convention.
 
 - Move the worker into `Invoke-WhSync`. Centralize patterns. Add the Ui route table.
 - Introduce `catalog.json` and `events.jsonl`. On first run, migrate them from manifest, group
@@ -480,6 +503,19 @@ Acceptance: behavior is unchanged for existing commands, migration is lossless (
 backup), and a page load does no report parsing.
 
 ### Phase 2 - Continuous re-evaluation and policy (M-L) - **the core requirement**
+
+Started 2026-10-31 with the antivirus scope decision (D5) and the automatic-quarantine switch (D2):
+
+- **Removed:** the whole-share Defender scan at the end of every update, the scheduled rescan
+  option (`DefenderScanInScheduledCheck`, `-DefenderScan`) and the Defender-history matching for
+  missing files.
+- **Added:** wheels removed or changed on the share become `FileMissing` / `FileModified` notices.
+  With `AutoQuarantine` on (the default) they are taken out or quarantined, and denylisted, by the
+  weekly check or the next update; with it off, they are only reported and updates stop. On-demand
+  scans copy and hash-check wheels locally first. The intake scan result is recorded in the catalog.
+- **Still to do in this phase:** OSV severity (needs D4), due dates and escalation, waivers, malware
+  advisories (`MAL-*`) under `AutoQuarantine`, the Unverified state and heartbeat, stateful
+  alerts, untracked wheels moved out.
 
 - `Invoke-WhMonitor` with every signal in section 4.2, plus the policy settings.
 - Severity enrichment and due dates; Unverified state, heartbeat, escalation.
@@ -543,11 +579,11 @@ depends on the catalog. After that, 3, 4 and 5 can be reordered by priority.
 
 | # | Question | Recommendation |
 |---|---|---|
-| D1 | Do clients install with `-r requirements-N.txt`, or only by name against the flat index? This decides whether group files must stay stable and whether named sets are worth building. | Confirm actual usage. If clients only install by name, group files become purely internal. |
-| D2 | Should auto-quarantine be on by default for malware advisories and Defender detections? | Yes: there is no legitimate reason to keep serving them, and the action is reversible. CVEs stay Flag + deadline. |
+| D1 | Do clients install with `-r requirements-N.txt`, or only by name against the flat index? This decides whether group files must stay stable and whether named sets are worth building. | **Answered:** clients do use `-r requirements-N.txt`. Group files stay stable and are never regenerated (Phase 1). |
+| D2 | Should auto-quarantine be on by default? | **Answered:** yes, with a switch in the UI and on the command line: setting `AutoQuarantine` (default on), `-AutoQuarantine On|Off` per run. Today it covers wheels removed or changed on the share; Phase 2 adds malware advisories (and optionally a severity threshold) under the same switch. |
 | D3 | Is a separate approver required (four-eyes), or can the requester approve their own proposal? | Configurable, default "same person allowed, recorded". |
-| D4 | Can the manager server reach `api.osv.dev` (for severity) as well as `pypi.org`? | Needed for severity. Without it, every finding is treated as High. |
-| D5 | Can a scheduled task run elevated (or as SYSTEM) for Defender rescans? | Yes, as a separate task with no other duties. |
+| D4 | Can the manager server reach `api.osv.dev` (for severity) as well as `pypi.org`? | **Open.** Explained: pip-audit gives no severity; OSV returns it per advisory ID (only the ID is sent). With the default `osv` service, pip-audit already queries `api.osv.dev`. Without it, every advisory counts as High. |
+| D5 | Should a scheduled task re-scan the wheelhouse with Defender? | **Answered: no.** Virus scanning of the share is the file server antivirus' job and out of scope. Defender scanning a share also runs as the computer account and may skip network files, so such scans were removed. The tool scans new downloads locally at intake, offers on-demand scans of hash-checked local copies, and detects wheels the file server's antivirus removed or changed (integrity check -> `FileMissing`/`FileModified`, taken out with `AutoQuarantine`). |
 | D6 | Does uv's flat index ignore subfolders (needed for `_staging`, `_untracked`, `_quarantine`)? Today's `_quarantine` already relies on this. | Verify with the deployed uv version before Phase 0. |
 | D7 | Should alerts also go to Teams/Slack or the Event Log? | Webhook + Event Log in Phase 5. |
 | D8 | Should the CLI be one `whm.ps1` dispatcher, module cmdlets only, or both? | Both: cmdlets for scripting, `whm` for people. |

@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Microsoft Defender scan of the wheelhouse (whole folder or chosen files)
+# Microsoft Defender: intake scans of staged downloads, on-demand scans of local copies
 # ---------------------------------------------------------------------------
 
 function Test-WheelhouseDefenderAvailable {
@@ -45,37 +45,112 @@ function Get-WheelhouseThreatDetection {
     }
 }
 
-function Find-DefenderRemovedWheel {
-    # Of the given manifest entries (whose wheel file is missing), returns those that
-    # Microsoft Defender detected - Defender quarantines or deletes such a file itself.
-    # Returns { Entry; ThreatName; Resource } per explained entry. Returns nothing when
-    # Defender's detection history cannot be read, so the caller still treats the files as
-    # missing (fail closed).
+function Invoke-WheelhouseCopyScan {
+    # On-demand Defender scan of published wheels that does not depend on how Defender
+    # treats the share. Defender reads network paths as the computer account, and a policy
+    # can skip network files altogether, so a scan of the share could report Clean without
+    # reading anything. Instead, the wheels (-File, or every tracked wheel) are copied to a
+    # local staging folder, each copy's SHA256 is checked against the manifest, and the
+    # copies are scanned. A detection in a copy applies to the share file: both have the
+    # hash recorded at publish.
+    # Returns a Wheelhouse.ScanResult naming the wheelhouse files (ScannedPaths,
+    # Threats.Resource), so it is recorded like a scan of the share; Status describes the
+    # scanned files. Wheels that could not be copied or whose hash differs are not scanned
+    # and are listed in NotScanned (the integrity check deals with those).
+    # Routine scanning of the share is the file server's antivirus' job, not this tool's.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Entry,
+        [string]$WheelhousePath,
 
-        [Parameter(Mandatory)]
-        [string]$WheelhousePath
+        # Wheel file names to scan; none = every wheel in the manifest.
+        [AllowEmptyCollection()]
+        [string[]]$File = @(),
+
+        [string]$ReportsFolder,
+
+        [string]$StagingRoot = (Join-Path $script:ManagerRoot 'staging')
     )
 
-    if ($Entry.Count -eq 0 -or -not (Test-WheelhouseDefenderAvailable)) { return }
-    try {
-        $detections = @(Get-WheelhouseThreatDetection -Since ([datetime]::MinValue))
-    }
-    catch {
-        Write-Log "Microsoft Defender's detection history could not be read ($($_.Exception.Message)) - missing files are treated as an integrity failure." 'WARN'
-        return
-    }
-
-    foreach ($item in $Entry) {
-        $fullPath = Join-Path $WheelhousePath ([string]$item.file)
-        $hit = $detections | Where-Object { ([string]$_.Resource).IndexOf($fullPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -First 1
-        if ($hit) {
-            [PSCustomObject]@{ Entry = $item; ThreatName = [string]$hit.ThreatName; Resource = [string]$hit.Resource }
+    $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+    $entries = @(if ($File.Count -gt 0) {
+            foreach ($name in $File) {
+                $entry = $manifest | Where-Object { $_.file -eq $name } | Select-Object -First 1
+                if (-not $entry) { throw [System.Collections.Generic.KeyNotFoundException]::new("$name is not tracked in the wheelhouse manifest.") }
+                $entry
+            }
         }
+        else { $manifest })
+
+    $staging = Join-Path $StagingRoot ('scan-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $staging -Force | Out-Null
+    $map = [ordered]@{}
+    $notScanned = [System.Collections.Generic.List[string]]::new()
+    try {
+        Write-Log "Copying $($entries.Count) wheel(s) to a local folder for the scan..."
+        foreach ($entry in $entries) {
+            $source = Join-Path $WheelhousePath ([string]$entry.file)
+            $copy = Join-Path $staging ([string]$entry.file)
+            try {
+                Copy-Item -LiteralPath $source -Destination $copy -ErrorAction Stop
+            }
+            catch {
+                $notScanned.Add("$($entry.file): could not be copied ($($_.Exception.Message))")
+                continue
+            }
+            if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne [string]$entry.sha256) {
+                $notScanned.Add("$($entry.file): does not match its recorded hash - not scanned; run Test-Wheelhouse.ps1")
+                Remove-Item -LiteralPath $copy -Force
+                continue
+            }
+            $map[[string](Get-Item -LiteralPath $copy).FullName] = [string](Join-Path $WheelhousePath ([string]$entry.file))
+        }
+        foreach ($text in $notScanned) { Write-Log "  Not scanned: $text" 'WARN' }
+
+        $status = 'Error'
+        $message = 'Nothing could be scanned.'
+        $scanned = @()
+        $threats = @()
+        $started = Get-Date
+        if ($map.Count -gt 0) {
+            $scan = Invoke-WheelhouseDefenderScan -Path @($staging)
+            $status = $scan.Status
+            $message = $scan.Message
+            if (@($scan.ScannedPaths).Count -gt 0) { $scanned = @($map.Values) }
+            # Report the share files, not the temporary copies.
+            $threats = @(foreach ($threat in @($scan.Threats)) {
+                    $resource = [string]$threat.Resource
+                    foreach ($copyPath in $map.Keys) {
+                        if ($resource.IndexOf($copyPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                            $resource = [regex]::Replace($resource, [regex]::Escape($copyPath), $map[$copyPath].Replace('$', '$$'), 'IgnoreCase')
+                            break
+                        }
+                    }
+                    [PSCustomObject]@{ Resource = $resource; ThreatName = $threat.ThreatName; ThreatId = $threat.ThreatId; ActionSuccess = $threat.ActionSuccess }
+                })
+        }
+        if ($notScanned.Count -gt 0) { $message = "$message $($notScanned.Count) wheel(s) not scanned: $($notScanned -join '; ')".Trim() }
+
+        $result = [PSCustomObject]@{
+            PSTypeName   = 'Wheelhouse.ScanResult'
+            Status       = $status
+            Message      = $message
+            ScanTime     = $started.ToString('yyyy-MM-dd HH:mm:ss')
+            ScannedPaths = $scanned
+            Threats      = $threats
+            NotScanned   = $notScanned.ToArray()
+            ReportPath   = $null
+        }
+        if ($ReportsFolder -and (Test-Path -Path $ReportsFolder)) {
+            $reportFile = Join-Path $ReportsFolder "Report_Scan_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+            Write-JsonFile -Path $reportFile -InputObject $result -Depth 4
+            $result.ReportPath = $reportFile
+            Write-Log "Scan report saved to: $reportFile"
+        }
+        return $result
+    }
+    finally {
+        Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 

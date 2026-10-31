@@ -9,8 +9,8 @@
     timestamps), and passes every vulnerable or failed audit straight into
     Send-VulnerabilityAlert.ps1 - no manual -ReportPaths needed.
 
-    Wheelhouse.Notice objects of the same run (Defender detections, a wheel Defender
-    removed, a download that did not match PyPI) go into the same alert.
+    Wheelhouse.Notice objects of the same run (a wheel missing or changed on the share, a
+    download that did not match PyPI or was detected at intake) go into the same alert.
 
     If Update-Wheelhouse.ps1 aborts before running any audit (e.g. an integrity
     check failure), this script skips the alert step and says why.
@@ -35,6 +35,7 @@
 .PARAMETER VulnerabilityServices
 .PARAMETER ExpeditePackage
 .PARAMETER ExpediteReason
+.PARAMETER AutoQuarantine
     Passed through to Update-Wheelhouse.ps1.
 
 .PARAMETER SmtpServer
@@ -70,6 +71,8 @@ param(
     [string[]]$VulnerabilityServices,
     [string[]]$ExpeditePackage,
     [string]$ExpediteReason,
+    [ValidateSet('On', 'Off')]
+    [string]$AutoQuarantine,
 
     [string]$SmtpServer,
     [string]$To,
@@ -100,7 +103,8 @@ $updateParamsIn = @(
     'MinimumPackageAgeDays',
     'VulnerabilityServices',
     'ExpeditePackage',
-    'ExpediteReason'
+    'ExpediteReason',
+    'AutoQuarantine'
 )
 foreach ($name in $updateParamsIn) {
     if ($PSBoundParameters.ContainsKey($name)) {

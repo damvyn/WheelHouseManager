@@ -160,8 +160,9 @@ function Get-PackageScanStatus {
 
 function Get-WheelhousePackage {
     # The wheelhouse inventory: one row per wheel file in manifest.json, with the
-    # group files that list it, its latest audit and Defender status, and whether the
-    # denylist blocks it. Also returns the untracked wheel files and the groups.
+    # group files that list it, its latest audit, Defender and PyPI (yanked) status from
+    # the catalog, and whether the denylist blocks it. Also returns the untracked wheel
+    # files and the groups.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -190,10 +191,39 @@ function Get-WheelhousePackage {
         }
     }
 
-    $reportsFolder = Join-Path $WheelhousePath 'reports'
-    $packageKeys = @($manifest | ForEach-Object { [PSCustomObject]@{ Name = [string]$_.name; Version = [string]$_.version } })
-    $auditStatus = Get-PackageAuditStatus -ReportsFolder $reportsFolder -Package $packageKeys -Services $Services
-    $scanStatus = Get-PackageScanStatus -ReportsFolder $reportsFolder -WheelhousePath $WheelhousePath -File @($manifest | ForEach-Object { [string]$_.file })
+    # Status comes from the catalog. A wheelhouse that has no catalog yet (no writer has
+    # run since the upgrade) falls back to reading the latest report files.
+    $catalog = Read-WheelhouseCatalog -WheelhousePath $WheelhousePath
+    $auditStatus = @{}
+    $scanStatus = @{}
+    $pypiStatus = @{}
+    if ($catalog.Exists) {
+        foreach ($key in $catalog.Records.Keys) {
+            $record = $catalog.Records[$key]
+            $audit = $record.checks.audit
+            $auditStatus[$key] = [PSCustomObject]@{
+                Status          = $(if ($audit -and $audit.status) { [string]$audit.status } else { 'Unknown' })
+                Vulnerabilities = @($(if ($audit) { @($audit.vulnerabilities) } else { @() }) | Where-Object { $_ })
+                LastAudit       = $(if ($audit) { ConvertTo-IsoTimestamp -Value $audit.last_run } else { '' })
+            }
+            $scan = $record.checks.scan
+            foreach ($file in $record.files) {
+                $scanStatus[$file] = [PSCustomObject]@{
+                    Status   = $(if (-not $scan) { 'Unknown' } elseif (@($scan.threat_files) -contains $file) { 'Threat' } else { 'Clean' })
+                    LastScan = $(if ($scan) { ConvertTo-IsoTimestamp -Value $scan.last_run } else { '' })
+                }
+            }
+            if ($record.checks.pypi) { $pypiStatus[$key] = $record.checks.pypi }
+        }
+    }
+    else {
+        $reportsFolder = Join-Path $WheelhousePath 'reports'
+        $packageKeys = @($manifest | ForEach-Object { [PSCustomObject]@{ Name = [string]$_.name; Version = [string]$_.version } })
+        $auditStatus = Get-PackageAuditStatus -ReportsFolder $reportsFolder -Package $packageKeys -Services $Services
+        $scanStatus = Get-PackageScanStatus -ReportsFolder $reportsFolder -WheelhousePath $WheelhousePath -File @($manifest | ForEach-Object { [string]$_.file })
+    }
+    $unknownAudit = [PSCustomObject]@{ Status = 'Unknown'; Vulnerabilities = @(); LastAudit = '' }
+    $unknownScan = [PSCustomObject]@{ Status = 'Unknown'; LastScan = '' }
 
     $rows = foreach ($entry in ($manifest | Sort-Object name, version, file)) {
         $key = "$($entry.name)==$($entry.version)"
@@ -203,8 +233,10 @@ function Get-WheelhousePackage {
         $rowGroups = @()
         if ($groupsByPin.ContainsKey($key)) { $rowGroups = @($groupsByPin[$key]) }
         $deny = Get-DenylistMatch -Name $entry.name -Version $entry.version -Denylist $Denylist
-        $audit = $auditStatus[$key]
-        $scan = $scanStatus[[string]$entry.file]
+        $audit = if ($auditStatus.ContainsKey($key)) { $auditStatus[$key] } else { $unknownAudit }
+        $scan = if ($scanStatus.ContainsKey([string]$entry.file)) { $scanStatus[[string]$entry.file] } else { $unknownScan }
+        $pypi = $pypiStatus[$key]
+        $vulnerabilities = @($audit.Vulnerabilities)
         [PSCustomObject]@{
             name            = [string]$entry.name
             version         = [string]$entry.version
@@ -216,11 +248,12 @@ function Get-WheelhousePackage {
             file_missing    = -not (Test-Path -Path $filePath)
             groups          = $rowGroups
             audit_status    = $audit.Status
-            vulnerabilities = @($audit.Vulnerabilities)
+            vulnerabilities = $vulnerabilities
             last_audit      = $audit.LastAudit
             scan_status     = $scan.Status
             last_scan       = $scan.LastScan
             denylisted      = $(if ($deny) { [string]$deny.reason } else { $null })
+            yanked          = $(if ($pypi -and $pypi.status -eq 'Yanked') { $(if ($pypi.reason) { [string]$pypi.reason } else { 'yanked' }) } else { $null })
         }
     }
 
@@ -359,9 +392,12 @@ function Remove-WheelhousePackage {
     #   - the wheel file(s) are deleted (default) or moved to <wheelhouse>\_quarantine
     #     with -Quarantine, where Restore-WheelhousePackage can bring them back;
     #   - unless -NoDenylist, name==version is added to the denylist so the next
-    #     Update-Wheelhouse run does not download it again.
-    # Runs under the wheelhouse lock. If a step before the file removal fails, the
-    # earlier steps are undone. Returns a summary object; throws on failure.
+    #     Update-Wheelhouse run does not download it again;
+    #   - the catalog records the new state, the history the reason.
+    # Runs under the write lock (Open-WheelhouseWrite, or the caller's with -LockHeld)
+    # and with a journal: if a step before the file removal fails, the earlier steps are
+    # undone; if the process dies, the next writer finishes the removal.
+    # Returns a summary object; throws on failure.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -381,7 +417,7 @@ function Remove-WheelhousePackage {
 
         [string]$DenylistPath = (Get-WheelhouseDenylistPath),
 
-        # The caller already holds the wheelhouse lock (Update-Wheelhouse.ps1).
+        # The caller already holds the write lock (Update-Wheelhouse.ps1).
         [switch]$LockHeld
     )
 
@@ -390,8 +426,9 @@ function Remove-WheelhousePackage {
     $mode = if ($Quarantine) { 'Quarantine' } else { 'Delete' }
     if (-not $PSCmdlet.ShouldProcess($label, "$mode package")) { return }
 
-    $lock = if ($LockHeld) { $null } else { Enter-WheelhouseLock -WheelhousePath $WheelhousePath }
+    $lock = if ($LockHeld) { $null } else { Open-WheelhouseWrite -WheelhousePath $WheelhousePath -DenylistPath $DenylistPath }
     $undo = [System.Collections.Generic.List[scriptblock]]::new()
+    $journal = $null
     try {
         $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
         $entries = @($manifest | Where-Object { $_.name -eq $normalized -and $_.version -eq $Version })
@@ -405,25 +442,16 @@ function Remove-WheelhousePackage {
         $affectedGroups = @($allGroups | Where-Object {
                 (Read-RequirementFile -FilePath $_)[$normalized] -eq $Version
             })
-
-        Write-Log "$mode $label (wheel file(s): $(($entries | ForEach-Object { $_.file }) -join ', '); groups: $(($affectedGroups | ForEach-Object { Split-Path -Path $_ -Leaf }) -join ', '))..."
-
-        # 1. Denylist first: it only ever blocks more, so it is safe to leave on an abort.
-        $denyEntry = $null
-        if (-not $NoDenylist) {
-            $denyReason = if ($Reason) { "$Reason ($($mode.ToLowerInvariant())d)" } else { "$($mode.ToLowerInvariant())d from the wheelhouse" }
-            $existing = Get-DenylistMatch -Name $normalized -Version $Version -Denylist @(Read-WheelhouseDenylist -Path $DenylistPath)
-            $denySource = if ($Quarantine) { 'quarantined' } else { 'removed' }
-            $denyEntry = Add-WheelhouseDenylistEntry -Name $normalized -Version $Version -Reason $denyReason -Source $denySource -Path $DenylistPath
-            if ($null -eq $existing) {
-                $undo.Add({ [void](Remove-WheelhouseDenylistEntry -Name $normalized -Version $Version -Path $DenylistPath) }.GetNewClosure())
-            }
-        }
-
-        # 2. Quarantine record (written before any file moves, so a record never
-        # lags behind the files).
+        $user = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
+        # "Deleting" a version whose wheels are already gone (e.g. the file server's
+        # antivirus took them) only takes it out of the group files and the manifest.
+        $alreadyGone = (-not $Quarantine) -and -not ($entries | Where-Object { Test-Path -LiteralPath (Join-Path $WheelhousePath ([string]$_.file)) })
+        $verb = if ($Quarantine) { 'quarantined' } elseif ($alreadyGone) { 'taken out' } else { 'deleted' }
+        $denyReason = if ($Reason) { "$Reason ($verb)" } else { "$verb from the wheelhouse" }
+        $denySource = if ($Quarantine) { 'quarantined' } else { 'removed' }
+        $existingDeny = if ($NoDenylist) { $null } else { Get-DenylistMatch -Name $normalized -Version $Version -Denylist @(Read-WheelhouseDenylist -Path $DenylistPath) }
+        $record = $null
         if ($Quarantine) {
-            $records = @(Read-QuarantineRecord -WheelhousePath $WheelhousePath)
             $record = [PSCustomObject]@{
                 id              = $id
                 name            = $normalized
@@ -432,9 +460,39 @@ function Remove-WheelhousePackage {
                 groups          = @($affectedGroups | ForEach-Object { Split-Path -Path $_ -Leaf })
                 reason          = $Reason
                 quarantined_utc = (Get-Date).ToUniversalTime().ToString('o')
-                quarantined_by  = $(if ($env:USERNAME) { $env:USERNAME } else { 'unknown' })
-                denylisted      = [bool]$denyEntry
+                quarantined_by  = $user
+                denylisted      = (-not $NoDenylist)
             }
+        }
+
+        Write-Log "$mode $label (wheel file(s): $(($entries | ForEach-Object { $_.file }) -join ', '); groups: $(($affectedGroups | ForEach-Object { Split-Path -Path $_ -Leaf }) -join ', '))..."
+
+        $journal = New-WheelhouseJournal -WheelhousePath $WheelhousePath -Operation 'remove' -Data ([ordered]@{
+                name              = $normalized
+                version           = $Version
+                mode              = $mode
+                files             = @($entries | ForEach-Object { [string]$_.file })
+                groups            = @($affectedGroups)
+                quarantine_folder = $quarantineFolder
+                quarantine_record = $record
+                deny              = (-not $NoDenylist)
+                deny_reason       = $denyReason
+                deny_source       = $denySource
+            })
+
+        # 1. Denylist first: it only ever blocks more, so it is safe to leave on an abort.
+        $denyEntry = $null
+        if (-not $NoDenylist) {
+            $denyEntry = Add-WheelhouseDenylistEntry -Name $normalized -Version $Version -Reason $denyReason -Source $denySource -Path $DenylistPath
+            if ($null -eq $existingDeny) {
+                $undo.Add({ [void](Remove-WheelhouseDenylistEntry -Name $normalized -Version $Version -Path $DenylistPath) }.GetNewClosure())
+            }
+        }
+
+        # 2. Quarantine record (written before any file moves, so a record never
+        # lags behind the files).
+        if ($Quarantine) {
+            $records = @(Read-QuarantineRecord -WheelhousePath $WheelhousePath)
             Save-QuarantineRecord -WheelhousePath $WheelhousePath -Record (@($records) + $record)
             $undo.Add({ Save-QuarantineRecord -WheelhousePath $WheelhousePath -Record $records }.GetNewClosure())
         }
@@ -470,28 +528,40 @@ function Remove-WheelhousePackage {
         for ($i = $undo.Count - 1; $i -ge 0; $i--) {
             try { & $undo[$i] } catch { Write-Log "Could not undo a step of the failed $label operation: $($_.Exception.Message)" 'ERROR' }
         }
+        # Everything is back as it was, so there is nothing for a repair to finish.
+        Remove-WheelhouseJournal -Path $journal
         Exit-WheelhouseLock -Lock $lock
         throw $failure
     }
 
-    # Deleting cannot be undone, so it is the very last step.
-    $deletedFiles = [System.Collections.Generic.List[string]]::new()
+    # Deleting cannot be undone, so it is the very last step. If it fails, the journal
+    # stays and the next writer finishes the deletion.
     try {
         if (-not $Quarantine) {
             foreach ($entry in $entries) {
                 $source = Join-Path $WheelhousePath ([string]$entry.file)
                 if (Test-Path -Path $source) {
                     Remove-Item -Path $source -Force -ErrorAction Stop
-                    $deletedFiles.Add([string]$entry.file)
                 }
             }
         }
+        $detail = "$verb by $user" + $(if ($Reason) { ": $Reason" } else { '' }) +
+            " (files: $(($entries | ForEach-Object { $_.file }) -join ', '); groups: $((@($affectedGroups | ForEach-Object { Split-Path -Path $_ -Leaf }) -join ', ')))"
+        $change = [PSCustomObject]@{
+            Name    = $normalized
+            Version = $Version
+            State   = $(if ($Quarantine) { 'Quarantined' } else { 'Removed' })
+            Action  = $(if ($Quarantine) { 'Quarantined' } elseif ($alreadyGone) { 'TakenOut' } else { 'Deleted' })
+            Detail  = $detail
+        }
+        Set-WheelhouseCatalogState -WheelhousePath $WheelhousePath -Change @($change)
+        Remove-WheelhouseJournal -Path $journal
     }
     finally {
         Exit-WheelhouseLock -Lock $lock
     }
 
-    Write-Log "$label removed from the wheelhouse ($($mode.ToLowerInvariant()))." 'OK'
+    Write-Log "$label removed from the wheelhouse ($verb)." 'OK'
     return [PSCustomObject]@{
         Name         = $normalized
         Version      = $Version
@@ -503,11 +573,98 @@ function Remove-WheelhousePackage {
     }
 }
 
+function Resolve-WheelhouseIntegrityProblem {
+    # Deals with wheels that were removed or changed outside the manager - the problems
+    # Assert-WheelhouseIntegrity -AllowChangedFiles returns - one package version at a time.
+    # Virus scanning of the share belongs to the file server's own antivirus; when it moves
+    # a wheel to its quarantine, this is how the manager finds out and catches up:
+    #   with -AutoQuarantine: a version with a Modified file is quarantined (the changed
+    #     file is kept in _quarantine as evidence; Restore refuses it, its hash no longer
+    #     matches); a version whose files are only Missing is taken out (pins and manifest
+    #     entries removed). Both are denylisted, so no update downloads them again before
+    #     someone has looked at why.
+    #   without it: nothing is changed; the notices say what to do.
+    # Returns one Wheelhouse.Notice (FileModified / FileMissing) per version. Call it while
+    # holding the write lock.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Problem,
+
+        [switch]$AutoQuarantine,
+
+        [string]$DenylistPath = (Get-WheelhouseDenylistPath)
+    )
+
+    $byPin = [ordered]@{}
+    foreach ($item in $Problem) {
+        if ($null -eq $item -or $item.Kind -notin 'Missing', 'Modified') { continue }
+        $key = "$($item.Entry.name)==$($item.Entry.version)"
+        if (-not $byPin.Contains($key)) { $byPin[$key] = [System.Collections.Generic.List[object]]::new() }
+        $byPin[$key].Add($item)
+    }
+
+    foreach ($key in $byPin.Keys) {
+        $items = $byPin[$key]
+        $name = [string]$items[0].Entry.name
+        $version = [string]$items[0].Entry.version
+        $files = @($items | ForEach-Object { [string]$_.Entry.file })
+        $modified = [bool]($items | Where-Object { $_.Kind -eq 'Modified' })
+        $kind = if ($modified) { 'FileModified' } else { 'FileMissing' }
+
+        if ($AutoQuarantine -and $PSCmdlet.ShouldProcess($key, $(if ($modified) { 'Quarantine changed wheel' } else { 'Take out missing wheel' }))) {
+            $reason = if ($modified) { 'content changed outside the manager (hash mismatch)' } else { "removed from the share outside the manager (e.g. by the file server's antivirus)" }
+            try {
+                $removeParams = @{
+                    WheelhousePath = $WheelhousePath
+                    Name           = $name
+                    Version        = $version
+                    Quarantine     = $modified
+                    Reason         = $reason
+                    DenylistPath   = $DenylistPath
+                    LockHeld       = $true
+                }
+                $done = Remove-WheelhousePackage @removeParams
+                $groups = @($done.Groups).Count
+                if ($modified) {
+                    $message = "The published wheel's content changed (its hash no longer matches). The version was quarantined - the changed file is kept as evidence - taken out of $groups group file(s) and denylisted."
+                    $action = 'Find out who or what changed the file; do not restore it. If the package is needed, remove the version from the denylist and run Update-Wheelhouse.ps1 to download a verified copy.'
+                }
+                else {
+                    $message = "The published wheel disappeared from the share - most likely the file server's antivirus moved it to its own quarantine. The version was taken out of $groups group file(s) and the manifest, and denylisted."
+                    $action = "Check the file server's antivirus log and quarantine for this file. If it was a false positive, remove the version from the denylist and run Update-Wheelhouse.ps1 to download a verified copy; otherwise keep it blocked and pin another version."
+                }
+                Write-Log "${key}: $message" 'ERROR'
+            }
+            catch {
+                $message = "The published wheel was $(if ($modified) { 'changed' } else { 'removed' }) outside the manager, and it could not be taken out automatically: $($_.Exception.Message)"
+                $action = 'Quarantine or delete the version by hand (UI: Packages tab).'
+                Write-Log "${key}: $message" 'ERROR'
+            }
+        }
+        else {
+            if ($modified) {
+                $message = "The published wheel's content changed (its hash no longer matches); clients may install a file that is not the one that was checked. Nothing was changed automatically (AutoQuarantine is off)."
+            }
+            else {
+                $message = "The published wheel disappeared from the share - most likely the file server's antivirus moved it to its own quarantine. Clients installing its group file will fail. Nothing was changed automatically (AutoQuarantine is off)."
+            }
+            $action = 'Quarantine or delete the version (UI: Packages tab), or turn AutoQuarantine on. Update-Wheelhouse.ps1 refuses to run until this is resolved.'
+        }
+        New-WheelhouseNotice -Kind $kind -Package $name -Version $version -File $files -Message $message -Action $action
+    }
+}
+
 function Restore-WheelhousePackage {
     # Brings a quarantined package back: verifies every file against the hash
     # recorded when it was quarantined, moves it back, re-adds the manifest entries and
     # the pins. The denylist entry that quarantining created is removed (unless
-    # -KeepDenylist); a denylist entry added by hand is left alone.
+    # -KeepDenylist); a denylist entry added by hand is left alone. Runs under the write
+    # lock with a journal, so an interrupted restore is finished by the next writer.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -523,7 +680,7 @@ function Restore-WheelhousePackage {
 
     if (-not $PSCmdlet.ShouldProcess($Id, 'Restore quarantined package')) { return }
 
-    $lock = Enter-WheelhouseLock -WheelhousePath $WheelhousePath
+    $lock = Open-WheelhouseWrite -WheelhousePath $WheelhousePath -DenylistPath $DenylistPath
     try {
         $records = @(Read-QuarantineRecord -WheelhousePath $WheelhousePath)
         $record = $records | Where-Object { $_.id -eq $Id } | Select-Object -First 1
@@ -553,34 +710,26 @@ function Restore-WheelhousePackage {
             }
         }
 
-        foreach ($entry in @($record.files)) {
-            Move-Item -Path (Join-Path $folder ([string]$entry.file)) -Destination (Join-Path $WheelhousePath ([string]$entry.file)) -ErrorAction Stop
+        $data = [ordered]@{ id = $Id; name = [string]$record.name; version = [string]$record.version; record = $record; folder = $folder; keep_denylist = [bool]$KeepDenylist }
+        $journal = New-WheelhouseJournal -WheelhousePath $WheelhousePath -Operation 'restore' -Data $data
+        $denyRemoved = Complete-WheelhouseRestoreJournal -WheelhousePath $WheelhousePath -Data $data -DenylistPath $DenylistPath
+        $user = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
+        $change = [PSCustomObject]@{
+            Name    = [string]$record.name
+            Version = [string]$record.version
+            State   = 'Published'
+            Action  = 'Restored'
+            Detail  = "restored from quarantine by $user" + $(if ($denyRemoved) { '; denylist entry removed' } else { '' })
         }
-        Save-WheelhouseManifest -Manifest (@($manifest) + @($record.files)) -WheelhousePath $WheelhousePath
+        Set-WheelhouseCatalogState -WheelhousePath $WheelhousePath -Change @($change)
+        Remove-WheelhouseJournal -Path $journal
 
-        foreach ($groupName in @($record.groups)) {
-            $groupFile = Join-Path $WheelhousePath "$groupName"
-            $listed = if (Test-Path -Path $groupFile) { Read-RequirementFile -FilePath $groupFile } else { @{} }
-            if ($listed[[string]$record.name] -ne $record.version) {
-                Add-RequirementToGroupFile -GroupFile $groupFile -Name $record.name -Version $record.version
-            }
-        }
-
-        Save-QuarantineRecord -WheelhousePath $WheelhousePath -Record @($records | Where-Object { $_.id -ne $Id })
-        if ((Test-Path -Path $folder) -and -not (Get-ChildItem -Path $folder -Force)) {
-            Remove-Item -Path $folder -Force
-        }
-
-        $denyRemoved = $false
-        if (-not $KeepDenylist) {
-            $denyRemoved = Remove-WheelhouseDenylistEntry -Name $record.name -Version $record.version -OnlySource 'quarantined' -Path $DenylistPath
-        }
         Write-Log "$($record.name)==$($record.version) restored from quarantine." 'OK'
         return [PSCustomObject]@{
-            Name             = [string]$record.name
-            Version          = [string]$record.version
-            Files            = @($record.files | ForEach-Object { [string]$_.file })
-            DenylistRemoved  = $denyRemoved
+            Name            = [string]$record.name
+            Version         = [string]$record.version
+            Files           = @($record.files | ForEach-Object { [string]$_.file })
+            DenylistRemoved = $denyRemoved
         }
     }
     finally {

@@ -1,33 +1,39 @@
 <#
 .SYNOPSIS
-    Scheduled check of everything already published: integrity, vulnerabilities,
-    denylist, PyPI yanked flag and (optionally) Microsoft Defender, with one automatic
-    alert on any finding. Intended for the Scheduled Task.
+    Scheduled check of everything already published: integrity, vulnerabilities, denylist
+    and PyPI yanked flag, with one automatic alert on any finding. Intended for the
+    Scheduled Task.
 
 .DESCRIPTION
     A package that passed every check when it entered the wheelhouse can fail one later:
-    a new vulnerability is published, the release is yanked, someone denylists it, or
-    Defender's updated signatures detect it. This script re-checks all of that.
+    a new vulnerability is published, the release is yanked, someone denylists it, or the
+    file server's antivirus removes or changes the wheel on the share. This script
+    re-checks all of that.
 
-    Deliberately does NOTHING else: no merge from Input\requirements.txt, no download,
-    no manifest or group file changes. This is the script that should run unattended on
-    a schedule - Update-Wheelhouse.ps1 (merge + download) stays a manual, deliberate
-    action taken after a requirements.txt change is approved.
+    It does not virus-scan the share - the file server's own antivirus does that. When that
+    antivirus moves a wheel to its quarantine, the integrity check here notices the missing
+    file. Then, with AutoQuarantine on (the default), the version is taken out of the group
+    files and the manifest and denylisted; a wheel whose content changed is quarantined as
+    evidence. With AutoQuarantine off, it is only reported.
+
+    Otherwise it changes nothing: no merge from Input\requirements.txt and no download. It
+    only records the results in the package catalog and history. Update-Wheelhouse.ps1
+    (merge + download) stays a manual, deliberate action taken after a requirements.txt
+    change is approved.
 
     Steps:
       1. Checks python / pip-audit are usable (installs or upgrades them if needed).
-      2. Verifies wheelhouse integrity against manifest.json (every tracked file's
-         hash must still match). Stops immediately on any mismatch - except for a
-         wheel that Microsoft Defender removed itself, which is reported as a notice
-         (Update-Wheelhouse.ps1 cleans it up).
+      2. Verifies wheelhouse integrity against manifest.json (every tracked file's hash
+         must still match). Wheels missing or changed on the share are handled as above.
+         Any other problem (a file that cannot be read, a broken manifest record) stops
+         the run.
       3. Checks every published version against the denylist and PyPI's yanked flag.
       4. For every group file (also when the manifest is still empty), runs pip-audit
          against each configured vulnerability service.
-      5. With -DefenderScan or the DefenderScanInScheduledCheck setting, re-scans the
-         whole wheelhouse with Microsoft Defender (needs an elevated account).
+      5. Records the results in the catalog (the UI's package table and history).
       6. If anything was found OR a check could not be completed, calls
-         Send-VulnerabilityAlert.ps1 once with every such result. A failed check is
-         never reported as "no problems".
+         Send-VulnerabilityAlert.ps1 once with every such result. A failed check is never
+         reported as "no problems".
 
     Exit codes: 0 OK; 1 findings (needs attention); 2 aborted, a check could not be
     completed, or the alert could not be sent.
@@ -39,9 +45,8 @@
     pip-audit vulnerability service(s) to check (default: osv, pypi, or the value in
     config\settings.psd1).
 
-.PARAMETER DefenderScan
-    Also re-scan the wheelhouse with Microsoft Defender, even if the
-    DefenderScanInScheduledCheck setting is off.
+.PARAMETER AutoQuarantine
+    On or Off for this run, overriding the AutoQuarantine setting (default On).
 
 .PARAMETER SmtpServer
 .PARAMETER MailTo
@@ -52,9 +57,13 @@
 .EXAMPLE
     .\Test-Wheelhouse.ps1 -WheelhousePath "\\server\share\wheelhouse"
 
+.EXAMPLE
+    # Report wheels that disappeared from the share, but do not take them out
+    .\Test-Wheelhouse.ps1 -AutoQuarantine Off
+
 .NOTES
     Requires the WheelhouseManager module folder and Send-VulnerabilityAlert.ps1 in the
-    same folder as this script.
+    same folder as this script. Needs no administrator rights.
 #>
 
 #Requires -Version 5.1
@@ -67,7 +76,8 @@ param(
     [ValidateSet('osv', 'pypi')]
     [string[]]$VulnerabilityServices,
 
-    [switch]$DefenderScan,
+    [ValidateSet('On', 'Off')]
+    [string]$AutoQuarantine,
 
     [string]$SmtpServer,
     [string]$MailTo,
@@ -79,9 +89,12 @@ Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $whlParams = @{
     'BoundParameters' = $PSBoundParameters
-    'Name' = @('WheelhousePath', 'VulnerabilityServices', 'ReportRetentionMonths', 'PythonVersion', 'Platform', 'DefenderScanInScheduledCheck')
+    'Name' = @('WheelhousePath', 'VulnerabilityServices', 'ReportRetentionMonths', 'PythonVersion', 'Platform', 'AutoQuarantine')
 }
 $cfg = Resolve-WheelhouseParameter @whlParams
+# Not $autoQuarantine: variable names are case-insensitive, and that one is the
+# -AutoQuarantine parameter, whose ValidateSet would refuse a [bool].
+$takeOutChangedWheels = ConvertTo-WheelhouseBoolean $cfg.AutoQuarantine
 
 $title = 'Wheelhouse scheduled check'
 $outcome = $null
@@ -103,7 +116,7 @@ try {
     $denylist = @(Read-WheelhouseDenylist)
 
     # -----------------------------------------------------------------------
-    # Step 1: manifest integrity check
+    # Step 1: integrity - and wheels removed or changed outside the manager
     # -----------------------------------------------------------------------
 
     Write-Log "Loading manifest: $(Get-WheelhouseManifestPath -WheelhousePath $cfg.WheelhousePath)"
@@ -115,20 +128,27 @@ try {
         Write-Log 'Manifest is empty - no published wheels to verify. Group files are still audited.' 'OK'
     }
     else {
-        $removedByDefender = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $cfg.WheelhousePath -ReportsFolder $reportsFolder -AllowDefenderRemoved)
-        foreach ($item in $removedByDefender) {
-            $noticeParams = @{
-                Kind    = 'DefenderRemoved'
-                Package = [string]$item.Entry.name
-                Version = [string]$item.Entry.version
-                File    = @([string]$item.Entry.file)
-                Message = "Microsoft Defender detected $($item.ThreatName) and removed the wheel. It is still listed in the manifest and the group files."
-                Action  = 'Run Update-Wheelhouse.ps1: it takes the pin out of the group files and the manifest and denylists the version. Then review the detection.'
+        $changed = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $cfg.WheelhousePath -ReportsFolder $reportsFolder -AllowChangedFiles)
+        if ($changed.Count -gt 0) {
+            if ($takeOutChangedWheels) {
+                # Taking them out changes the manifest and group files: write lock, waiting
+                # for an update's write step if one is in progress.
+                $lock = Open-WheelhouseWrite -WheelhousePath $cfg.WheelhousePath -TimeoutSeconds 300
+                try {
+                    $resolved = @(Resolve-WheelhouseIntegrityProblem -WheelhousePath $cfg.WheelhousePath -Problem $changed -AutoQuarantine)
+                }
+                finally {
+                    Exit-WheelhouseLock -Lock $lock
+                }
+                $manifest = Read-WheelhouseManifest -WheelhousePath $cfg.WheelhousePath
             }
-            $notices.Add((New-WheelhouseNotice @noticeParams))
+            else {
+                $resolved = @(Resolve-WheelhouseIntegrityProblem -WheelhousePath $cfg.WheelhousePath -Problem $changed)
+            }
+            foreach ($notice in $resolved) { $notices.Add($notice) }
+            $gone = @($changed | ForEach-Object { [string]$_.Entry.file })
+            $published = @($manifest | Where-Object { $gone -notcontains [string]$_.file })
         }
-        $gone = @($removedByDefender | ForEach-Object { [string]$_.Entry.file })
-        $published = @($manifest | Where-Object { $gone -notcontains [string]$_.file })
     }
 
     $groupFiles = Get-WheelhouseGroupFile -WheelhousePath $cfg.WheelhousePath
@@ -181,27 +201,23 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Step 4: optional Defender re-scan with the current signatures
+    # Step 4: record the results in the catalog (the UI shows them from there)
     # -----------------------------------------------------------------------
 
-    if ($DefenderScan -or $cfg.DefenderScanInScheduledCheck) {
-        $scan = Invoke-WheelhouseDefenderScan -Path $cfg.WheelhousePath -ReportsFolder $reportsFolder
-        if ($scan.Status -eq 'Threat') {
-            foreach ($threat in @($scan.Threats)) {
-                $hit = $published | Where-Object { ([string]$threat.Resource).IndexOf((Join-Path $cfg.WheelhousePath ([string]$_.file)), [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -First 1
-                $noticeParams = @{
-                    Kind    = 'DefenderThreat'
-                    Package = $(if ($hit) { [string]$hit.name } else { '' })
-                    Version = $(if ($hit) { [string]$hit.version } else { '' })
-                    File    = @([string]$threat.Resource)
-                    Message = "Microsoft Defender detected $($threat.ThreatName) with the current signatures."
-                }
-                $notices.Add((New-WheelhouseNotice @noticeParams))
-            }
-        }
-        elseif ($scan.Status -eq 'Error') {
-            $checkErrors.Add("Microsoft Defender scan: $($scan.Message)")
-        }
+    $catalogAudits = $auditResults.ToArray()
+    $catalogChecked = @($deployed.Checked)
+    $catalogServices = $cfg.VulnerabilityServices
+    try {
+        Update-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath -Update ({
+                param($catalog)
+                Update-CatalogAuditResult -Catalog $catalog -AuditResult $catalogAudits -Services $catalogServices
+                Update-CatalogPyPIResult -Catalog $catalog -Checked $catalogChecked
+            }.GetNewClosure())
+    }
+    catch {
+        # Otherwise the UI would keep showing the previous results as current.
+        $checkErrors.Add("The results could not be recorded in the package catalog: $($_.Exception.Message)")
+        Write-Log $checkErrors[$checkErrors.Count - 1] 'ERROR'
     }
 
     # -----------------------------------------------------------------------

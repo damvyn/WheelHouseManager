@@ -45,13 +45,13 @@ the *wheelhouse* - for Windows clients that may not reach PyPI.
 flowchart LR
     subgraph Manager server
         IN[Input\requirements.in] -->|Update-Requirement.ps1<br/>uv pip compile + pip dry-run| TXT[Input\requirements.txt]
-        TXT -->|Update-Wheelhouse.ps1<br/>merge plan + Invoke-CandidateIntake| STG[staging\]
-        STG -->|Publish-StagedWheel| WH
+        TXT -->|Update-Wheelhouse.ps1 -> Invoke-WheelhouseSync<br/>merge plan + Invoke-CandidateIntake| STG[staging\]
+        STG -->|Publish-CandidateIntake<br/>write lock + journal| WH
         SCHED[Scheduled Task] -->|Test-Wheelhouse.ps1| WH
         UI[Start-WheelhouseUI.ps1<br/>HttpListener on localhost] -->|child processes / module calls| WH
     end
     EXT[(pypi.org / files.pythonhosted.org<br/>api.osv.dev / Defender)] -.-> Manager server
-    WH[(Wheelhouse share<br/>*.whl, requirements-N.txt,<br/>manifest.json, reports\, _quarantine\)]
+    WH[(Wheelhouse share<br/>*.whl, requirements-N.txt, manifest.json,<br/>catalog.json, events.jsonl, reports\, _quarantine\)]
     WH -->|flat index, read only| CL[Clients: uv]
 ```
 
@@ -72,7 +72,7 @@ Setup.ps1                                deploys the manager (section 7.1)
 Invoke-WheelhousePipeline.ps1            orchestrator: Update-Wheelhouse.ps1 -> Send-VulnerabilityAlert.ps1
 Jobs/
     Update-Requirement.ps1               resolve: requirements.in -> requirements.txt
-    Update-Wheelhouse.ps1                the worker: integrity, merge plan, intake, deployed audit, manifest, Defender
+    Update-Wheelhouse.ps1                the update run (thin: Invoke-WheelhouseSync does the work)
     Test-Wheelhouse.ps1                  scheduled re-check of everything published + alert
     Test-WheelhousePackage.ps1           audit all / chosen pins, no alert (UI "Audit")
     Invoke-WheelhouseScan.ps1            Defender scan of all / chosen wheels (UI "Scan")
@@ -115,10 +115,14 @@ is the repo root; tests pass explicit paths (`-ManagerRoot`, `-StagingRoot`, `-S
 
 | Path | Owner (writes) | Notes |
 |---|---|---|
-| `*.whl` | `Publish-StagedWheel` (create), `Remove-WheelhousePackage` (move/delete), `Restore-WheelhousePackage` (move back) | Served to clients. `*.whl.partial` exists only during a publish. |
-| `requirements.txt` (legacy group 0), `requirements-<N>.txt` | `Add-RequirementToGroupFile` (append), `Remove-RequirementFromGroupFile` (atomic rewrite) | Other names (`requirements-torch.txt`) are not groups. Never rewritten wholesale. |
+| `*.whl` | `Publish-StagedWheel` (called by `Publish-CandidateIntake`), `Remove-WheelhousePackage` (move/delete), `Restore-WheelhousePackage` (move back) | Served to clients. `*.whl.partial` exists only during a publish. |
+| `requirements.txt` (legacy group 0), `requirements-<N>.txt` | `Add-RequirementToGroupFile` (append), `Remove-RequirementFromGroupFile` (atomic rewrite) | Other names (`requirements-torch.txt`) are not groups. Never rewritten wholesale - clients install from them (`uv pip install -r`), so they stay stable and remain the source of group membership. |
 | `manifest.json` | `Save-WheelhouseManifest` (worker, remove, restore) | JSON array, atomic write. Damaged -> **throws**. |
-| `.wheelhouse.lock` | `Enter-WheelhouseLock` | Exclusive, delete-on-close; content `pid=... user=... started=...` |
+| `catalog.json` | `Update-WheelhouseCatalog`, `Set-WheelhouseCatalogState`, `Invoke-WheelhouseSync` (all under the write lock) | Per-version state and latest check results (section 11). Derived: reconciled from manifest, group files and quarantine on every write. Damaged -> **throws** (delete it to rebuild; check results start again). |
+| `events.jsonl` | `Write-WheelhouseEvent` (under the write lock) | Append-only history, one JSON object per line. Unreadable lines are skipped with a warning. |
+| `.journal\*.json` | `New-/Remove-WheelhouseJournal` | Intent of a publish/remove/restore in progress; a leftover is finished by `Repair-WheelhouseJournal`. Unreadable -> **throws**. |
+| `.wheelhouse.lock` | `Enter-WheelhouseLock -Kind write` | Write lock: exclusive, delete-on-close; content `pid=... user=... started=...`. Held only while files change. |
+| `.wheelhouse-sync.lock` | `Enter-WheelhouseLock -Kind sync` | Held for a whole `Invoke-WheelhouseSync` run - one update at a time. |
 | `_quarantine\quarantine.json`, `_quarantine\<id>\*.whl` | Remove (`-Quarantine`) / Restore | Damaged record file -> **throws** |
 | `reports\` | Every run | Retention by `Remove-ExpiredReport` (`Log_*.txt`, `Report_*.json`, `Alert_*.html`) |
 
@@ -136,9 +140,9 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
    (`AVYPO~1`), Defender reports long paths, and matching is by substring - a detection could be
    missed and the scan reported as clean. *Where:* `Invoke-CandidateIntake -StagingRoot` default.
 3. **Group files only list pins whose wheel is published.** Intake is transactional per package:
-   the worker appends a pin only for `Accepted` packages, after their `Published` entries were
-   saved to the manifest. Pins already listed but without a wheel are fed back through intake.
-   *Where:* `Update-Wheelhouse.ps1` step 3.
+   `Publish-CandidateIntake` copies the files, then `Complete-WheelhousePublishJournal` records
+   them in the manifest and only then appends the pins of packages whose wheels all arrived. Pins
+   already listed but without a wheel are fed back through intake. *Where:* `Intake.ps1`, `Journal.ps1`.
 4. **The manifest only gains entries intake returns as `Published`** (verified against PyPI's
    sha256). The single exception is first-time setup (manifest empty at start): the wheels
    already in the folder are adopted by `Merge-WheelhouseManifest -PreRunFiles @()`. Untracked
@@ -147,9 +151,14 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
    A Defender scan is `Clean`/`Threat`/`Error`; `Error` is never clean. Unverifiable PyPI data
    rejects at intake and is an error in the scheduled check. A damaged manifest, denylist or
    quarantine record throws. (Settings are the exception - see 3.1.)
-6. **One writer at a time.** Anything that rewrites the manifest or group files holds
-   `Enter-WheelhouseLock`: `Update-Wheelhouse.ps1`, `Remove-WheelhousePackage`,
-   `Restore-WheelhousePackage`. A caller that already holds it passes `-LockHeld`.
+6. **One writer at a time, for as short as possible.** Every change to the manifest, group files,
+   catalog, quarantine or history happens under the write lock, taken with `Open-WheelhouseWrite`
+   (lock + journal repair) and held only while files change. Code that holds it already passes
+   `-LockHeld`. Long work (audits, downloads, scans) runs without it, and whatever a writer read
+   before is read again under the lock (the manifest and the denylist in `Publish-CandidateIntake`).
+   `Invoke-WheelhouseSync` also holds the sync lock for its whole run, so two updates never plan
+   from the same state. UI actions fail at once if the write lock is busy (`TimeoutSeconds 0`);
+   the update and the checks wait up to 300 s.
 7. **Removal is ordered and undoable.** Denylist -> quarantine record -> group files -> manifest
    -> move files; each step pushes an undo; a failure replays them in reverse. Deleting files is
    the last, non-undoable step, outside the undo `try`. *Why:* clients must never see a pin
@@ -177,6 +186,32 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
     strict patterns *and* exist in the manifest; `ConvertTo-UiArgument` refuses quotes.
 16. **Defaults live only in `Get-WheelhouseDefaultSetting`.** Scripts resolve parameters with
     `Resolve-WheelhouseParameter`; nothing else hard-codes a default.
+17. **Multi-step changes are journaled.** Publish, remove and restore write a journal before their
+    first step and delete it after the last. `Repair-WheelhouseJournal` (run by every
+    `Open-WheelhouseWrite`) finishes a leftover by rolling forward with idempotent `Complete-*`
+    functions - the same ones the normal publish and restore paths use. A journal it cannot read
+    or finish stops every writer until someone looks.
+18. **The catalog is derived, the history append-only.** `Sync-WheelhouseCatalog` can rebuild state,
+    files and groups from manifest, group files and quarantine at any time; only check results and
+    history live in the catalog/events alone. A failed audit or scan never refreshes `last_run`,
+    `last_ok` or a status (`Update-CatalogAuditResult` / `Update-CatalogScanResult`).
+19. **Names, versions and wheel file names from outside are validated in one place** -
+    `Test-WheelhousePackageName`, `Test-WheelhousePackageVersion`, `Test-WheelhouseWheelFileName`,
+    `ConvertTo-WheelhousePin` (Common.ps1).
+20. **The share is never virus-scanned by this tool.** The file server's own antivirus does that.
+    Defender runs on this server only for local files: staged downloads at intake, and on-demand
+    scans of hash-checked local copies (`Invoke-WheelhouseCopyScan`). *Why:* Defender reads network
+    paths as the computer account and a policy can skip network files, so a scan of the share could
+    report Clean without reading anything.
+21. **Wheels removed or changed on the share are detected, not ignored.** The integrity check
+    classifies them (`Missing`, `Modified`); with `AutoQuarantine` (default on, `-AutoQuarantine
+    On|Off` per run) `Resolve-WheelhouseIntegrityProblem` takes a missing version out (pins and
+    manifest, denylisted) and quarantines a modified one as evidence; without it the update stops
+    and the scheduled check only reports. `Unreadable` and `Malformed` always stop the run.
+22. **Never assign to a script variable named like a validated parameter.** Variable names are
+    case-insensitive and the parameter's `Validate*` attribute rejects the value; at script level
+    that error does not stop the script (this silently disabled automatic quarantine once). A test
+    checks every script.
 
 ---
 
@@ -209,6 +244,8 @@ flowchart TD
 
 - Scripts are thin: parameters -> `Resolve-WheelhouseParameter` -> `Start-WheelhouseRun` ->
   `try { ... } catch { exit code } finally { Stop-WheelhouseRun }` -> output objects -> `exit`.
+  The update run itself is a module function (`Invoke-WheelhouseSync`); the checks record their
+  results with `Update-WheelhouseCatalog -Update { param($catalog) ... }`.
   `Update-Requirement.ps1` and `Send-VulnerabilityAlert.ps1` skip `Start-WheelhouseRun` (they may
   run without a wheelhouse) and log to the console only.
 - Only orchestrating scripts call other scripts, with `&` (in-process, so result objects are
@@ -224,8 +261,9 @@ flowchart TD
 ## 6. Module internals
 
 **Loading.** `WheelhouseManager.psm1` sets `$script:ManagerRoot` and dot-sources `Common`,
-`Settings`, `Requirements`, `Manifest`, `Audit`, `Intake`, `Alert`, `Run`, `Denylist`, `Package`,
-`Scan`, `Ui` (order is for readability; calls resolve at run time). The psd1's
+`Settings`, `Requirements`, `Manifest`, `Catalog`, `Journal`, `Audit`, `Intake`, `Sync`, `Alert`,
+`Run`, `Denylist`, `Package`, `Scan`, `Ui` (order is for readability; calls resolve at run time).
+`Ui.ps1` builds `$script:UiRoutes` at load time. The psd1's
 `FunctionsToExport` is the public surface; CI fails if a listed function is missing.
 
 **Module-scope state** (`$script:`):
@@ -233,13 +271,14 @@ flowchart TD
 | Variable | File | Purpose |
 |---|---|---|
 | `ManagerRoot` | psm1 | Default for every manager-relative path |
+| `PackageNamePattern`, `PackageVersionPattern`, `WheelFileNamePattern` | Common | The one definition of valid names/versions/wheel file names from outside |
+| `CatalogSchemaVersion` | Catalog | Written into `catalog.json`; a newer one is refused |
 | `GroupFilePattern` (`^requirements-(\d+)\.txt$`), `LegacyGroupFileName` | Requirements | What counts as a group file |
 | `AuditReportPattern` | Audit | The single definition of audit report names (writer and readers) |
-| `DenylistNamePattern`, `DenylistVersionPattern` | Denylist | Entry validation |
 | `QuarantineFolderName` (`_quarantine`), `PackageSpecPattern` | Package | Quarantine location; what `requirements.in` lines the UI may add |
 | `UiWebRoot`, `UiStaticFiles`, `UiMimeTypes` | Ui | Static file whitelist |
 | `UiJobs`, `UiJobCounter`, `UiMaxJobHistory` (30), `UiShutdown` | Ui | In-memory job list and server state (one UI process) |
-| `UiPackageNamePattern`, `UiPackageVersionPattern`, `UiWheelFilePattern` | Ui | Request validation |
+| `UiRoutes` | Ui | The API route table (`Get-WheelhouseUiRoute`) |
 
 **Settings resolution.** `Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters -Name a, b`
 returns a hashtable; per name: bound parameter > non-empty setting (empty string / empty array /
@@ -284,30 +323,40 @@ Resolves `RequirementsInPath`, `RequirementsTxtPath` (setting `LocalRequirements
 
 Exit: 0 written; 1 uv or the pip check rejected the result; 2 missing input / python / platform.
 
-### 7.4 `Update-Wheelhouse.ps1` (the worker)
+### 7.4 `Update-Wheelhouse.ps1` (the update run)
 Parameters: `WheelhousePath`, `LocalRequirementsPath` (`""` = no merge), `PythonVersion`,
 `Platform`, `MinimumPackageAgeDays`, `VulnerabilityServices`, `ExpeditePackage` (`name==ver`,
-array or comma string), `ExpediteReason` (required with it). Also resolves
-`ReportRetentionMonths`, `RequireDefenderScanAtIntake`. Full sequence in
-[9.2](#92-the-worker-update-wheelhouseps1). Output: AuditResults then Notices. Exit: 0; 1
-rejection / vulnerable deployed audit / Defender threat / Defender-removed wheel; 2 aborted or any
-audit `Error`; 3 lock busy.
+array or comma string, parsed by `ConvertTo-WheelhousePin`), `ExpediteReason` (required with it).
+Also resolves `ReportRetentionMonths`, `RequireDefenderScanAtIntake`. The script only frames the
+run (transcript, `Confirm-PythonAndTooling`, exit code); `Invoke-WheelhouseSync` does the work -
+sequence in [9.2](#92-the-update-run-invoke-wheelhousesync). Output: AuditResults then Notices. Exit: 0; 1
+rejection / vulnerable deployed audit / wheel taken out because it was missing or changed on the share;
+2 aborted (including a missing/changed wheel with `-AutoQuarantine Off`) or any audit `Error`; 3 lock
+busy. `-AutoQuarantine On|Off` overrides the setting for the run.
 
 ### 7.5 `Test-Wheelhouse.ps1` (Scheduled Task)
-Parameters: `WheelhousePath`, `VulnerabilityServices`, `DefenderScan` (switch), `SmtpServer`,
+Parameters: `WheelhousePath`, `VulnerabilityServices`, `AutoQuarantine` (On/Off), `SmtpServer`,
 `MailTo`, `MailFrom` (renamed to `To`/`From` for the alert). Also resolves `PythonVersion`,
-`Platform`, `ReportRetentionMonths`, `DefenderScanInScheduledCheck`. No lock, no writes except
-reports. Sequence in [9.3](#93-the-scheduled-re-check-test-wheelhouseps1). Exit: 0; 1 findings;
-2 aborted, a check incomplete, or the alert failed.
+`Platform`, `ReportRetentionMonths`, `AutoQuarantine` (setting). It changes the wheelhouse only to
+take out wheels missing or changed on the share (write lock, `AutoQuarantine` on); otherwise it
+writes reports, catalog and history only. No administrator rights needed. Sequence in [9.3](#93-the-scheduled-re-check-test-wheelhouseps1). Exit: 0; 1 findings;
+2 aborted, a check incomplete, the alert failed, or the results could not be recorded in the catalog.
+Records audits and PyPI results with `Update-WheelhouseCatalog` (write lock, waits up to
+300 s).
 
 ### 7.6 `Test-WheelhousePackage.ps1`
 `-Package` pins (validated by regex, must be in the manifest) -> `Invoke-PackageAudit -Stage
 Manual` (report group `selection`); none -> `Invoke-GroupAudit -Stage Manual` per group. Emits
-AuditResults, no alert. Exit 1 vulnerable, 2 audit error or abort.
+AuditResults, no alert, records the results in the catalog. Exit 1 vulnerable, 2 audit error,
+abort, or results not recorded.
 
 ### 7.7 `Invoke-WheelhouseScan.ps1`
-`-File` bare `*.whl` names that exist in the wheelhouse, or the whole folder. Emits a
-`Wheelhouse.ScanResult`. Exit 1 `Threat`, 2 `Error` or abort.
+On-demand second opinion with this server's Defender (routine scanning of the share is the file
+server's antivirus' job). `-File` bare `*.whl` names from the manifest, or every tracked wheel.
+`Invoke-WheelhouseCopyScan` copies them to local staging, checks each copy's SHA256 against the
+manifest and scans the copies; the `Wheelhouse.ScanResult` names the share files and is recorded in
+the catalog. Exit 1 `Threat`, 2 `Error`, a wheel not scanned (`NotScanned`), abort or result not
+recorded.
 
 ### 7.8 `Send-VulnerabilityAlert.ps1`
 `-ReportPaths`, `-AuditErrors`, `-Notices` (at least one), `-WheelhousePath`, `-SmtpServer`,
@@ -331,14 +380,18 @@ Columns: purpose | returns / side effects | callers. All are exported.
 |---|---|---|---|
 | `Write-Log` | `[ts] [LEVEL] message` to the host (`INFO`/`OK`/`WARN`/`ERROR`) | - | everything |
 | `Get-NormalizedPackageName` | PEP 503 normalization | string | everywhere names are compared |
+| `Test-WheelhousePackageName` / `Test-WheelhousePackageVersion` / `Test-WheelhouseWheelFileName` | validate names, versions, bare wheel file names from outside | bool | UI, denylist, scan script |
+| `ConvertTo-WheelhousePin` | `name==version` pins from arrays and comma/semicolon lists; `ArgumentException` otherwise | `{Name; Version}` | Update-Wheelhouse, Test-WheelhousePackage |
 | `ConvertTo-HtmlSafe` | HTML-encode | string | alert HTML |
 | `Write-TextFileAtomic` | write `<path>.tmp`, move over target | file | JSON/settings/group rewrites |
 | `Write-JsonFile` | `ConvertTo-Json` (arrays stay arrays, null -> `[]`) + atomic write | file | manifest, reports, denylist, quarantine |
 | `Invoke-NativeCommand` | run exe, stderr merged as text, lines echoed; `-PassThru` returns lines (`-NoEnumerate`); `$LASTEXITCODE` kept | lines | pip, pip-audit, uv callers |
-| `Enter-WheelhouseLock` | open `.wheelhouse.lock` exclusively, delete-on-close; busy -> `InvalidOperationException` with `Data['WheelhouseLockBusy']` | `FileStream` | worker, Remove, Restore |
-| `Exit-WheelhouseLock` | dispose (null-safe) | - | same |
+| `Enter-WheelhouseLock` | `-Kind write` (`.wheelhouse.lock`) or `sync` (`.wheelhouse-sync.lock`), exclusive, delete-on-close; `-TimeoutSeconds` waits; busy -> `InvalidOperationException` with `Data['WheelhouseLockBusy']`; missing folder -> plain error | `FileStream` | `Open-WheelhouseWrite`, `Invoke-WheelhouseSync` |
+| `Exit-WheelhouseLock` | dispose (null-safe) | - | every lock holder |
+| `Open-WheelhouseWrite` | write lock + `Repair-WheelhouseJournal`; releases the lock if the repair fails | `FileStream` | every writer |
 | `Get-WheelhouseExitCode` | `-Outcome Ok/Attention/Error/Busy` -> 0/1/2/3; `-ErrorRecord` -> 3 if lock busy else 2 | int | every job script |
 | `ConvertTo-UtcDateTime` | JSON date (text on 5.1, `[datetime]` on 7) -> UTC `[datetime]` | datetime | PyPI parsing, intake |
+| `ConvertTo-WheelhouseBoolean` | setting (`[bool]`) or command line (`On`/`Off`, `True`, `1`, `Yes`) -> `[bool]` | bool | scripts (`-AutoQuarantine`) |
 
 ### 8.2 `Settings.ps1`
 
@@ -377,9 +430,10 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Get-WheelhouseManifestPath` | `<wh>\manifest.json` | string | manifest functions, logs |
 | `Read-WheelhouseManifest` | entries (`-NoEnumerate`); missing/empty -> empty; invalid -> throws | object[] | many |
 | `Save-WheelhouseManifest` | write the array | file | worker, remove, restore |
-| `Test-ManifestIntegrity` | per entry: malformed `file`, missing, unreadable, hash mismatch; `-ExcludeFile` skips explained files | string[] (`-NoEnumerate`) | `Assert-WheelhouseIntegrity` |
+| `Get-WheelhouseIntegrityProblem` | per entry: `Missing`, `Modified` (hash mismatch), `Unreadable`, `Malformed` | `{Kind; Entry; Message}` | `Assert-WheelhouseIntegrity` |
+| `Test-ManifestIntegrity` | the problem messages only | string[] (`-NoEnumerate`) | tests, callers that only report |
 | `Get-UntrackedWheelFile` | `*.whl` not in the manifest | string[] (`-NoEnumerate`) | integrity, inventory |
-| `Assert-WheelhouseIntegrity` | throw on problems (writes `Report_Integrity_*`), warn on untracked. `-AllowDefenderRemoved`: missing files matched by `Find-DefenderRemovedWheel` are returned instead | `{Entry; ThreatName; Resource}` with the switch | worker, scheduled check |
+| `Assert-WheelhouseIntegrity` | writes `Report_Integrity_*` for any problem, warns on untracked; throws on any problem, or with `-AllowChangedFiles` only on `Unreadable`/`Malformed` and returns the `Missing`/`Modified` ones | problems with the switch | worker, scheduled check |
 | `Merge-WheelhouseManifest` | old entries + wheels not in `-PreRunFiles` (hashed now); bootstrap adds all | object[] (`-NoEnumerate`) | worker (first-time setup only) |
 | `Compare-RequirementsAgainstManifest` | pins without a manifest entry matching the target tag (`cpXY`/`py*`/`abi3`, platform or `any`) | `@{ Descriptions; Packages }` | worker, `Get-UndownloadedPin` |
 | `Get-QuarantineFileName` | wheel names for a pin from the manifest, or an estimated glob | string[] | alert HTML |
@@ -398,14 +452,15 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Invoke-GroupAudit` | one audit per service, fix suggestions if vulnerable | AuditResult[] (`-NoEnumerate`) | worker, checks, intake, `Invoke-PackageAudit` |
 | `Get-PyPIReleaseInfo` | PyPI JSON API (TLS 1.2 on 5.1): files with sha256, upload time, yanked; release yanked flag; throws if unreadable/empty | `{Files; FirstUploadUtc; Yanked; YankedReason}` | `Test-PackageAge`, `Get-DeployedPackageNotice` |
 | `Test-PackageAge` | release first upload vs. minimum age; `-Expedite` names pass; results carry `EligibleUtc`, `Yanked`, `Release`; unreadable -> failed with `Error` | `@{ TooNew; Results }` | intake |
-| `Get-DeployedPackageNotice` | published versions vs. denylist and PyPI yanked flag (release or deployed file); unreadable -> one aggregated error | `@{ Notices; Errors }` | scheduled check |
+| `Get-DeployedPackageNotice` | published versions vs. denylist and PyPI yanked flag (release or deployed file); unreadable -> one aggregated error | `@{ Notices; Errors; Checked = {Package; Version; Yanked; Reason} }` | scheduled check |
 
 ### 8.6 `Intake.ps1`
 
 | Function | Purpose | Returns | Callers |
 |---|---|---|---|
-| `Invoke-CandidateIntake` | the per-package gate (section 9.1) | `@{ Accepted; Rejected (Name, Version, Reason, Category); AuditResults; Published }` | worker |
-| `Publish-StagedWheel` | copy as `.partial`, re-hash, rename; identical untracked file kept, different one throws | `{Entry; Created}` | intake |
+| `Invoke-CandidateIntake` | first half of the gate: every check, no lock, nothing written to the wheelhouse (section 9.1) | `@{ Packages; Rejected (Name, Version, Reason, Category); AuditResults; Verified = @{name = staged FileInfo[]}; StagingPath }` | `Invoke-WheelhouseSync` |
+| `Publish-CandidateIntake` | second half: under the write lock, re-check the denylist, journal, copy, `Complete-WheelhousePublishJournal`, catalog + history; always deletes the staging folder | `@{ Accepted; Rejected; Published; Manifest }` | `Invoke-WheelhouseSync` |
+| `Publish-StagedWheel` | copy as `.partial`, re-hash, rename; identical untracked file kept, different one throws | `{Entry; Created}` | `Publish-CandidateIntake` |
 
 ### 8.7 `Alert.ps1`
 
@@ -443,12 +498,13 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Get-WheelhouseQuarantinePath` | `<wh>\_quarantine` | quarantine functions |
 | `Get-PackageAuditStatus` | latest audit per pin from report files (newest first, <= 300 files, stops when every pin was seen by every `-Services`); default `Unknown` | inventory |
 | `Get-PackageScanStatus` | latest Defender result per file from `Report_Scan_*` (<= 50, `Error` reports skipped; covered = file or wheelhouse folder scanned) | inventory |
-| `Get-WheelhousePackage` | inventory rows (manifest x groups x audit x scan x denylist) + groups + untracked | UI `GET /api/packages` |
+| `Get-WheelhousePackage` | inventory rows (manifest x groups x catalog checks x denylist; report parsing only when no catalog exists yet) + groups + untracked | UI `GET /api/packages` |
 | `Invoke-PackageAudit` | audit chosen pins via a temporary `selection.txt` | Test-WheelhousePackage |
 | `Remove-RequirementFromGroupFile` | remove one pin and its `--hash` continuation lines, atomically | remove |
 | `Read-QuarantineRecord` / `Save-QuarantineRecord` / `Get-QuarantinedPackage` | `quarantine.json` | remove, restore, UI |
-| `Remove-WheelhousePackage` | section 9.5; `-Quarantine`, `-Reason`, `-NoDenylist`, `-DenylistPath`, `-LockHeld` | UI, worker (Defender-removed) |
-| `Restore-WheelhousePackage` | section 9.5; `-KeepDenylist` | UI |
+| `Remove-WheelhousePackage` | section 9.5 (write lock, journal, undo, catalog + history; "taken out" instead of "deleted" when the wheels were already gone); `-Quarantine`, `-Reason`, `-NoDenylist`, `-DenylistPath`, `-LockHeld` | UI, `Resolve-WheelhouseIntegrityProblem` |
+| `Resolve-WheelhouseIntegrityProblem` | per version: with `-AutoQuarantine` take out a missing one / quarantine a modified one (both denylisted); without it change nothing; call under the write lock | `Wheelhouse.Notice` (`FileMissing`/`FileModified`) | `Invoke-WheelhouseSync`, scheduled check |
+| `Restore-WheelhousePackage` | section 9.5 (verify, journal, `Complete-WheelhouseRestoreJournal`, catalog + history); `-KeepDenylist` | UI |
 | `Test-PackageSpec` | allowed `requirements.in` line (name, extras, version operators; <= 200 chars) | `Add-RequirementInLine` |
 | `Add-RequirementInLine` | append valid, new, non-denylisted specs | UI add |
 
@@ -456,11 +512,11 @@ Columns: purpose | returns / side effects | callers. All are exported.
 
 | Function | Purpose | Callers |
 |---|---|---|
-| `Test-WheelhouseDefenderAvailable` | `Start-MpScan` exists | scan, UI state, `Find-DefenderRemovedWheel` |
+| `Test-WheelhouseDefenderAvailable` | `Start-MpScan` exists | scan, UI state |
 | `Invoke-MpScan` | `Start-MpScan -ScanType CustomScan` (mock seam) | scan |
-| `Get-WheelhouseThreatDetection` | detections since a time, per resource, with threat name (mock seam) | scan, `Find-DefenderRemovedWheel` |
-| `Find-DefenderRemovedWheel` | missing manifest files that a detection names; unreadable history -> none (fail closed) | integrity |
-| `Invoke-WheelhouseDefenderScan` | scan paths, match detections (5 s margin) by substring of the scanned path; `Threat` > `Error` > `Clean`; optional `Report_Scan_*` | worker, checks, scan script, intake |
+| `Get-WheelhouseThreatDetection` | detections since a time, per resource, with threat name (mock seam) | scan |
+| `Invoke-WheelhouseCopyScan` | copy wheels to local staging, check SHA256 against the manifest, scan the copies, report the share files; changed/uncopyable wheels in `NotScanned` | `Wheelhouse.ScanResult` | Invoke-WheelhouseScan.ps1 |
+| `Invoke-WheelhouseDefenderScan` | scan local paths, match detections (5 s margin) by substring of the scanned path; `Threat` > `Error` > `Clean`; optional `Report_Scan_*`. Never given the share. | intake, `Invoke-WheelhouseCopyScan` |
 
 ### 8.12 `Ui.ps1`
 See [section 10](#10-web-ui). Functions: `Get-WheelhouseUiContext` (effective settings, read per
@@ -468,8 +524,41 @@ request), `Assert-WheelhouseUiConfigured`, `Get-UiBodyValue`, `Resolve-UiPackage
 `ConvertTo-UiArgument`, `Get-WheelhouseUiRunningJob`, `Start-WheelhouseUiJobStep`,
 `Start-WheelhouseUiJob`, `Sync-WheelhouseUiJob`, `Stop-WheelhouseUiJob`, `Read-UiLogFile`,
 `ConvertTo-WheelhouseUiJobSummary`, `Get-WheelhouseUiRandomToken`, `Test-WheelhouseUiRequest`,
-`Invoke-WheelhouseUiApi`, `Send-WheelhouseUiResponse`, `Invoke-WheelhouseUiRequest`,
-`Start-WheelhouseUiServer`.
+`Get-WheelhouseUiRoute` (the route table), `Invoke-WheelhouseUiApi`, `Send-WheelhouseUiResponse`,
+`Invoke-WheelhouseUiRequest`, `Start-WheelhouseUiServer`.
+
+### 8.13 `Catalog.ps1`
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Get-WheelhouseCatalogPath` / `Get-WheelhouseEventLogPath` | `<wh>\catalog.json` / `<wh>\events.jsonl` | catalog functions |
+| `ConvertTo-CatalogRecord` / `ConvertTo-CatalogCheck` | normalize a record read from JSON: every property present, checks rebuilt with ISO timestamps and real lists | `Read-WheelhouseCatalog` |
+| `New-CatalogRecord` | a new record (state, reason) | sync, state changes |
+| `Read-WheelhouseCatalog` / `Save-WheelhouseCatalog` | `{Path; WheelhousePath; Exists; Records ("name==version" -> record)}`; damaged or newer schema -> throws; atomic save, sorted | everything below |
+| `Write-WheelhouseEvent` / `Read-WheelhouseEvent` | append one history line (failure only warns) / newest first, filter by package and version, skip bad lines | writers / UI history |
+| `Set-CatalogRecordState` | change state, `state_since`, reason; history entry unless `-NoEvent` | sync, `Set-WheelhouseCatalogState` |
+| `Sync-WheelhouseCatalog` | reconcile with manifest, group files, quarantine; a new catalog imports the latest reports and quarantine records | every catalog update |
+| `Get-CatalogServiceMap` | a record's per-service audit results as an ordered hashtable | `Update-CatalogAuditResult` |
+| `Update-CatalogAuditResult` / `Update-CatalogScanResult` / `Update-CatalogPyPIResult` | record check results; history entry on a status change; failed checks never refresh a status | sync run, checks |
+| `Update-WheelhouseCatalog` | write lock (unless `-LockHeld`) + read + sync + `-Update { param($catalog) }` + save | scripts, journal repair, sync run |
+| `Set-WheelhouseCatalogState` | record operation results (`{Name; Version; State; Action; Detail}`) in history and catalog; failure only warns | publish, remove, restore |
+
+### 8.14 `Journal.ps1`
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Get-WheelhouseJournalFolder` | `<wh>\.journal` | journal functions |
+| `New-WheelhouseJournal` / `Remove-WheelhouseJournal` | write the intent of a publish/remove/restore / delete it after the last step | publish, remove, restore |
+| `Repair-WheelhouseJournal` | finish every leftover journal (oldest first), history entry `Recovered`, reconcile the catalog; unreadable or unfinishable -> throws | `Open-WheelhouseWrite` |
+| `Complete-WheelhousePublishJournal` | manifest entries for wheels present with the recorded hash; pins for additions whose wheels all arrived; delete `.partial` leftovers | `Publish-CandidateIntake`, repair |
+| `Complete-WheelhouseRemoveJournal` | roll a remove/quarantine forward: denylist, quarantine record, pins, manifest, files | repair |
+| `Complete-WheelhouseRestoreJournal` | roll a restore forward (hash-checked move back, manifest, pins, record, denylist); returns whether the denylist entry was removed | `Restore-WheelhousePackage`, repair |
+
+### 8.15 `Sync.ps1`
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Invoke-WheelhouseSync` | the update run (section 9.2); returns `{Outcome Ok/Attention/Error; AuditResults; Notices; Rejected; Published}`; throws when it cannot start | Update-Wheelhouse.ps1 |
 
 ---
 
@@ -488,33 +577,45 @@ previous ones; `$reject` moves a package from `$remaining` to `Rejected` with a 
 | 3 | `pip download -d <staging> --no-deps --only-binary=:all: --python-version --platform --implementation cp` via `Invoke-PipPinRetry` | `no-wheel`, `download` | staging = `<StagingRoot>\<guid>` |
 | 4 | Each staged file vs. the release's PyPI file list: listed, sha256 equal, not yanked, own upload date vs. cooldown (unless expedited) | `integrity`, `yanked`, `cooldown`, `pypi-metadata` | files claimed by no package are discarded |
 | 5 | `Invoke-WheelhouseDefenderScan` of the staging folder | `defender` | `Threat`: reject the package whose file path the detection names; an unmatched detection rejects all staged; `Error`: reject all with `-RequireDefenderScan`, else warn; a file that vanished during the scan is rejected |
-| 6 | `Publish-StagedWheel` per file | `publish` | on failure, files this call created are deleted |
+
+`Invoke-CandidateIntake` stops here: it returns the verified staged files and leaves the staging
+folder for `Publish-CandidateIntake`, which runs under the write lock:
+
+| # | Stage | Reject category | Notes |
+|---|---|---|---|
+| 6 | Denylist read again | `denylist` | a version blocked while the checks ran |
+| 7 | `New-WheelhouseJournal publish` | - | planned entries (hashes of the staged files) and additions |
+| 8 | `Publish-StagedWheel` per file | `publish` | on failure, files this call created are deleted |
+| 9 | `Complete-WheelhousePublishJournal` | - | manifest first, then the pins of accepted additions |
+| 10 | `Set-WheelhouseCatalogState` | - | `Published` + history (with the expedite reason, if any); a completed intake scan becomes the version's scan result (`Clean`) |
 
 `finally` removes the staging folder. Returns `Published` = manifest entries (sha256 = verified
-hash, `downloaded_utc` = now).
+hash, `downloaded_utc` = now) and the manifest afterwards.
 
-### 9.2 The worker (`Update-Wheelhouse.ps1`)
+### 9.2 The update run (`Invoke-WheelhouseSync`)
+
+`Update-Wheelhouse.ps1`: `Start-WheelhouseRun` -> parse/validate `-ExpeditePackage` (+ reason) ->
+`Confirm-PythonAndTooling` -> `Invoke-WheelhouseSync` -> exit code from `Outcome` -> emit
+AuditResults, Notices. The function:
 
 ```
-Start-WheelhouseRun; parse/validate -ExpeditePackage (+ reason); Enter-WheelhouseLock
-Confirm-PythonAndTooling; Read-WheelhouseDenylist
-Read-WheelhouseManifest; isBootstrap = (count == 0)
-Assert-WheelhouseIntegrity -AllowDefenderRemoved
-    each returned pin -> Remove-WheelhousePackage -LockHeld (delete mode, reason "removed by Microsoft Defender")
-                         + DefenderRemoved notice; re-read manifest
-Get-WheelhouseGroupFile; Read-RequirementFile(local); Get-RequirementMergePlan -> additions per group
-foreach group (existing first, then new by number):
-    candidates = additions + Compare-RequirementsAgainstManifest(listed vs manifest).Packages
-    Invoke-CandidateIntake (Expedite, RequireDefenderScan)
-    manifest += Published; Save-WheelhouseManifest          <- before touching the group file
-    Add-RequirementToGroupFile for accepted *additions*
-    rejections -> list (+ IntakeBlocked notice for integrity/defender; audit-error => incomplete)
-    if group existed and lists pins: Invoke-GroupAudit -Stage Deployed
-warn about unused -ExpeditePackage; write Report_Rejected_*
-if isBootstrap and something published: Merge-WheelhouseManifest -PreRunFiles @() (adopt pre-existing wheels)
-Invoke-WheelhouseDefenderScan(wheelhouse): Threat -> DefenderThreat notices
-exit: incomplete -> 2, any failure -> 1, else 0; catch -> Get-WheelhouseExitCode -ErrorRecord
-finally: Exit-WheelhouseLock; Stop-WheelhouseRun; emit AuditResults, Notices
+Enter-WheelhouseLock -Kind sync                          (whole run; busy -> exit 3)
+A [write lock]  Read-WheelhouseDenylist; Read-WheelhouseManifest; isBootstrap = (count == 0)
+                Assert-WheelhouseIntegrity -AllowChangedFiles:$AutoQuarantine  (off: missing/changed -> throw)
+                    Missing/Modified -> Resolve-WheelhouseIntegrityProblem -AutoQuarantine -> FileMissing/FileModified notices
+                Update-WheelhouseCatalog -LockHeld (reconcile / create)
+                Get-WheelhouseGroupFile + Read-RequirementFile per group (snapshot)
+B [no lock]     Read-RequirementFile(local); Get-RequirementMergePlan -> additions per group
+C per group (existing first, then new by number):
+   [no lock]    candidates = additions + Compare-RequirementsAgainstManifest(listed vs manifest).Packages
+                Invoke-CandidateIntake (Expedite, RequireDefenderScan, StagingRoot)
+   [write lock] Publish-CandidateIntake (9.1 steps 6-10) -> manifest refreshed
+   [no lock]    rejections -> list (+ IntakeBlocked notice for integrity/defender; audit-error => incomplete)
+                if the group existed and lists pins: Invoke-GroupAudit -Stage Deployed
+                warn about unused -ExpeditePackage; write Report_Rejected_*
+D [write lock]  if isBootstrap and something published: Merge-WheelhouseManifest -PreRunFiles @()
+E [write lock]  catalog: Sync + Update-CatalogAuditResult(all audits)    (no scan of the share)
+Outcome: incomplete -> Error, any failure -> Attention, else Ok
 ```
 
 ### 9.3 The scheduled re-check (`Test-Wheelhouse.ps1`)
@@ -523,17 +624,21 @@ The answer to "a package passed intake, then fails a check later":
 
 ```
 Start-WheelhouseRun; Confirm-PythonAndTooling; Read-WheelhouseDenylist; Read-WheelhouseManifest
-if manifest not empty: Assert-WheelhouseIntegrity -AllowDefenderRemoved -> DefenderRemoved notices
-                       (read only: the worker cleans up); published = manifest minus those
+if manifest not empty: Assert-WheelhouseIntegrity -AllowChangedFiles
+    Missing/Modified -> AutoQuarantine on:  Open-WheelhouseWrite (300 s) + Resolve-WheelhouseIntegrityProblem -AutoQuarantine
+                        AutoQuarantine off: Resolve-WheelhouseIntegrityProblem (report only)
+    -> FileMissing / FileModified notices; published = manifest minus those
 Get-WheelhouseGroupFile (always - also with an empty manifest); Get-UndownloadedPin -> warnings
 Get-DeployedPackageNotice(published, denylist) -> Denylisted / Yanked notices, PyPI errors
 Invoke-GroupAudit -Stage Scheduled per group
-if -DefenderScan or DefenderScanInScheduledCheck: scan -> DefenderThreat notices / check error
+Update-WheelhouseCatalog { Update-CatalogAuditResult; Update-CatalogPyPIResult(Checked) }
+    failure -> CheckError (the UI would otherwise show stale results as current)
 Get-VulnerabilityAlertParameter(AuditResults, Notice, CheckError) -> & Send-VulnerabilityAlert.ps1
 exit: incomplete or alert failed -> 2; findings -> 1; else 0
 ```
 
-It never changes the wheelhouse; acting on findings is an administrator decision.
+It changes the wheelhouse only to take out wheels missing or changed on the share (with
+`AutoQuarantine`); every other finding is reported and acting on it is an administrator decision.
 
 ### 9.4 Alerting
 
@@ -547,19 +652,25 @@ list. Integrity failures abort before any alert (they surface as exit code 2 and
 
 ### 9.5 Remove, quarantine, restore
 
-`Remove-WheelhousePackage` (lock unless `-LockHeld`), undo action in brackets:
+`Remove-WheelhousePackage` (`Open-WheelhouseWrite` unless `-LockHeld`) reads everything it needs,
+writes a `remove` journal, then runs these steps - undo action in brackets:
 
 1. denylist entry (`removed`/`quarantined`) [remove it, only if it did not exist before]
 2. quarantine record, quarantine mode [restore previous records]
 3. pin out of each affected group file [rewrite original content]
 4. manifest without the entries [save previous manifest]
 5. quarantine mode: move files to `_quarantine\<yyyyMMdd_HHmmss>_<name>_<version>\` [move back]
-6. outside the undo block: delete mode deletes the files; release the lock
+6. outside the undo block: delete mode deletes the files, `Set-WheelhouseCatalogState`
+   (`Quarantined`/`Removed` + history with reason, files, groups), delete the journal, release the lock
 
-`Restore-WheelhousePackage`: under the lock, verify everything first (destination absent, not in
-manifest, quarantined file present, SHA256 unchanged) -> move back -> manifest += recorded entries
--> re-add pins to the recorded groups (if missing) -> drop record and empty folder -> remove the
-`quarantined` denylist entry unless `-KeepDenylist`.
+An exception in steps 1-5 runs the undo stack and deletes the journal (nothing to finish). A failed
+delete in step 6, or a crash anywhere, leaves the journal: the next writer finishes the removal.
+
+`Restore-WheelhousePackage`: under the write lock, verify everything first (destination absent,
+not in manifest, quarantined file present, SHA256 unchanged) -> `restore` journal ->
+`Complete-WheelhouseRestoreJournal` (move back, manifest += recorded entries, re-add pins to the
+recorded groups, drop record and empty folder, remove the `quarantined` denylist entry unless
+`-KeepDenylist`) -> `Set-WheelhouseCatalogState` (`Published`, `Restored`) -> delete the journal.
 
 ### 9.6 Resolve (`Update-Requirement.ps1`)
 See 7.3. It never touches the wheelhouse and takes no lock.
@@ -578,6 +689,18 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
       Cancel: taskkill /PID /T /F -> Cancelled. Shutdown cancels the running job.
 ```
 
+### 9.8 Catalog lifecycle
+
+- Created by the first writer after an upgrade (`Sync-WheelhouseCatalog` on a missing file):
+  one record per manifest version (`Published`) and per quarantine record (`Quarantined`), with
+  the latest audit/scan results imported from the report files, and one `CatalogCreated` event.
+- Reconciled by every catalog write: state, files and groups follow manifest, group files and
+  quarantine; differences produce `Reconciled` or `Discovered` events.
+- Operations record their own changes with a reason (`Published`, `Quarantined`, `Deleted`,
+  `Restored`, `Recovered`); checks record `AuditChanged`, `ScanChanged`, `PyPIChanged`.
+- The UI reads status from the catalog (`Get-WheelhousePackage`) and history from `events.jsonl`
+  (`GET /api/packages/<name>/<version>/history`).
+
 ---
 
 ## 10. Web UI
@@ -590,7 +713,11 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 - Non-API paths: GET only (405); `/` needs `?t=<token>` (403).
 - Responses: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
   `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer`.
-- `Invoke-WheelhouseUiApi` maps `ArgumentException` -> 400, `KeyNotFoundException` -> 404,
+- `Invoke-WheelhouseUiApi` finds the route in `$script:UiRoutes` (`Get-WheelhouseUiRoute`). Each
+  route declares `Method`, `Pattern` (named groups reach the handler as `$Match`), `Wheelhouse`
+  (needs a configured, reachable wheelhouse), `Idle` (refused with that message while a job runs)
+  and `Handler { param($Context, $Body, $Match) }`.
+- It maps `ArgumentException` -> 400, `KeyNotFoundException` -> 404,
   `InvalidOperationException` -> 409 (includes the busy lock and "a job is running"), other -> 500.
 
 ### 10.2 API
@@ -599,6 +726,7 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 |---|---|---|---|
 | `GET /api/state` | - | path, configured, reachable, defender, is_admin, python/platform, running job | 200 |
 | `GET /api/packages` | - | `Get-WheelhousePackage` (denylist, configured services) | 200 |
+| `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
 | `POST /api/packages/audit` | `{all}` or `{packages:[{name,version}]}` (<= 500) | job `Test-WheelhousePackage.ps1 [-Package ...]` | 202 |
 | `POST /api/packages/scan` | `{all}` or `{files:[...]}` | job `Invoke-WheelhouseScan.ps1 [-File ...]` | 202 |
 | `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
@@ -615,8 +743,9 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 ### 10.3 Browser client (`Web/app.js`)
 
 One IIFE, ES5, no dependencies. `api()` adds the token header and JSON content type; `h()`
-builds DOM nodes (never `innerHTML` with data). Tabs: Packages (`loadPackages`, `renderPackages`,
-`runAudit`, `runScan`, `removeSelected`), Add (`renderAdd`, `loadRequirements`, `loadRejected`),
+builds DOM nodes (never `innerHTML` with data); `confirmDialog` / `infoDialog` use the page's one
+`<dialog>`. Tabs: Packages (`loadPackages`, `renderPackages`, `runAudit`, `runScan`,
+`removeSelected`, `showHistory` - the per-row History dialog), Add (`renderAdd`, `loadRequirements`, `loadRejected`),
 Quarantine (`loadQuarantine`), Denylist (`loadDenylist`), Settings (`loadSettings`, a form
 generated from the schema), Jobs (`loadJobs`, `watchJob`, `pollJob` every 1.5 s, `jobKind`/
 `jobLabel` for Succeeded/Running/Attention/Failed/Cancelled). The CSP forbids inline scripts and
@@ -639,11 +768,12 @@ folder) - Windows' JScript cannot, because the code uses ES5 reserved-word prope
 **`Wheelhouse.AuditResult`**: `Stage`, `Group`, `GroupFile`, `Service`, `Status`
 (`Passed`/`Vulnerable`/`Error`), `ExitCode`, `ReportPath`, `Message`.
 
-**`Wheelhouse.Notice`**: `Kind` (`Denylisted`, `Yanked`, `DefenderThreat`, `DefenderRemoved`,
+**`Wheelhouse.Notice`**: `Kind` (`Denylisted`, `Yanked`, `FileMissing`, `FileModified`,
 `IntakeBlocked`), `Package`, `Version`, `Files[]`, `Message`, `Action`.
 
 **`Wheelhouse.ScanResult`**: `Status` (`Clean`/`Threat`/`Error`), `Message`, `ScanTime`,
-`ScannedPaths[]`, `Threats[{Resource; ThreatName; ThreatId; ActionSuccess}]`, `ReportPath`.
+`ScannedPaths[]`, `Threats[{Resource; ThreatName; ThreatId; ActionSuccess}]`, `ReportPath`;
+`Invoke-WheelhouseCopyScan` adds `NotScanned[]` and reports share paths, not the local copies.
 
 **Rejection** (`Report_Rejected_<ts>.json`): `Group`, `Package`, `Version`, `Kind`
 (`new`/`listed`), `Category`, `Reason`. Categories: `denylist`, `vulnerability`, `audit-error`,
@@ -661,6 +791,18 @@ UploadTimeUtc; Yanked; YankedReason}]`, `FirstUploadUtc`, `Yanked`, `YankedReaso
 **Quarantine record**: `id`, `name`, `version`, `files[<manifest entries>]`, `groups[<file names>]`,
 `reason`, `quarantined_utc`, `quarantined_by`, `denylisted`.
 
+**Catalog** (`catalog.json`): `{ schema: 1; updated_utc; packages: [record] }`. Record: `name`,
+`version`, `state` (`Published`/`Quarantined`/`Removed`), `state_since`, `state_reason`,
+`groups[]` (group file names), `files[]`, `published_utc`, `checks`:
+`audit {status Passed|Vulnerable|Unknown; last_run; last_ok; vulnerabilities[]; services {<service>:
+{status; last_run; vulnerabilities[]; last_error; error}}}`, `scan {status Clean|Threat; last_run;
+threat_files[]}`, `pypi {status Ok|Yanked; last_run; reason}`. Timestamps are ISO 8601 UTC strings.
+
+**History line** (`events.jsonl`): `{ ts; user; action; package; version; detail }`.
+
+**Journal** (`.journal\<ts>_<operation>_<id>.json`): `{ operation publish|remove|restore;
+started_utc; user; pid; data }` - `data` as documented on the matching `Complete-*` function.
+
 **Audit report name**: `Report_<Stage>-<Group>-<OSV|PYPI>_<yyyyMMdd_HHmmss>.json`, Stage in
 `PreDownload`, `Deployed`, `Scheduled`, `Manual`. Defined once in `$script:AuditReportPattern`.
 
@@ -673,7 +815,7 @@ UploadTimeUtc; Yanked; YankedReason}]`, `FirstUploadUtc`, `Yanked`, `YankedReaso
 | 0 | `Ok` | success |
 | 1 | `Attention` | finished with findings / rejections / threats / notices |
 | 2 | `Error`, or any `-ErrorRecord` | aborted, or an audit/check could not be completed |
-| 3 | `Busy`, or `-ErrorRecord` with `Data['WheelhouseLockBusy']` | lock held by another operation |
+| 3 | `Busy`, or `-ErrorRecord` with `Data['WheelhouseLockBusy']` | a lock is held by another operation (write lock past its timeout, or the sync lock: another update run) |
 
 Rules: throw typed exceptions where callers distinguish them (`ArgumentException` for bad input,
 `KeyNotFoundException` for "not found", `InvalidOperationException` for state conflicts);
@@ -726,9 +868,18 @@ Conventions:
 - **Intake tests** use `New-TestRelease` (a fake PyPI release whose wheel content and sha256 are
   known) and the shared mock bodies `$script:intakeAgeMock`, `$script:intakeDownloadMock`,
   `$script:intakeScanMock`, driven by `$global:WhmReleases`, `WhmNoWheel`, `WhmWheelOverride`,
-  `WhmScanStatus`, `WhmThreatPackage`. Always pass `-StagingRoot` inside the test folder.
+  `WhmScanStatus`, `WhmThreatPackage`. `Invoke-TestIntake -Params` runs check + publish like the
+  update run. Always pass `-StagingRoot` and `-DenylistPath` inside the test folder.
+- **`Invoke-WheelhouseSync` tests** use the same mocks plus an `Invoke-GroupAudit` mock, a
+  `Get-TestWheelhouse` and a local requirements file; they assert on files, catalog, history,
+  and that no lock, journal or staging file is left behind.
+- **Journal tests** write a journal by hand (the state a crash leaves) and run
+  `Repair-WheelhouseJournal` / `Open-WheelhouseWrite`.
+- Never pipe a `-NoEnumerate` reader straight into `ForEach-Object` in a test; assign it first or
+  use member access (`(Read-WheelhouseManifest -WheelhousePath $wh).name`).
 - Defender is faked through `Test-WheelhouseDefenderAvailable`, `Invoke-MpScan`,
-  `Get-WheelhouseThreatDetection` (or `Invoke-WheelhouseDefenderScan` as a whole); PyPI through
+  `Get-WheelhouseThreatDetection` (or `Invoke-WheelhouseDefenderScan` as a whole); a wheel removed
+  or changed by the file server's antivirus is simulated by deleting or overwriting it; PyPI through
   `Get-PyPIReleaseInfo` or `Invoke-RestMethod`.
 - **UI API tests** call `Invoke-WheelhouseUiApi` directly with a temp manager root and mock
   `Start-WheelhouseUiJob`. **UI job tests** start real child processes from throw-away scripts.
@@ -778,9 +929,20 @@ section 11), and test it with the intake mocks.
 `Test-Wheelhouse.ps1`, report unreadable inputs as `CheckError`, and add the kind to the README's
 alert table.
 
-**A new API route.** Add a `switch -Regex` branch in `Invoke-WheelhouseUiApi`; validate input
-(patterns + manifest), throw typed exceptions, refuse state changes while a job runs if they touch
-the wheelhouse; add the client call in `app.js` with `api()` and `h()`; add an API test.
+**A new API route.** Add an entry to `Get-WheelhouseUiRoute` (`Method`, `Pattern`, `Wheelhouse`,
+`Idle` if it changes the wheelhouse, `Handler`); validate input with the shared helpers and the
+manifest, throw typed exceptions; add the client call in `app.js` with `api()` and `h()`; add an
+API test.
+
+**A new operation that changes the wheelhouse.** Take `Open-WheelhouseWrite` (or accept
+`-LockHeld`), read what you need under the lock, write a journal before the first step if there is
+more than one step (add an operation to `New-WheelhouseJournal`, a `Complete-*` function that rolls
+it forward idempotently, and a branch in `Repair-WheelhouseJournal`), record the result with
+`Set-WheelhouseCatalogState`, then delete the journal. Keep the lock for seconds, not minutes.
+
+**A new check result in the catalog.** Add a `checks.<kind>` object (and its normalization in
+`ConvertTo-CatalogCheck`), an `Update-Catalog<Kind>Result` function that never refreshes a status
+from a failed check, and show it in `Get-WheelhousePackage` / `showHistory`.
 
 **Before you finish.** Tests under PowerShell 7 *and* 5.1, PSScriptAnalyzer at Warning/Error, the
 ASCII check, and the README/ARCHITECTURE sections your change affects.
@@ -795,11 +957,13 @@ Which code runs for each user scenario (user steps are in the README):
 |---|---|
 | Deploy / upgrade | `Setup.ps1` -> `Save-/Set-WheelhouseSetting`, `Initialize-ManagerFile` |
 | Resolve | `Update-Requirement.ps1` -> uv -> `Test-RequirementWheelAvailability` -> `Invoke-PipPinRetry` |
-| Publish | `Update-Wheelhouse.ps1` -> 9.2 -> `Invoke-CandidateIntake` (9.1) -> `Publish-StagedWheel` |
+| Publish | `Update-Wheelhouse.ps1` -> `Invoke-WheelhouseSync` (9.2) -> `Invoke-CandidateIntake` -> `Publish-CandidateIntake` (9.1) |
+| Crash recovery | any writer -> `Open-WheelhouseWrite` -> `Repair-WheelhouseJournal` -> `Complete-*` -> `Update-WheelhouseCatalog` |
+| Package history | `GET /api/packages/<name>/<version>/history` -> `Read-WheelhouseCatalog`, `Read-WheelhouseEvent` |
 | Publish + alert | `Invoke-WheelhousePipeline.ps1` -> worker -> `Get-VulnerabilityAlertParameter` -> alert script |
 | Urgent fix | worker `-ExpeditePackage` -> intake `-Expedite` -> `Test-PackageAge -Expedite` + file cooldown skip |
-| Weekly check | `Test-Wheelhouse.ps1` -> 9.3 -> `Get-DeployedPackageNotice`, `Invoke-GroupAudit`, optional scan -> alert |
-| Defender removed a wheel | check: notice only; worker: `Assert-WheelhouseIntegrity -AllowDefenderRemoved` -> `Remove-WheelhousePackage -LockHeld` |
+| Weekly check | `Test-Wheelhouse.ps1` -> 9.3 -> `Get-DeployedPackageNotice`, `Invoke-GroupAudit` -> alert |
+| File server antivirus removed/changed a wheel | check or update: `Assert-WheelhouseIntegrity -AllowChangedFiles` -> `Resolve-WheelhouseIntegrityProblem` -> `Remove-WheelhousePackage -LockHeld` |
 | Audit / scan from the UI | `POST /api/packages/audit` or `/scan` -> job -> `Test-WheelhousePackage.ps1` / `Invoke-WheelhouseScan.ps1` |
 | Add from the UI | `POST /api/packages/add` -> `Add-RequirementInLine` -> job `Update-Requirement.ps1`; then `GET /api/requirements` -> `POST /api/wheelhouse/update` |
 | Quarantine / delete / restore | `POST /api/packages/remove` / `/api/quarantine/restore` -> 9.5 |
@@ -810,11 +974,10 @@ Which code runs for each user scenario (user steps are in the README):
 
 ## 17. Known gaps and glossary
 
-Known gaps (tracked in `REFACTOR_PLAN.md`): no persistent per-package state - the UI rebuilds
-status from report files; untracked wheels are only warned about; no accepted-risk waivers, no
-severity or deadlines; alerts are not de-duplicated between runs; `Update-Wheelhouse.ps1` holds the
-lock for the whole run; the worker logic lives in the script rather than a module function;
-integrity re-hashes every file every run; `Send-MailMessage` has no authentication; expedite does
+Known gaps (tracked in `REFACTOR_PLAN.md`): the catalog knows `Published`/`Quarantined`/`Removed`
+only - no `Flagged`, `Waived`, `Unverified` or `Pending` states, severity, deadlines or waivers yet;
+untracked wheels are only warned about; alerts are not de-duplicated between runs; integrity
+re-hashes every file every run (and does so under the write lock); `Send-MailMessage` has no authentication; expedite does
 not reach the resolver (`Update-Requirement.ps1` still needs `-MinimumPackageAgeDays 0` for a
 too-new fix).
 
@@ -826,5 +989,8 @@ too-new fix).
 | Intake | `Invoke-CandidateIntake`: the checks a candidate passes before publishing |
 | Published | the wheel is in the wheelhouse and the manifest |
 | Notice | `Wheelhouse.Notice`: a non-audit finding for the alert |
+| Catalog | `catalog.json`: per-version state and latest check results |
+| Journal | `.journal\*.json`: the intent of a multi-step change, finished after a crash |
+| Write lock / sync lock | `.wheelhouse.lock` (short, every writer) / `.wheelhouse-sync.lock` (one update run at a time) |
 | Bootstrap | a worker run that starts with an empty manifest |
 | Manager root | the folder with `Jobs\`, `config\`, `Input\` (`$script:ManagerRoot`) |

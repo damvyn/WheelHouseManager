@@ -4,15 +4,16 @@
 
 function New-WheelhouseNotice {
     # A finding that needs an administrator but is not a pip-audit result: a published
-    # version that is denylisted or yanked, a Defender detection, a wheel Defender removed,
-    # a download that failed verification. Scripts emit these next to their
+    # version that is denylisted or yanked, a wheel that was removed or changed outside the
+    # manager (e.g. by the file server's antivirus), a download that failed verification or
+    # was detected at intake. Scripts emit these next to their
     # Wheelhouse.AuditResult objects, and the alert lists them in a section of their own.
     # Only builds an object - nothing to confirm.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Denylisted', 'Yanked', 'DefenderThreat', 'DefenderRemoved', 'IntakeBlocked')]
+        [ValidateSet('Denylisted', 'Yanked', 'FileMissing', 'FileModified', 'IntakeBlocked')]
         [string]$Kind,
 
         [AllowEmptyString()]
@@ -35,8 +36,8 @@ function New-WheelhouseNotice {
         $Action = switch ($Kind) {
             'Denylisted' { 'Quarantine or delete it (UI: Packages tab). The denylist only stops new downloads; this version is still installable.' }
             'Yanked' { 'Read the yank reason on PyPI. Pin another version in requirements.in, re-run Update-Requirement.ps1 and Update-Wheelhouse.ps1, then quarantine this one.' }
-            'DefenderThreat' { 'Quarantine the package now (UI: Packages tab), then review the detection in Microsoft Defender.' }
-            'DefenderRemoved' { 'Microsoft Defender removed the wheel. Review the detection; the version is taken out of the group files and denylisted by Update-Wheelhouse.ps1.' }
+            'FileMissing' { "Check the file server's antivirus log and quarantine for this file, then quarantine or delete the version (UI: Packages tab)." }
+            'FileModified' { 'Quarantine the version now (UI: Packages tab) and find out who or what changed the file.' }
             'IntakeBlocked' { 'Nothing was published. Find out why the download differed or was detected before trying this version again.' }
         }
     }

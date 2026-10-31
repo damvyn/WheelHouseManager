@@ -1,3 +1,5 @@
 backups/*
 Examples/*
 staging/
+config/
+logs/

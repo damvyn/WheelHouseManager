@@ -18,7 +18,8 @@ What it does for you:
 - **Lets you act quickly.** Quarantine (reversible) or delete a package, block versions on a
   denylist, restore from quarantine, or fast-track an urgent security fix.
 - **Gives you a web UI** on the manager server for all of the above, plus email (or HTML file)
-  alerts and a full audit trail of reports and logs.
+  alerts, a history of every package version (who added, quarantined or restored it, and when
+  its audit or scan result changed) and a full audit trail of reports and logs.
 
 Contents
 
@@ -84,17 +85,26 @@ The two parts only share the wheelhouse folder: the manager writes it, clients r
    Downloads wait in a staging folder on the manager server until they passed everything. Only
    then are they copied to the share, so clients never see an unchecked file.
 5. **Published.** The wheel is in the wheelhouse, recorded with its SHA256 in `manifest.json`, and
-   its pin is listed in a group file. Clients can install it.
+   its pin is listed in a group file. Clients can install it. The package catalog
+   (`catalog.json`) marks the version *Published* and its history records who published it.
 6. **Monitored.** Every week `Test-Wheelhouse.ps1` re-checks everything that is published:
    files unchanged (hash), new vulnerabilities, yanked on PyPI since, denylisted since, and -
-   optionally - Defender with the latest signatures. Anything it finds goes into one alert.
+   wheels the file server's antivirus removed or changed. Anything it finds goes into one alert, and
+   every result is recorded in the catalog - the UI shows it, and a change (for example *Passed*
+   -> *Vulnerable*) appears in the package's history.
 7. **Taken out (if needed).** You quarantine or delete the package. Its pin is removed and the
    version is denylisted so it is not downloaded again. Quarantine can be undone.
 
-**Nothing is removed automatically.** A package flagged by the weekly check stays installable
-until an administrator acts on the alert. The one exception: a wheel that Microsoft Defender
-deletes or quarantines itself is cleaned out of the manifest and group files by the next
-`Update-Wheelhouse.ps1` run (and denylisted).
+**Findings are not acted on automatically** - a package flagged as vulnerable, yanked or
+denylisted stays installable until an administrator acts on the alert. The one exception is a
+wheel that was **removed or changed on the share** by something else, typically the file
+server's antivirus: with `AutoQuarantine` on (the default), the weekly check or the next update
+takes a missing wheel out of the group files and the manifest, quarantines a changed one as
+evidence, denylists both, and alerts.
+
+**Virus scanning of the share is not this tool's job** - the file server's own antivirus does
+that. This manager scans every *new* download with Microsoft Defender before it is published, and
+can scan published wheels on demand (from hash-checked local copies).
 
 ### Key terms
 
@@ -107,6 +117,8 @@ deletes or quarantines itself is cleaned out of the manifest and group files by 
 | **Cooldown** | Minimum age of a release before it is accepted (`MinimumPackageAgeDays`). Protects against freshly published malicious or broken releases. |
 | **Denylist** | `config\denylist.json`: versions (or `*` for all versions) that must never enter the wheelhouse. |
 | **Quarantine** | `<wheelhouse>\_quarantine\`: removed packages kept for later restore. |
+| **Catalog** | `catalog.json` in the wheelhouse: each package version's state (*Published*, *Quarantined*, *Removed*) and its latest audit, Defender and PyPI results. Rebuilt automatically from the other files if it is missing. |
+| **History** | `events.jsonl` in the wheelhouse: who did what to which version, and when a check result changed. |
 
 ---
 
@@ -174,8 +186,10 @@ C:\WheelHouseManager\
     logs\ui\                        output of jobs started from the web UI
 ```
 
-The wheelhouse share gets `manifest.json`, the group files, `reports\` and `_quarantine\` as
-they are needed.
+The wheelhouse share gets `manifest.json`, `catalog.json`, `events.jsonl`, the group files,
+`reports\` and `_quarantine\` as they are needed. After an upgrade from a version without a
+catalog, the first run that changes or checks the wheelhouse creates `catalog.json` from what is
+there (including the latest audit and scan results); nothing needs to be done by hand.
 
 ### 3.3 Schedule the weekly check - `Test-Wheelhouse.ps1`
 
@@ -198,9 +212,9 @@ Or in the Task Scheduler GUI: **Create Task** -> *Run whether user is logged on 
 trigger -> action `powershell.exe` with the arguments above -> under Settings, *Run task as soon
 as possible after a scheduled start is missed*.
 
-The account needs network access and read access to the share. To also re-scan with Defender
-every week, set `DefenderScanInScheduledCheck = $true` and run the task with highest privileges
-(administrator).
+The account needs network access and read/write access to the share (to take out wheels the file
+server's antivirus removed). No administrator rights are needed. Virus scanning of the share is
+left to the file server's own antivirus.
 
 Task Scheduler's *Last Run Result*: `0` all good, `1` findings (an alert was sent), `2` a check
 could not be completed (also alerted) - see [Exit codes](#9-exit-codes).
@@ -278,7 +292,7 @@ settings file** > **the built-in default**. A key missing from the file uses its
 | `SmtpServer` | (empty) | SMTP relay (`host` or `host:port`). Empty: alerts are saved as HTML files instead of emailed. |
 | `MailTo` / `MailFrom` | `servicedesk@company.com` / `NoReply@company.com` | Alert recipient and sender. |
 | `RequireDefenderScanAtIntake` | `$false` | When a download cannot be scanned (not elevated, Defender missing): `$false` publishes with a warning, `$true` rejects it. A detection always rejects. |
-| `DefenderScanInScheduledCheck` | `$false` | The weekly check also re-scans the whole wheelhouse with Defender (needs an elevated task). |
+| `AutoQuarantine` | `$true` | A published wheel that disappeared from the share (e.g. moved to the file server antivirus' quarantine) is taken out of the group files and denylisted; one whose content changed is quarantined as evidence. `$false`: only reported, and updates stop until someone acts. Override per run with `-AutoQuarantine On|Off`. An alert is sent either way. |
 
 Example:
 
@@ -292,7 +306,7 @@ Example:
     SmtpServer                   = 'smtp.company.local'
     MailTo                       = 'python-admins@company.com'
     RequireDefenderScanAtIntake  = $true
-    DefenderScanInScheduledCheck = $true
+    AutoQuarantine               = $true
 }
 ```
 
@@ -363,10 +377,10 @@ group file cannot list two versions of a package. Both wheels are then in the wh
 
 ```powershell
 .\Test-Wheelhouse.ps1                   # the weekly check now, with alert
-.\Test-Wheelhouse.ps1 -DefenderScan     # ... and a Defender re-scan (elevated PowerShell)
+.\Test-Wheelhouse.ps1 -AutoQuarantine Off   # only report wheels missing/changed on the share
 .\Test-WheelhousePackage.ps1                                   # audit everything, no alert
 .\Test-WheelhousePackage.ps1 -Package numpy==2.3.1,pandas==2.2.3   # audit chosen packages
-.\Invoke-WheelhouseScan.ps1                                    # Defender scan of everything (elevated)
+.\Invoke-WheelhouseScan.ps1                                    # Defender scan of every wheel (elevated; local copies)
 .\Invoke-WheelhouseScan.ps1 -File numpy-2.3.1-cp314-cp314-win_amd64.whl
 ```
 
@@ -383,8 +397,8 @@ An alert (email, or `<wheelhouse>\reports\Alert_<timestamp>.html`) can contain t
 |---|---|---|
 | `Yanked` | A published version was withdrawn on PyPI. | Read the yank reason. Pin another version, resolve, publish, then quarantine this one. |
 | `Denylisted` | A published version is on the denylist (blocked after it was published). | Quarantine or delete it - the denylist only stops new downloads. |
-| `DefenderThreat` | Defender detects a published wheel. | Quarantine it now, then review the detection. |
-| `DefenderRemoved` | Defender removed a published wheel itself. | Review the detection. `Update-Wheelhouse.ps1` cleans up the pin and denylists the version. |
+| `FileMissing` | A published wheel disappeared from the share - usually the file server's antivirus moved it to its quarantine. With AutoQuarantine on, the version was taken out of the group files and denylisted. | Check the file server's antivirus log. False positive: remove the version from the denylist and run `Update-Wheelhouse.ps1` (it downloads a verified copy). Otherwise keep it blocked and pin another version. |
+| `FileModified` | A published wheel's content changed. With AutoQuarantine on, it was quarantined as evidence and denylisted. | Find out what changed it; do not restore it. |
 | `IntakeBlocked` | A download did not match PyPI or was detected - nothing was published. | Investigate before trying that version again. |
 
 **Vulnerability findings** - package, version, advisory ID (CVE/GHSA), description, fix
@@ -402,10 +416,12 @@ before download* was a candidate that never reached the wheelhouse - just change
 at the run log (`<wheelhouse>\reports\Log_Audit_*.txt`), fix the cause (usually network) and run
 `Test-Wheelhouse.ps1` again.
 
-An **integrity failure** (a wheel's hash changed, or a file disappeared without a Defender
-detection) is not alerted by email: the script stops immediately, exit code 2, details in
-`Report_Integrity_*.json`. Treat it as possible tampering: compare the file, restore it from
-quarantine or backup, or remove the package and publish it again.
+A wheel that **disappeared** from the share or whose **content changed** is listed as `FileMissing`
+/ `FileModified` (see the table above). With `AutoQuarantine` off, `Update-Wheelhouse.ps1` refuses
+to run until you quarantine or delete that version. Any other **integrity failure** (a wheel that
+cannot be read, a broken manifest record) is not alerted by email: the script stops immediately,
+exit code 2, details in `Report_Integrity_*.json`. Fix access to the share, or the manifest, and run
+again.
 
 ### 5.6 Publish an urgent security fix (skip the cooldown for one package)
 
@@ -424,7 +440,9 @@ the run.
 In the UI, **Packages** tab: select rows -> **Quarantine** (reversible) or **Delete** (permanent,
 asks for confirmation). Both remove the pin from every group file and the manifest first - so
 clients never see a pin without a wheel - then move or delete the file, and add the version to the
-denylist. If a step fails, the earlier steps are undone.
+denylist. If a step fails, the earlier steps are undone; if the server crashes part-way, the next
+operation finishes the job (see 5.13). You can quarantine while an update is running - only the
+few seconds in which an update writes files make you wait.
 
 **Restore**: **Quarantine** tab -> **Restore**. The file's hash must be unchanged; the package goes
 back into the manifest and its group files, and the denylist entry that quarantining created is
@@ -472,6 +490,20 @@ Pins whose wheel does not fit the new target are treated as missing and download
 Get the new version of this repository and run `Setup.ps1` again with the same
 `-DestinationPath`. Your settings, denylist, `Input\` files and the wheelhouse are not touched.
 
+### 5.13 See a package's history - and what happens after a crash
+
+In the UI's **Packages** tab, **History** on a row shows the version's state, its latest audit,
+Defender and PyPI results, and every recorded event: published (and by whom, with the expedite
+reason if the cooldown was skipped), quarantined or deleted (with the reason), restored, audit
+or scan result changed, yanked on PyPI. The same history is in `<wheelhouse>\events.jsonl`, one
+line per event.
+
+Publishing, quarantining, deleting and restoring each write a small *journal* file
+(`<wheelhouse>\.journal\`) before they start and delete it when they are done. If the server or
+the process dies in between, the next operation that changes the wheelhouse finishes the job first
+(logged as *Finishing an interrupted ...* and recorded as *Recovered* in the history). You do not
+need to do anything, unless that repair itself fails - see [Troubleshooting](#10-troubleshooting).
+
 ---
 
 ## 6. The web UI
@@ -488,7 +520,7 @@ whether Defender is available and the session is elevated.
 
 | Tab | What you can do |
 |---|---|
-| **Packages** | See every published wheel with its groups, latest audit and Defender result, and denylist flag; filter by name or status. Select rows to **Audit**, **Scan**, **Quarantine** or **Delete**. |
+| **Packages** | See every published wheel with its groups, latest audit and Defender result, a *yanked* badge if PyPI withdrew it, and the denylist flag; filter by name or status (vulnerable, threat, never audited/scanned, yanked, denylisted, file missing). Select rows to **Audit**, **Scan**, **Quarantine** or **Delete**; **History** shows one version's state, checks and history. |
 | **Add packages** | **1. Add**: enter packages; they are added to `requirements.in` and resolved - nothing is downloaded. **2. Review and publish**: read the resolved `requirements.txt`, then **Publish** (runs every check, then publishes). *Also publish right away* does both at once. The card at the bottom lists the latest rejected packages with their reasons. |
 | **Quarantine** | Quarantined packages; **Restore** one. |
 | **Denylist** | Add or remove blocked versions; shows whether a blocked version is still published. |
@@ -509,17 +541,20 @@ shows the details.
 |---|---|---|
 | `Setup.ps1` (repo) | Deploy or upgrade the manager | `-DestinationPath`, `-WheelhousePath` |
 | `Jobs\Update-Requirement.ps1` | `requirements.in` -> `requirements.txt` | `-RequirementsInPath`, `-RequirementsTxtPath`, `-PythonVersion`, `-Platform`, `-MinimumPackageAgeDays` |
-| `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins; audit what is published; Defender scan | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
+| `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins; audit what is published; take out wheels missing/changed on the share | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-AutoQuarantine On|Off`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
 | `Invoke-WheelhousePipeline.ps1` (root) | `Update-Wheelhouse.ps1` + one alert | as above, plus `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
-| `Jobs\Test-Wheelhouse.ps1` | Weekly check of everything published, with alert | `-DefenderScan`, `-VulnerabilityServices`, `-SmtpServer`, `-MailTo`, `-MailFrom` |
+| `Jobs\Test-Wheelhouse.ps1` | Weekly check of everything published, with alert | `-AutoQuarantine On|Off`, `-VulnerabilityServices`, `-SmtpServer`, `-MailTo`, `-MailFrom` |
 | `Jobs\Test-WheelhousePackage.ps1` | Audit all or chosen pins, no alert | `-Package name==ver,...` |
-| `Jobs\Invoke-WheelhouseScan.ps1` | Defender scan of all or chosen wheels (elevated) | `-File name.whl,...` |
+| `Jobs\Invoke-WheelhouseScan.ps1` | On-demand Defender scan of all or chosen wheels - copied locally and hash-checked first, never scanned on the share (elevated) | `-File name.whl,...` |
 | `Jobs\Send-VulnerabilityAlert.ps1` | Build and send/save an alert (used by the scripts above) | `-ReportPaths`, `-AuditErrors`, `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
 | `Jobs\Start-WheelhouseUI.ps1` | Start the web UI | `-Port`, `-NoBrowser` |
 
-Only one operation at a time may change the wheelhouse (`Update-Wheelhouse.ps1`, quarantine,
-delete, restore). A second one is refused with "Another wheelhouse operation is already
-running" (exit code 3) - just try again later.
+Changes to the wheelhouse are serialized, but only for the seconds in which files are written:
+quarantine, delete and restore work while an update runs, and the update and the checks wait (up
+to 5 minutes) for each other's write steps. Only one `Update-Wheelhouse.ps1` runs at a time - a
+second one stops with "Another Update-Wheelhouse run is already in progress" (exit code 3). A UI
+action that meets a write step in progress is refused with "Another wheelhouse operation is
+already running" - just try again a moment later.
 
 ---
 
@@ -535,9 +570,12 @@ is deleted after `ReportRetentionMonths`.
 | `Report_<Stage>-<group>-<OSV\|PYPI>_<ts>.json` | Every audit | pip-audit result. Stage: `PreDownload` (candidates), `Deployed` (Update-Wheelhouse), `Scheduled` (Test-Wheelhouse), `Manual` (Test-WheelhousePackage) |
 | `Report_PackageAge-<group>_<ts>.json` | Update-Wheelhouse | Cooldown/yanked data per candidate, with the eligible date |
 | `Report_Rejected_<ts>.json` | Update-Wheelhouse | Every rejected pin with category and reason |
-| `Report_Scan_<ts>.json` | Every Defender scan | Status, scanned paths, detections |
+| `Report_Scan_<ts>.json` | Every Defender scan (intake and on-demand) | Status, scanned paths, detections |
 | `Report_Integrity_<ts>.json` | Integrity check | What did not match the manifest |
 | `Alert_<ts>.html` | Send-VulnerabilityAlert | Saved alert (no SMTP server) |
+
+Next to `reports\`, the wheelhouse holds `catalog.json` (current state and latest check results
+per package version) and `events.jsonl` (history). Neither is deleted by the retention setting.
 
 Jobs started from the UI also keep their console output in `C:\WheelHouseManager\logs\ui\`.
 
@@ -562,7 +600,12 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
 |---|---|
 | `WheelhousePath was not supplied and is not set in config\settings.psd1` | Run `Setup.ps1 -WheelhousePath ...`, or set it in the UI's Settings tab. |
 | `Wheelhouse path does not exist or is not reachable` | Check the share path and the account's access to it. |
-| `Another wheelhouse operation is already running (lock file in use: ...)` | Wait for the other run (or UI job) to finish. The lock is released automatically, even after a crash. |
+| `Another wheelhouse operation is already running (lock file in use: ...)` | Another operation is writing right now (usually for a few seconds). Try again. The lock is released automatically, even after a crash. |
+| `Another Update-Wheelhouse run is already in progress` | Only one update runs at a time. Wait for it to finish. |
+| `Waiting up to 300 s for another wheelhouse operation to finish` | Informational: an update or check waits for another operation's write step. |
+| `A journal of an interrupted operation could not be read` / `An interrupted ... could not be finished` | A crash left a half-done change that cannot be finished automatically (the message says why). Check the files it names by hand, then delete the journal file named in the message; every change to the wheelhouse is refused until then. |
+| `catalog.json exists but could not be parsed` | Restore it from a backup, or delete it: the next run rebuilds it from the manifest, group files and quarantine (the check results start again; the history in `events.jsonl` is kept). |
+| `The results could not be recorded in the package catalog` | The check ran, but its results are not visible in the UI (usually the write lock stayed busy for 5 minutes). The run exits with code 2 - run the check again. |
 | `Wheelhouse integrity check failed - refusing to continue ...` | A published wheel changed or disappeared. See `Report_Integrity_*.json` and section 5.5. |
 | `manifest.json exists but could not be parsed` / `denylist.json exists but could not be parsed` / `quarantine.json could not be parsed` | The file is damaged; it is never treated as empty. Restore it from backup or fix the JSON by hand. |
 | `Wheelhouse has no requirement group files yet, and no local requirements were supplied` | First run: add packages to `requirements.in`, run `Update-Requirement.ps1`, then `Update-Wheelhouse.ps1`. |
@@ -590,15 +633,18 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
   start URL, refuses foreign `Host`/`Origin` headers and non-JSON requests, and validates every
   package and file name against the manifest. Use it on the manager server itself - do not expose
   the port.
-- Changes to the wheelhouse are serialized by a lock, and removal steps are undone if one fails.
+- Changes to the wheelhouse are serialized by a lock; removal steps are undone if one fails, and
+  every multi-step change is journaled, so a crash part-way is finished by the next operation.
+- Every change and every changed check result is recorded with user and time in `events.jsonl`.
 
 ---
 
 ## 12. Limitations
 
 - Wheels only (no source packages), for **one** Python version and platform per manager.
-- Nothing is quarantined automatically when the weekly check finds a problem - an administrator
-  decides.
+- Vulnerable, yanked or denylisted packages are not quarantined automatically - an administrator
+  decides. Only wheels removed or changed on the share are taken out automatically (`AutoQuarantine`).
+- The share is not virus-scanned by this tool; that is the file server antivirus' job.
 - Wheels found in the share that the manager did not publish ("untracked") are reported, but are
   still visible to clients until removed by hand.
 - Email uses `Send-MailMessage` (no SMTP authentication).

@@ -59,21 +59,16 @@ try {
     $manifest = Read-WheelhouseManifest -WheelhousePath $cfg.WheelhousePath
     Write-Log "Manifest contains $($manifest.Count) tracked file(s)."
 
-    # A comma-separated string (how the UI passes a list) is split here.
-    $pins = @($Package | ForEach-Object { $_ -split '[,;]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    # A comma-separated string (how the UI passes a list) is accepted too.
+    $pins = @(ConvertTo-WheelhousePin -Pin $Package)
 
     if ($pins.Count -gt 0) {
         $packages = @{}
         foreach ($pin in $pins) {
-            if ($pin -notmatch '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)==(?<version>[A-Za-z0-9][A-Za-z0-9._+!-]*)$') {
-                throw "Not a name==version pin: '$pin'"
+            if (-not ($manifest | Where-Object { $_.name -eq $pin.Name -and $_.version -eq $pin.Version })) {
+                throw "$($pin.Name)==$($pin.Version) is not tracked in the wheelhouse manifest."
             }
-            $name = Get-NormalizedPackageName $Matches['name']
-            $version = $Matches['version']
-            if (-not ($manifest | Where-Object { $_.name -eq $name -and $_.version -eq $version })) {
-                throw "$name==$version is not tracked in the wheelhouse manifest."
-            }
-            $packages[$name] = $version
+            $packages[$pin.Name] = $pin.Version
         }
         Write-Log "Auditing $($packages.Count) selected package(s)..."
         $auditParams = @{ Packages = $packages; Services = $cfg.VulnerabilityServices; ReportsFolder = $reportsFolder }
@@ -98,9 +93,24 @@ try {
         }
     }
 
-    if ($auditResults | Where-Object { $_.Status -eq 'Error' }) {
+    # The UI's package table shows the results from the catalog.
+    $catalogAudits = $auditResults.ToArray()
+    $catalogServices = $cfg.VulnerabilityServices
+    $recorded = $true
+    try {
+        Update-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath -Update ({
+                param($catalog)
+                Update-CatalogAuditResult -Catalog $catalog -AuditResult $catalogAudits -Services $catalogServices
+            }.GetNewClosure())
+    }
+    catch {
+        Write-Log "The results could not be recorded in the package catalog: $($_.Exception.Message)" 'ERROR'
+        $recorded = $false
+    }
+
+    if (-not $recorded -or ($auditResults | Where-Object { $_.Status -eq 'Error' })) {
         $exitCode = Get-WheelhouseExitCode -Outcome Error
-        $outcome = 'an audit could not be completed'
+        $outcome = $(if ($recorded) { 'an audit could not be completed' } else { 'results not recorded' })
     }
     elseif ($auditResults | Where-Object { $_.Status -eq 'Vulnerable' }) {
         $exitCode = Get-WheelhouseExitCode -Outcome Attention

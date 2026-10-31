@@ -1,6 +1,70 @@
 # ---------------------------------------------------------------------------
-# Generic helpers: logging, package-name normalization, HTML escaping, file I/O
+# Generic helpers: logging, package-name normalization and validation, HTML
+# escaping, file I/O, locks, exit codes
 # ---------------------------------------------------------------------------
+
+# The one definition of what a package name, a version and a wheel file name may look
+# like wherever one comes from outside (UI requests, -Package/-File/-ExpeditePackage,
+# the denylist). Requirement files have their own, more lenient parser.
+$script:PackageNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+$script:PackageVersionPattern = '^[A-Za-z0-9][A-Za-z0-9._+!-]*$'
+$script:WheelFileNamePattern = '^[A-Za-z0-9][A-Za-z0-9._+!-]*\.whl$'
+
+function Test-WheelhousePackageName {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$Name
+    )
+
+    return [bool]($Name -match $script:PackageNamePattern)
+}
+
+function Test-WheelhousePackageVersion {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$Version
+    )
+
+    return [bool]($Version -match $script:PackageVersionPattern)
+}
+
+function Test-WheelhouseWheelFileName {
+    # A bare wheel file name - no folder, no path traversal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$FileName
+    )
+
+    return [bool]($FileName -match $script:WheelFileNamePattern -and [System.IO.Path]::GetFileName($FileName) -eq $FileName)
+}
+
+function ConvertTo-WheelhousePin {
+    # Parses pins written as "name==version". -Pin takes an array and/or comma- or
+    # semicolon-separated strings (how the UI and a command line pass lists). Returns
+    # { Name (normalized); Version } per pin; throws ArgumentException for anything else.
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [string[]]$Pin = @()
+    )
+
+    foreach ($text in @($Pin | ForEach-Object { $_ -split '[,;]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $parts = $text -split '==', 2
+        if ($parts.Count -ne 2 -or -not (Test-WheelhousePackageName $parts[0].Trim()) -or -not (Test-WheelhousePackageVersion $parts[1].Trim())) {
+            throw [System.ArgumentException]::new("Not a name==version pin: '$text'")
+        }
+        [PSCustomObject]@{ Name = (Get-NormalizedPackageName $parts[0].Trim()); Version = $parts[1].Trim() }
+    }
+}
 
 function Write-Log {
     [CmdletBinding()]
@@ -68,7 +132,9 @@ function Write-TextFileAtomic {
     if (-not $PSCmdlet.ShouldProcess($Path, 'Write file')) { return }
 
     $tempPath = "$Path.tmp"
-    Set-Content -Path $tempPath -Value $Content -Encoding utf8 -ErrorAction Stop
+    # Empty content gives an empty file - not a lone line break that a later append
+    # would turn into a blank first line.
+    Set-Content -Path $tempPath -Value $Content -Encoding utf8 -NoNewline:($Content -eq '') -ErrorAction Stop
     Move-Item -Path $tempPath -Destination $Path -Force -ErrorAction Stop
 }
 
@@ -126,35 +192,66 @@ function Invoke-NativeCommand {
 }
 
 function Enter-WheelhouseLock {
-    # Takes the wheelhouse-wide lock (<wheelhouse>\.wheelhouse.lock) that every
-    # operation changing the manifest or the group files holds while it runs, so a
-    # UI action, Update-Wheelhouse.ps1 and a scheduled run never rewrite them at
-    # the same time. The lock is an exclusively opened, delete-on-close file: the
-    # operating system releases it even if the holding process crashes.
-    # Returns the lock handle for Exit-WheelhouseLock; throws InvalidOperationException
-    # if another operation holds the lock.
+    # Takes one of the wheelhouse locks. Each is an exclusively opened, delete-on-close
+    # file, so the operating system releases it even if the holder crashes.
+    #   write (<wheelhouse>\.wheelhouse.lock) - held while the manifest, group files,
+    #         catalog or quarantine change; only for the seconds that takes. Writers
+    #         normally take it through Open-WheelhouseWrite (lock + journal repair).
+    #   sync  (<wheelhouse>\.wheelhouse-sync.lock) - held for a whole Update-Wheelhouse
+    #         run, so two runs never plan merges from the same state. Other operations
+    #         ignore it.
+    # -TimeoutSeconds waits for a busy lock (0 = fail at once). Returns the handle for
+    # Exit-WheelhouseLock; throws InvalidOperationException (Data['WheelhouseLockBusy'])
+    # when the lock stays busy.
     [CmdletBinding()]
     [OutputType([System.IO.FileStream])]
     param(
         [Parameter(Mandatory)]
-        [string]$WheelhousePath
+        [string]$WheelhousePath,
+
+        [ValidateSet('write', 'sync')]
+        [string]$Kind = 'write',
+
+        [ValidateRange(0, 3600)]
+        [int]$TimeoutSeconds = 0
     )
 
-    $lockPath = Join-Path $WheelhousePath '.wheelhouse.lock'
-    try {
-        $stream = [System.IO.FileStream]::new(
-            $lockPath,
-            [System.IO.FileMode]::OpenOrCreate,
-            [System.IO.FileAccess]::ReadWrite,
-            [System.IO.FileShare]::None,
-            4096,
-            [System.IO.FileOptions]::DeleteOnClose)
-    }
-    catch [System.IO.IOException] {
-        $busy = [System.InvalidOperationException]::new("Another wheelhouse operation is already running (lock file in use: $lockPath). Wait for it to finish and try again.")
-        # Lets scripts exit with the "busy" code (Get-WheelhouseExitCode).
-        $busy.Data['WheelhouseLockBusy'] = $true
-        throw $busy
+    $lockPath = Join-Path $WheelhousePath $(if ($Kind -eq 'sync') { '.wheelhouse-sync.lock' } else { '.wheelhouse.lock' })
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $announced = $false
+    while ($true) {
+        try {
+            $stream = [System.IO.FileStream]::new(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None,
+                4096,
+                [System.IO.FileOptions]::DeleteOnClose)
+            break
+        }
+        catch [System.IO.DirectoryNotFoundException] {
+            throw "The wheelhouse folder does not exist or is not reachable: $WheelhousePath"
+        }
+        catch [System.IO.IOException] {
+            if ((Get-Date) -ge $deadline) {
+                $text = if ($Kind -eq 'sync') {
+                    "Another Update-Wheelhouse run is already in progress (lock file in use: $lockPath). Wait for it to finish and try again."
+                }
+                else {
+                    "Another wheelhouse operation is already running (lock file in use: $lockPath). Wait for it to finish and try again."
+                }
+                $busy = [System.InvalidOperationException]::new($text)
+                # Lets scripts exit with the "busy" code (Get-WheelhouseExitCode).
+                $busy.Data['WheelhouseLockBusy'] = $true
+                throw $busy
+            }
+            if (-not $announced) {
+                Write-Log "Waiting up to $TimeoutSeconds s for another wheelhouse operation to finish ($lockPath)..."
+                $announced = $true
+            }
+            Start-Sleep -Milliseconds 500
+        }
     }
 
     $info = [System.Text.Encoding]::ASCII.GetBytes("pid=$PID user=$env:USERNAME started=$((Get-Date).ToString('s'))")
@@ -172,6 +269,34 @@ function Exit-WheelhouseLock {
     )
 
     if ($null -ne $Lock) { $Lock.Dispose() }
+}
+
+function Open-WheelhouseWrite {
+    # The way every writer starts changing the wheelhouse: takes the write lock, then
+    # finishes any change a crashed process left half-done (Repair-WheelhouseJournal),
+    # so the writer always starts from a consistent state. Returns the lock handle;
+    # release it with Exit-WheelhouseLock.
+    [CmdletBinding()]
+    [OutputType([System.IO.FileStream])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [ValidateRange(0, 3600)]
+        [int]$TimeoutSeconds = 0,
+
+        [string]$DenylistPath = (Get-WheelhouseDenylistPath)
+    )
+
+    $lock = Enter-WheelhouseLock -WheelhousePath $WheelhousePath -TimeoutSeconds $TimeoutSeconds
+    try {
+        Repair-WheelhouseJournal -WheelhousePath $WheelhousePath -DenylistPath $DenylistPath
+    }
+    catch {
+        Exit-WheelhouseLock -Lock $lock
+        throw
+    }
+    return , $lock
 }
 
 function Get-WheelhouseExitCode {
@@ -201,6 +326,21 @@ function Get-WheelhouseExitCode {
         'Busy' { return 3 }
         default { return 0 }
     }
+}
+
+function ConvertTo-WheelhouseBoolean {
+    # An on/off value from a setting ($true/$false) or a command line (On/Off, True/False,
+    # 1/0, Yes/No) as [bool]. Scheduled Tasks pass -File arguments as text, so scripts take
+    # On/Off strings rather than [bool] parameters.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        $Value
+    )
+
+    if ($Value -is [bool]) { return $Value }
+    return ([string]$Value).Trim() -in 'On', 'True', '1', 'Yes'
 }
 
 function ConvertTo-UtcDateTime {
