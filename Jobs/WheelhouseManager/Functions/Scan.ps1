@@ -45,6 +45,40 @@ function Get-WheelhouseThreatDetection {
     }
 }
 
+function Find-DefenderRemovedWheel {
+    # Of the given manifest entries (whose wheel file is missing), returns those that
+    # Microsoft Defender detected - Defender quarantines or deletes such a file itself.
+    # Returns { Entry; ThreatName; Resource } per explained entry. Returns nothing when
+    # Defender's detection history cannot be read, so the caller still treats the files as
+    # missing (fail closed).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Entry,
+
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath
+    )
+
+    if ($Entry.Count -eq 0 -or -not (Test-WheelhouseDefenderAvailable)) { return }
+    try {
+        $detections = @(Get-WheelhouseThreatDetection -Since ([datetime]::MinValue))
+    }
+    catch {
+        Write-Log "Microsoft Defender's detection history could not be read ($($_.Exception.Message)) - missing files are treated as an integrity failure." 'WARN'
+        return
+    }
+
+    foreach ($item in $Entry) {
+        $fullPath = Join-Path $WheelhousePath ([string]$item.file)
+        $hit = $detections | Where-Object { ([string]$_.Resource).IndexOf($fullPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -First 1
+        if ($hit) {
+            [PSCustomObject]@{ Entry = $item; ThreatName = [string]$hit.ThreatName; Resource = [string]$hit.Resource }
+        }
+    }
+}
+
 function Invoke-WheelhouseDefenderScan {
     # Scans each path (a folder or a file) with Microsoft Defender and returns a
     # Wheelhouse.ScanResult. Status:

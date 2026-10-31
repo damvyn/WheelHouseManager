@@ -48,9 +48,13 @@ function Get-PackageAuditStatus {
         [AllowEmptyCollection()]
         [object[]]$Package,
 
+        # The configured services; a package is fully known once each has reported on it.
+        [string[]]$Services = @('osv', 'pypi'),
+
         [int]$MaxReports = 300
     )
 
+    $serviceCount = [math]::Max(1, @($Services | Where-Object { $_ } | Select-Object -Unique).Count)
     $wanted = @{}
     foreach ($item in $Package) { $wanted["$($item.Name)==$($item.Version)"] = $true }
     $seen = @{}
@@ -90,7 +94,7 @@ function Get-PackageAuditStatus {
                 Vulnerabilities = @($current.Vulnerabilities + $ids | Select-Object -Unique)
                 LastAudit       = $(if ($current.LastAudit -gt $stamp) { $current.LastAudit } else { $stamp })
             }
-            if ($seen[$key].Count -eq 2) { $fullySeen++ }
+            if ($seen[$key].Count -eq $serviceCount) { $fullySeen++ }
         }
     }
     return $result
@@ -164,7 +168,9 @@ function Get-WheelhousePackage {
         [string]$WheelhousePath,
 
         [AllowEmptyCollection()]
-        [object[]]$Denylist = @()
+        [object[]]$Denylist = @(),
+
+        [string[]]$Services = @('osv', 'pypi')
     )
 
     $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
@@ -186,7 +192,7 @@ function Get-WheelhousePackage {
 
     $reportsFolder = Join-Path $WheelhousePath 'reports'
     $packageKeys = @($manifest | ForEach-Object { [PSCustomObject]@{ Name = [string]$_.name; Version = [string]$_.version } })
-    $auditStatus = Get-PackageAuditStatus -ReportsFolder $reportsFolder -Package $packageKeys
+    $auditStatus = Get-PackageAuditStatus -ReportsFolder $reportsFolder -Package $packageKeys -Services $Services
     $scanStatus = Get-PackageScanStatus -ReportsFolder $reportsFolder -WheelhousePath $WheelhousePath -File @($manifest | ForEach-Object { [string]$_.file })
 
     $rows = foreach ($entry in ($manifest | Sort-Object name, version, file)) {
@@ -373,7 +379,10 @@ function Remove-WheelhousePackage {
 
         [switch]$NoDenylist,
 
-        [string]$DenylistPath = (Get-WheelhouseDenylistPath)
+        [string]$DenylistPath = (Get-WheelhouseDenylistPath),
+
+        # The caller already holds the wheelhouse lock (Update-Wheelhouse.ps1).
+        [switch]$LockHeld
     )
 
     $normalized = Get-NormalizedPackageName $Name
@@ -381,7 +390,7 @@ function Remove-WheelhousePackage {
     $mode = if ($Quarantine) { 'Quarantine' } else { 'Delete' }
     if (-not $PSCmdlet.ShouldProcess($label, "$mode package")) { return }
 
-    $lock = Enter-WheelhouseLock -WheelhousePath $WheelhousePath
+    $lock = if ($LockHeld) { $null } else { Enter-WheelhouseLock -WheelhousePath $WheelhousePath }
     $undo = [System.Collections.Generic.List[scriptblock]]::new()
     try {
         $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath

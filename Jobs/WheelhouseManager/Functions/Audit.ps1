@@ -289,9 +289,57 @@ function Invoke-GroupAudit {
     Write-Output -NoEnumerate $results
 }
 
+function Get-PyPIReleaseInfo {
+    # Reads one release from the PyPI JSON API (https://pypi.org/pypi/<name>/<version>/json):
+    # every file with its sha256 digest, upload time and yanked flag, plus whether the
+    # release itself is yanked. An exact pin still installs a yanked release (PEP 592), so
+    # callers must check that themselves. Throws if PyPI cannot be read or lists no files.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$Version
+    )
+
+    # Windows PowerShell 5.1 on older .NET Framework defaults to TLS 1.0/1.1, which
+    # pypi.org rejects - every check would then fail closed.
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+
+    $response = Invoke-RestMethod -Uri "https://pypi.org/pypi/$Name/$Version/json" -ErrorAction Stop
+    $files = @(foreach ($url in @($response.urls)) {
+            if ($null -eq $url) { continue }
+            [PSCustomObject]@{
+                FileName      = [string]$url.filename
+                Sha256        = [string]$url.digests.sha256
+                UploadTimeUtc = ConvertTo-UtcDateTime -Value $url.upload_time_iso_8601
+                Yanked        = [bool]$url.yanked
+                YankedReason  = [string]$url.yanked_reason
+            }
+        })
+    if ($files.Count -eq 0) {
+        throw 'No release files found for this version.'
+    }
+
+    return [PSCustomObject]@{
+        Name           = $Name
+        Version        = $Version
+        Files          = $files
+        FirstUploadUtc = ($files | Sort-Object UploadTimeUtc | Select-Object -First 1).UploadTimeUtc
+        Yanked         = [bool]$response.info.yanked
+        YankedReason   = [string]$response.info.yanked_reason
+    }
+}
+
 function Test-PackageAge {
-    # Checks each package's PyPI publish date against the minimum age. Unresolvable
-    # packages fail closed.
+    # Reads each package's PyPI release (Get-PyPIReleaseInfo) and checks its publish date
+    # - the first upload of the release - against the minimum age. Packages named in
+    # -Expedite skip the age requirement (urgent fixes); their result says so.
+    # Unresolvable packages fail closed. Each result also carries the release (files,
+    # digests, yanked), which the checks after the download need.
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -299,46 +347,48 @@ function Test-PackageAge {
         [hashtable]$Packages,
 
         [Parameter(Mandatory)]
-        [int]$MinimumAgeDays
+        [int]$MinimumAgeDays,
+
+        [AllowEmptyCollection()]
+        [string[]]$Expedite = @()
     )
 
     $tooNew = [System.Collections.Generic.List[string]]::new()
     $results = [System.Collections.Generic.List[object]]::new()
     $nowUtc = (Get-Date).ToUniversalTime()
 
-    # Windows PowerShell 5.1 on older .NET Framework defaults to TLS 1.0/1.1, which
-    # pypi.org rejects - every age check would then fail closed.
-    if ($PSVersionTable.PSEdition -ne 'Core') {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    }
-
     foreach ($name in ($Packages.Keys | Sort-Object)) {
         $version = $Packages[$name]
         try {
-            $response = Invoke-RestMethod -Uri "https://pypi.org/pypi/$name/$version/json" -ErrorAction Stop
-
-            if (-not $response.urls -or @($response.urls).Count -eq 0) {
-                throw 'No release files found for this version.'
-            }
-
-            $uploadTimeUtc = [DateTimeOffset]::Parse($response.urls[0].upload_time_iso_8601).UtcDateTime
+            $release = Get-PyPIReleaseInfo -Name $name -Version $version
+            $uploadTimeUtc = $release.FirstUploadUtc
             $ageDays = [math]::Floor(($nowUtc - $uploadTimeUtc).TotalDays)
-            $passed = $ageDays -ge $MinimumAgeDays
+            $expedited = $Expedite -contains $name
+            $passed = $expedited -or ($ageDays -ge $MinimumAgeDays)
+            $eligibleUtc = $uploadTimeUtc.AddDays($MinimumAgeDays)
 
             $results.Add([PSCustomObject]@{
                     Package             = $name
                     Version             = $version
-                    UploadDateUtc       = $uploadTimeUtc
+                    UploadDateUtc       = $uploadTimeUtc.ToString('o')
                     AgeDays             = $ageDays
                     MinimumRequiredDays = $MinimumAgeDays
+                    EligibleUtc         = $eligibleUtc.ToString('o')
+                    Expedited           = $expedited
                     Passed              = $passed
+                    Yanked              = $release.Yanked
+                    YankedReason        = $release.YankedReason
+                    Release             = $release
                 })
 
-            if ($passed) {
+            if ($expedited -and $ageDays -lt $MinimumAgeDays) {
+                Write-Log "Age check SKIPPED (expedited): $name==$version was published $ageDays day(s) ago (normally requires $MinimumAgeDays)." 'WARN'
+            }
+            elseif ($passed) {
                 Write-Log "Age check OK: $name==$version was published $ageDays day(s) ago (>= $MinimumAgeDays)." 'OK'
             }
             else {
-                Write-Log "Age check FAILED: $name==$version was published only $ageDays day(s) ago (requires $MinimumAgeDays)." 'WARN'
+                Write-Log "Age check FAILED: $name==$version was published only $ageDays day(s) ago (requires $MinimumAgeDays, eligible $($eligibleUtc.ToString('yyyy-MM-dd')))." 'WARN'
                 $tooNew.Add("$name==$version (published $ageDays day(s) ago, requires $MinimumAgeDays)")
             }
         }
@@ -350,7 +400,12 @@ function Test-PackageAge {
                     UploadDateUtc       = $null
                     AgeDays             = $null
                     MinimumRequiredDays = $MinimumAgeDays
+                    EligibleUtc         = $null
+                    Expedited           = $false
                     Passed              = $false
+                    Yanked              = $null
+                    YankedReason        = $null
+                    Release             = $null
                     Error               = $_.Exception.Message
                 })
             $tooNew.Add("$name==$version (could not verify publish date)")
@@ -358,4 +413,72 @@ function Test-PackageAge {
     }
 
     return @{ TooNew = $tooNew.ToArray(); Results = $results.ToArray() }
+}
+
+function Get-DeployedPackageNotice {
+    # Re-checks what is already published against conditions that can change after
+    # intake: the denylist (an entry added later) and PyPI's yanked flag (the release or
+    # one of the deployed files). Returns @{ Notices = Wheelhouse.Notice, ...; Errors =
+    # string, ... }. A release whose PyPI data cannot be read is an error, never "not yanked".
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Manifest,
+
+        [AllowEmptyCollection()]
+        [object[]]$Denylist = @(),
+
+        [switch]$SkipYanked
+    )
+
+    $notices = [System.Collections.Generic.List[object]]::new()
+    $unreadable = [System.Collections.Generic.List[string]]::new()
+
+    $pins = [ordered]@{}
+    foreach ($entry in ($Manifest | Sort-Object name, version)) {
+        $key = "$($entry.name)==$($entry.version)"
+        if (-not $pins.Contains($key)) { $pins[$key] = [System.Collections.Generic.List[string]]::new() }
+        $pins[$key].Add([string]$entry.file)
+    }
+    if ($pins.Count -gt 0 -and -not $SkipYanked) {
+        Write-Log "Checking $($pins.Count) published package version(s) against the denylist and PyPI's yanked flag..."
+    }
+
+    foreach ($key in $pins.Keys) {
+        $name, $version = $key -split '==', 2
+        $files = $pins[$key].ToArray()
+
+        $blocked = Get-DenylistMatch -Name $name -Version $version -Denylist $Denylist
+        if ($blocked) {
+            $why = if ($blocked.reason) { ": $($blocked.reason)" } else { '' }
+            $notices.Add((New-WheelhouseNotice -Kind 'Denylisted' -Package $name -Version $version -File $files -Message "Blocked by the denylist ($($blocked.version), $($blocked.source))$why, but still published."))
+        }
+
+        if ($SkipYanked) { continue }
+        try {
+            $release = Get-PyPIReleaseInfo -Name $name -Version $version
+        }
+        catch {
+            $unreadable.Add("$key ($($_.Exception.Message))")
+            continue
+        }
+        $yankedFiles = @($release.Files | Where-Object { $_.Yanked -and $files -contains $_.FileName })
+        if ($release.Yanked -or $yankedFiles.Count -gt 0) {
+            $reason = @($release.YankedReason) + @($yankedFiles | ForEach-Object { $_.YankedReason }) | Where-Object { $_ } | Select-Object -First 1
+            $text = if ($reason) { "Yanked on PyPI: $reason" } else { 'Yanked on PyPI (no reason given).' }
+            $notices.Add((New-WheelhouseNotice -Kind 'Yanked' -Package $name -Version $version -File $files -Message $text))
+        }
+    }
+
+    foreach ($notice in $notices) {
+        Write-Log "  $($notice.Kind): $($notice.Package)==$($notice.Version) - $($notice.Message)" 'WARN'
+    }
+    $errors = @()
+    if ($unreadable.Count -gt 0) {
+        $errors = @("PyPI yanked check could not be completed for $($unreadable.Count) package(s): $($unreadable -join '; ')")
+        Write-Log $errors[0] 'ERROR'
+    }
+    return @{ Notices = $notices.ToArray(); Errors = [string[]]$errors }
 }

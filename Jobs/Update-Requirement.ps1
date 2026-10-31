@@ -20,6 +20,10 @@
     existing requirements.txt is left untouched, the rejected result is saved next to
     it as requirements.rejected.txt, and every unavailable package is listed.
 
+    Exit codes: 0 written; 1 the result was rejected (uv could not resolve it, or a
+    package has no usable wheel) - change requirements.in and run again; 2 the input
+    file, python or the platform mapping is missing.
+
     If called with no path parameters, both default to the Input\ folder next to
     this script's deployment (WheelHouseManager\Input\requirements.in / .txt) -
     the same files Setup.ps1 creates.
@@ -90,11 +94,11 @@ Write-Log "Target Python: $($cfg.PythonVersion) / $($cfg.Platform) | Cooldown: $
 if (-not (Test-Path -Path $cfg.RequirementsInPath)) {
     Write-Log "requirements.in not found: $($cfg.RequirementsInPath)" "ERROR"
     Write-Log "Run Setup.ps1 first, or pass -RequirementsInPath explicitly." "ERROR"
-    exit 1
+    exit 2
 }
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     Write-Log "Python was not found on this machine - it is needed to verify the resolved packages." "ERROR"
-    exit 1
+    exit 2
 }
 
 try {
@@ -102,7 +106,7 @@ try {
 }
 catch {
     Write-Log $_.Exception.Message "ERROR"
-    exit 1
+    exit 2
 }
 
 # Resolve into a temporary file first - the real requirements.txt is only replaced

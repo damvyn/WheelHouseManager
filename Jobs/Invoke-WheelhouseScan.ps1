@@ -8,7 +8,7 @@
 
     The result is saved as reports\Report_Scan_<timestamp>.json and written to the
     output stream as a Wheelhouse.ScanResult. The script exits 1 if Defender reported
-    a threat, or the scan could not be completed (that is never reported as clean).
+    a threat, and 2 if the scan could not be completed (that is never reported as clean).
 
 .PARAMETER WheelhousePath
     Wheelhouse folder. Optional if set in config\settings.psd1.
@@ -65,14 +65,18 @@ try {
     }
 
     $scan = Invoke-WheelhouseDefenderScan -Path @($paths) -ReportsFolder $reportsFolder
-    if ($scan.Status -ne 'Clean') {
-        $exitCode = 1
+    if ($scan.Status -eq 'Threat') {
+        $exitCode = Get-WheelhouseExitCode -Outcome Attention
+        $outcome = $scan.Status
+    }
+    elseif ($scan.Status -ne 'Clean') {
+        $exitCode = Get-WheelhouseExitCode -Outcome Error
         $outcome = $scan.Status
     }
 }
 catch {
     Write-Log $_.Exception.Message 'ERROR'
-    $exitCode = 1
+    $exitCode = Get-WheelhouseExitCode -ErrorRecord $_
     $outcome = 'ABORTED'
 }
 finally {

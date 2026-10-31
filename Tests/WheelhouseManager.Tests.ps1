@@ -3,6 +3,8 @@
 
 # Mock bodies run in the module's scope, so test-case values reach them via globals.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '')]
+# New-TestRelease only builds a test object.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
 param()
 
 Describe 'WheelhouseManager' {
@@ -46,6 +48,88 @@ Describe 'WheelhouseManager' {
             return $wheelhouse
         }
 
+        # A fake PyPI release (as Get-PyPIReleaseInfo returns it) with one wheel whose
+        # content - and therefore sha256 - is known. The intake mocks below "download" it.
+        function New-TestRelease {
+            param(
+                [string]$Name,
+                [string]$Version = '1.0',
+                [int]$UploadDaysAgo = 400,
+                # Upload age of the wheel file itself, if it differs from the release's.
+                [int]$FileUploadDaysAgo = -1,
+                [switch]$Yanked,
+                [switch]$FileYanked
+            )
+            $content = "wheel $Name $Version"
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $hash = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($content))) -replace '-', '').ToLowerInvariant()
+            $now = (Get-Date).ToUniversalTime()
+            $fileAge = if ($FileUploadDaysAgo -ge 0) { $FileUploadDaysAgo } else { $UploadDaysAgo }
+            return [PSCustomObject]@{
+                Name           = $Name
+                Version        = $Version
+                Files          = @([PSCustomObject]@{
+                        FileName      = "$($Name -replace '-', '_')-$Version-py3-none-any.whl"
+                        Sha256        = $hash
+                        UploadTimeUtc = $now.AddDays(-$fileAge)
+                        Yanked        = [bool]$FileYanked
+                        YankedReason  = $(if ($FileYanked) { 'bad file' } else { '' })
+                    })
+                FirstUploadUtc = $now.AddDays(-$UploadDaysAgo)
+                Yanked         = [bool]$Yanked
+                YankedReason   = $(if ($Yanked) { 'broken build' } else { '' })
+                Content        = $content
+            }
+        }
+
+        # Mock bodies for Invoke-CandidateIntake, driven by globals (mock bodies run in
+        # module scope and cannot see this file's functions):
+        #   WhmReleases       name -> New-TestRelease (missing = PyPI unreachable)
+        #   WhmNoWheel        names pip finds no wheel for
+        #   WhmWheelOverride  name -> content actually "downloaded" (tampered file)
+        #   WhmScanStatus     Clean / Error / Threat; WhmThreatPackage = name detected
+        $script:intakeAgeMock = {
+            $now = (Get-Date).ToUniversalTime()
+            $rows = foreach ($name in $Packages.Keys) {
+                $release = $global:WhmReleases[$name]
+                if (-not $release) {
+                    [PSCustomObject]@{ Package = $name; Version = $Packages[$name]; AgeDays = $null; Passed = $false; Release = $null; Error = 'PyPI unreachable' }
+                    continue
+                }
+                $age = [math]::Floor(($now - $release.FirstUploadUtc).TotalDays)
+                $expedited = @($Expedite) -contains $name
+                [PSCustomObject]@{
+                    Package = $name; Version = $Packages[$name]; AgeDays = $age; MinimumRequiredDays = $MinimumAgeDays
+                    EligibleUtc = $release.FirstUploadUtc.AddDays($MinimumAgeDays).ToString('o'); Expedited = $expedited
+                    Passed = ($expedited -or $age -ge $MinimumAgeDays); Yanked = $release.Yanked; YankedReason = $release.YankedReason; Release = $release
+                }
+            }
+            @{ TooNew = @(); Results = @($rows) }
+        }
+        $script:intakeDownloadMock = {
+            $dir = $PipArguments[[array]::IndexOf($PipArguments, '-d') + 1]
+            $global:WhmIntakeDownloaded = @($Packages.Keys | Sort-Object)
+            $ok = @{}
+            $failed = @()
+            foreach ($name in $Packages.Keys) {
+                if (@($global:WhmNoWheel) -contains $name) { $failed += "$name==$($Packages[$name])"; continue }
+                $release = $global:WhmReleases[$name]
+                $content = if ($global:WhmWheelOverride -and $global:WhmWheelOverride.ContainsKey($name)) { $global:WhmWheelOverride[$name] } else { $release.Content }
+                [System.IO.File]::WriteAllText((Join-Path $dir $release.Files[0].FileName), $content)
+                $ok[$name] = $Packages[$name]
+            }
+            @{ Succeeded = $ok; Failed = $failed; Error = $null }
+        }
+        $script:intakeScanMock = {
+            $status = if ($global:WhmScanStatus) { $global:WhmScanStatus } else { 'Clean' }
+            $threats = @()
+            if ($status -eq 'Threat') {
+                $file = Get-ChildItem -Path $Path[0] -File | Where-Object { $_.Name -like "$($global:WhmThreatPackage)-*" } | Select-Object -First 1
+                $threats = @([PSCustomObject]@{ Resource = "file:_$($file.FullName)"; ThreatName = 'Trojan:Test'; ThreatId = '1'; ActionSuccess = $false })
+            }
+            [PSCustomObject]@{ Status = $status; Message = "scan $status"; Threats = $threats; ScannedPaths = @($Path) }
+        }
+
         # Pester 5 can only mock commands that exist; provide a stub on machines
         # without Python so the pip-audit tests still run.
         $script:addedPythonStub = $false
@@ -57,7 +141,8 @@ Describe 'WheelhouseManager' {
 
     AfterAll {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
-        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded, WhmIntakeCandidates, WhmScanDetections, WhmUiJobSteps -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded, WhmIntakeCandidates, WhmScanDetections, WhmUiJobSteps,
+            WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -508,51 +593,162 @@ Describe 'WheelhouseManager' {
     }
 
     Context 'Invoke-CandidateIntake' {
-        It 'rejects each failing package with its reason and accepts only what was downloaded' {
+        BeforeAll {
+            function Get-IntakeParam {
+                param([hashtable]$Packages, [string]$Folder)
+                return @{
+                    Packages       = $Packages
+                    GroupName      = 'requirements-1'
+                    WheelhousePath = $Folder
+                    ReportsFolder  = $Folder
+                    Services       = @('osv')
+                    MinimumAgeDays = 10
+                    PythonVersion  = '3.14'
+                    Platform       = 'win_amd64'
+                    StagingRoot    = (Join-Path $Folder 'staging')
+                }
+            }
+            function Get-RejectReason {
+                param($Result)
+                $reasons = @{}
+                foreach ($item in $Result.Rejected) { $reasons[$item.Name] = "[$($item.Category)] $($item.Reason)" }
+                return $reasons
+            }
+        }
+
+        BeforeEach {
+            $global:WhmReleases = @{}
+            $global:WhmNoWheel = @()
+            $global:WhmWheelOverride = @{}
+            $global:WhmScanStatus = 'Clean'
+            $global:WhmThreatPackage = $null
+            $global:WhmIntakeDownloaded = $null
+            $global:WhmIntakeAudit = $null
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-GroupAudit -MockWith {
+                if ($global:WhmIntakeAudit) { return , $global:WhmIntakeAudit }
+                , @([PSCustomObject]@{ Stage = 'PreDownload'; Group = 'g'; Service = 'osv'; Status = 'Passed'; ReportPath = 'none'; Message = 'm' })
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Test-PackageAge -MockWith $script:intakeAgeMock
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -MockWith $script:intakeDownloadMock
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-WheelhouseDefenderScan -MockWith $script:intakeScanMock
+        }
+
+        It 'rejects each failing package with its reason and publishes only what passed everything' {
             $folder = Get-TestFolder
             $vulnReport = Join-Path $folder 'Report_PreDownload-requirements-1-candidates-OSV_20260101_000000.json'
             Set-Content -Path $vulnReport -Value '{"dependencies":[{"name":"VulnPkg","version":"1.0","vulns":[{"id":"PYSEC-1"}]},{"name":"good","version":"1.0","vulns":[]}]}'
-
             $global:WhmIntakeAudit = @([PSCustomObject]@{ Stage = 'PreDownload'; Group = 'requirements-1-candidates'; Service = 'osv'; Status = 'Vulnerable'; ReportPath = $vulnReport; Message = 'm' })
-            Mock -ModuleName WheelhouseManager -CommandName Invoke-GroupAudit -MockWith { , $global:WhmIntakeAudit }
-            Mock -ModuleName WheelhouseManager -CommandName Test-PackageAge -MockWith {
-                @{
-                    TooNew  = @('fresh==1.0')
-                    Results = @(
-                        foreach ($name in $Packages.Keys) {
-                            [PSCustomObject]@{ Package = $name; Version = $Packages[$name]; AgeDays = $(if ($name -eq 'fresh') { 2 } else { 400 }); Passed = ($name -ne 'fresh') }
-                        }
-                    )
-                }
-            }
-            Mock -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -MockWith {
-                $global:WhmIntakeDownloaded = @($Packages.Keys | Sort-Object)
-                $ok = @{} + $Packages
-                $ok.Remove('nowheel')
-                @{ Succeeded = $ok; Failed = @("nowheel==$($Packages['nowheel'])"); Error = $null }
-            }
+            foreach ($name in 'good', 'vulnpkg', 'nowheel') { $global:WhmReleases[$name] = New-TestRelease -Name $name }
+            $global:WhmReleases['fresh'] = New-TestRelease -Name 'fresh' -UploadDaysAgo 2
+            $global:WhmNoWheel = @('nowheel')
 
-            $intakeParams = @{
-                Packages       = @{ good = '1.0'; vulnpkg = '1.0'; fresh = '1.0'; nowheel = '2.0' }
-                GroupName      = 'requirements-1'
-                WheelhousePath = $folder
-                ReportsFolder  = $folder
-                Services       = @('osv')
-                MinimumAgeDays = 10
-                PythonVersion  = '3.14'
-                Platform       = 'win_amd64'
-            }
-            $result = Invoke-CandidateIntake @intakeParams
+            $params = Get-IntakeParam -Folder $folder -Packages @{ good = '1.0'; vulnpkg = '1.0'; fresh = '1.0'; nowheel = '1.0' }
+            $result = Invoke-CandidateIntake @params
 
             ($result.Accepted.Keys -join ',') | Should -Be 'good'
-            $reasons = @{}
-            foreach ($item in $result.Rejected) { $reasons[$item.Name] = $item.Reason }
+            $reasons = Get-RejectReason -Result $result
             ($reasons.Keys | Sort-Object) -join ',' | Should -Be 'fresh,nowheel,vulnpkg'
-            $reasons['vulnpkg'] | Should -Match 'PYSEC-1'
-            $reasons['fresh'] | Should -Match 'published 2 day'
-            $reasons['nowheel'] | Should -Match 'no downloadable wheel'
+            $reasons['vulnpkg'] | Should -Match '^\[vulnerability\].*PYSEC-1'
+            $reasons['fresh'] | Should -Match '^\[cooldown\] .*published 2 day.*eligible \d{4}-\d{2}-\d{2}'
+            $reasons['nowheel'] | Should -Match '^\[no-wheel\] no downloadable wheel'
             # Rejected packages are never passed on to the next step.
             ($global:WhmIntakeDownloaded -join ',') | Should -Be 'good,nowheel'
+
+            # The accepted wheel is in the wheelhouse, with the hash PyPI publishes, and
+            # nothing else is left behind.
+            @($result.Published).Count | Should -Be 1
+            $entry = $result.Published[0]
+            $entry.file | Should -Be 'good-1.0-py3-none-any.whl'
+            $entry.sha256 | Should -Be $global:WhmReleases['good'].Files[0].Sha256
+            (Get-FileHash -Path (Join-Path $folder $entry.file) -Algorithm SHA256).Hash | Should -Be $entry.sha256
+            @(Get-ChildItem -Path $folder -Filter '*.whl*').Count | Should -Be 1
+            @(Get-ChildItem -Path (Join-Path $folder 'staging') -Force).Count | Should -Be 0
+        }
+
+        It 'rejects a download whose sha256 differs from PyPI, and never publishes it' {
+            $folder = Get-TestFolder
+            $global:WhmReleases['tampered'] = New-TestRelease -Name 'tampered'
+            $global:WhmReleases['fine'] = New-TestRelease -Name 'fine'
+            $global:WhmWheelOverride = @{ tampered = 'not what PyPI published' }
+
+            $params = Get-IntakeParam -Folder $folder -Packages @{ tampered = '1.0'; fine = '1.0' }
+            $result = Invoke-CandidateIntake @params
+
+            ($result.Accepted.Keys -join ',') | Should -Be 'fine'
+            (Get-RejectReason -Result $result)['tampered'] | Should -Match '^\[integrity\] sha256 of tampered-1.0-py3-none-any.whl does not match PyPI'
+            Test-Path -Path (Join-Path $folder 'tampered-1.0-py3-none-any.whl') | Should -Be $false
+        }
+
+        It 'rejects yanked releases and yanked files' {
+            $folder = Get-TestFolder
+            $global:WhmReleases['gone'] = New-TestRelease -Name 'gone' -Yanked
+            $global:WhmReleases['badfile'] = New-TestRelease -Name 'badfile' -FileYanked
+
+            $params = Get-IntakeParam -Folder $folder -Packages @{ gone = '1.0'; badfile = '1.0' }
+            $result = Invoke-CandidateIntake @params
+
+            $result.Accepted.Count | Should -Be 0
+            $reasons = Get-RejectReason -Result $result
+            $reasons['gone'] | Should -Match '^\[yanked\] yanked on PyPI: broken build'
+            $reasons['badfile'] | Should -Match '^\[yanked\] badfile-1.0-py3-none-any.whl is yanked'
+            # The yanked release is rejected before it is downloaded.
+            ($global:WhmIntakeDownloaded -join ',') | Should -Be 'badfile'
+        }
+
+        It 'applies the cooldown to the downloaded file, and skips it only for expedited pins' {
+            $folder = Get-TestFolder
+            # An old release with a wheel that was added to it two days ago.
+            $global:WhmReleases['late'] = New-TestRelease -Name 'late' -UploadDaysAgo 400 -FileUploadDaysAgo 2
+            $global:WhmReleases['urgent'] = New-TestRelease -Name 'urgent' -UploadDaysAgo 1
+            $global:WhmReleases['other'] = New-TestRelease -Name 'other' -UploadDaysAgo 1
+
+            $params = Get-IntakeParam -Folder $folder -Packages @{ late = '1.0'; urgent = '1.0'; other = '1.0' }
+            # Expediting a different version than the candidate has no effect.
+            $params['Expedite'] = @{ urgent = '1.0'; other = '9.9' }
+            $result = Invoke-CandidateIntake @params
+
+            ($result.Accepted.Keys -join ',') | Should -Be 'urgent'
+            $reasons = Get-RejectReason -Result $result
+            $reasons['late'] | Should -Match '^\[cooldown\] .*late-1.0-py3-none-any.whl was uploaded 2 day'
+            $reasons['other'] | Should -Match '^\[cooldown\] .*published 1 day'
+        }
+
+        It 'rejects only the package Defender detects, and handles a scan that could not run' {
+            $folder = Get-TestFolder
+            $global:WhmReleases['evil'] = New-TestRelease -Name 'evil'
+            $global:WhmReleases['clean'] = New-TestRelease -Name 'clean'
+            $global:WhmScanStatus = 'Threat'
+            $global:WhmThreatPackage = 'evil'
+
+            $params = Get-IntakeParam -Folder $folder -Packages @{ evil = '1.0'; clean = '1.0' }
+            $result = Invoke-CandidateIntake @params
+            ($result.Accepted.Keys -join ',') | Should -Be 'clean'
+            (Get-RejectReason -Result $result)['evil'] | Should -Match '^\[defender\] Microsoft Defender detected Trojan:Test in evil-1.0'
+            Test-Path -Path (Join-Path $folder 'evil-1.0-py3-none-any.whl') | Should -Be $false
+
+            # Scan unavailable: published with a warning by default...
+            $global:WhmScanStatus = 'Error'
+            $other = Get-TestFolder
+            $params = Get-IntakeParam -Folder $other -Packages @{ clean = '1.0' }
+            (Invoke-CandidateIntake @params).Accepted.Count | Should -Be 1
+
+            # ...and rejected when a scan is required.
+            $strict = Get-TestFolder
+            $params = Get-IntakeParam -Folder $strict -Packages @{ clean = '1.0' }
+            $params['RequireDefenderScan'] = $true
+            $required = Invoke-CandidateIntake @params
+            $required.Accepted.Count | Should -Be 0
+            (Get-RejectReason -Result $required)['clean'] | Should -Match '^\[defender\] the Defender scan could not be completed'
+            @(Get-ChildItem -Path $strict -Filter '*.whl').Count | Should -Be 0
+        }
+
+        It 'fails closed when PyPI release data is unavailable' {
+            $folder = Get-TestFolder
+            $params = Get-IntakeParam -Folder $folder -Packages @{ unknown = '1.0' }
+            $result = Invoke-CandidateIntake @params
+            $result.Accepted.Count | Should -Be 0
+            (Get-RejectReason -Result $result)['unknown'] | Should -Match '^\[pypi-metadata\] cooldown: could not verify'
+            $global:WhmIntakeDownloaded | Should -BeNullOrEmpty
         }
 
         It 'accepts nothing when the audit could not be completed' {
@@ -685,10 +881,13 @@ Describe 'WheelhouseManager' {
                 $global:WhmIntakeCandidates = @(Get-Content -Path $GroupFile)
                 , @([PSCustomObject]@{ Stage = 'PreDownload'; Group = 'g'; Service = 'osv'; Status = 'Passed'; ReportPath = 'none'; Message = 'm' })
             }
-            Mock -ModuleName WheelhouseManager -CommandName Test-PackageAge -MockWith {
-                @{ TooNew = @(); Results = @(foreach ($n in $Packages.Keys) { [PSCustomObject]@{ Package = $n; Version = $Packages[$n]; AgeDays = 400; Passed = $true } }) }
-            }
-            Mock -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -MockWith { @{ Succeeded = $Packages; Failed = @(); Error = $null } }
+            $global:WhmReleases = @{ fine = (New-TestRelease -Name 'fine' -Version '2.0') }
+            $global:WhmNoWheel = @()
+            $global:WhmWheelOverride = @{}
+            $global:WhmScanStatus = 'Clean'
+            Mock -ModuleName WheelhouseManager -CommandName Test-PackageAge -MockWith $script:intakeAgeMock
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-PipPinRetry -MockWith $script:intakeDownloadMock
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-WheelhouseDefenderScan -MockWith $script:intakeScanMock
 
             $deny = @(
                 [PSCustomObject]@{ name = 'evil'; version = '*'; reason = 'malware'; source = 'manual' },
@@ -703,6 +902,7 @@ Describe 'WheelhouseManager' {
                 PythonVersion  = '3.14'
                 Platform       = 'win_amd64'
                 Denylist       = $deny
+                StagingRoot    = (Join-Path $folder 'staging')
             }
             $result = Invoke-CandidateIntake @intakeParams
 
@@ -733,6 +933,186 @@ Describe 'WheelhouseManager' {
             $result = Invoke-CandidateIntake @intakeParams
             $result.Accepted.Count | Should -Be 0
             @($result.Rejected).Count | Should -Be 1
+        }
+    }
+
+    Context 'PyPI release data' {
+        It 'reads files, digests, upload times and yanked flags, whether dates arrive as text or [datetime]' {
+            $global:WhmRestResponse = [PSCustomObject]@{
+                info = [PSCustomObject]@{ yanked = $true; yanked_reason = 'broken' }
+                urls = @(
+                    [PSCustomObject]@{ filename = 'a-1.0-py3-none-any.whl'; digests = [PSCustomObject]@{ sha256 = 'aa11' }; upload_time_iso_8601 = '2026-01-05T10:00:00.000000Z'; yanked = $false; yanked_reason = $null },
+                    [PSCustomObject]@{ filename = 'a-1.0.tar.gz'; digests = [PSCustomObject]@{ sha256 = 'bb22' }; upload_time_iso_8601 = [datetime]::new(2026, 1, 2, 0, 0, 0, [System.DateTimeKind]::Utc); yanked = $true; yanked_reason = 'sdist' })
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-RestMethod -MockWith { $global:WhmRestResponse }
+
+            $release = Get-PyPIReleaseInfo -Name 'a' -Version '1.0'
+
+            @($release.Files).Count | Should -Be 2
+            $release.Files[0].Sha256 | Should -Be 'aa11'
+            $release.Files[0].UploadTimeUtc | Should -Be ([datetime]::new(2026, 1, 5, 10, 0, 0, [System.DateTimeKind]::Utc))
+            $release.Files[1].Yanked | Should -Be $true
+            $release.FirstUploadUtc | Should -Be ([datetime]::new(2026, 1, 2, 0, 0, 0, [System.DateTimeKind]::Utc))
+            $release.Yanked | Should -Be $true
+            $release.YankedReason | Should -Be 'broken'
+
+            $global:WhmRestResponse = [PSCustomObject]@{ info = [PSCustomObject]@{ yanked = $false }; urls = @() }
+            { Get-PyPIReleaseInfo -Name 'a' -Version '1.0' } | Should -Throw '*No release files*'
+        }
+
+        It 'checks the age, gives the eligible date, honours expedite and fails closed' {
+            $global:WhmPyPI = @{
+                fresh  = (New-TestRelease -Name 'fresh' -UploadDaysAgo 3)
+                urgent = (New-TestRelease -Name 'urgent' -UploadDaysAgo 3)
+                old    = (New-TestRelease -Name 'old' -UploadDaysAgo 30)
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Get-PyPIReleaseInfo -MockWith {
+                if (-not $global:WhmPyPI.ContainsKey($Name)) { throw 'HTTP 404' }
+                $global:WhmPyPI[$Name]
+            }
+
+            $check = Test-PackageAge -Packages @{ fresh = '1.0'; urgent = '1.0'; old = '1.0'; gone = '1.0' } -MinimumAgeDays 10 -Expedite @('urgent')
+            $byName = @{}
+            foreach ($row in $check.Results) { $byName[$row.Package] = $row }
+
+            $byName['fresh'].Passed | Should -Be $false
+            (ConvertTo-UtcDateTime -Value $byName['fresh'].EligibleUtc).Date | Should -Be ((Get-Date).ToUniversalTime().AddDays(7).Date)
+            $byName['urgent'].Passed | Should -Be $true
+            $byName['urgent'].Expedited | Should -Be $true
+            $byName['old'].Passed | Should -Be $true
+            $byName['old'].Release.Name | Should -Be 'old'
+            $byName['gone'].Passed | Should -Be $false
+            $byName['gone'].Release | Should -BeNullOrEmpty
+            $byName['gone'].Error | Should -Match '404'
+        }
+    }
+
+    Context 'Publish-StagedWheel' {
+        It 'publishes atomically, keeps an identical untracked file and refuses a different one' {
+            $staging = Get-TestFolder
+            $wheelhouse = Get-TestFolder
+            $staged = Join-Path $staging 'pkg-1.0-py3-none-any.whl'
+            Set-Content -Path $staged -Value 'verified bytes'
+
+            $first = Publish-StagedWheel -Path $staged -WheelhousePath $wheelhouse
+            $first.Created | Should -Be $true
+            $first.Entry.name | Should -Be 'pkg'
+            $first.Entry.sha256 | Should -Be (Get-FileHash -Path $staged -Algorithm SHA256).Hash
+            (Get-FileHash -Path (Join-Path $wheelhouse 'pkg-1.0-py3-none-any.whl') -Algorithm SHA256).Hash | Should -Be $first.Entry.sha256
+
+            $again = Publish-StagedWheel -Path $staged -WheelhousePath $wheelhouse
+            $again.Created | Should -Be $false
+
+            Set-Content -Path (Join-Path $wheelhouse 'pkg-1.0-py3-none-any.whl') -Value 'someone else''s file'
+            { Publish-StagedWheel -Path $staged -WheelhousePath $wheelhouse } | Should -Throw '*different file*'
+            @(Get-ChildItem -Path $wheelhouse -Filter '*.partial').Count | Should -Be 0
+        }
+    }
+
+    Context 'Published packages that fail a check later' {
+        It 'reports deployed versions that are denylisted or yanked, and an unreadable release as an error' {
+            $manifest = @(
+                [PSCustomObject]@{ name = 'six'; version = '1.16.0'; file = 'six-1.16.0-py3-none-any.whl' },
+                [PSCustomObject]@{ name = 'attrs'; version = '23.1.0'; file = 'attrs-23.1.0-py3-none-any.whl' },
+                [PSCustomObject]@{ name = 'fine'; version = '1.0'; file = 'fine-1.0-py3-none-any.whl' })
+            $deny = @([PSCustomObject]@{ name = 'attrs'; version = '23.1.0'; reason = 'cve'; source = 'manual' })
+            $global:WhmPyPI = @{
+                six  = (New-TestRelease -Name 'six' -Version '1.16.0' -FileYanked)
+                fine = (New-TestRelease -Name 'fine')
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Get-PyPIReleaseInfo -MockWith {
+                if (-not $global:WhmPyPI.ContainsKey($Name)) { throw 'timeout' }
+                $global:WhmPyPI[$Name]
+            }
+
+            $result = Get-DeployedPackageNotice -Manifest $manifest -Denylist $deny
+
+            $kinds = @($result.Notices | ForEach-Object { "$($_.Kind):$($_.Package)" } | Sort-Object)
+            $kinds -join ',' | Should -Be 'Denylisted:attrs,Yanked:six'
+            ($result.Notices | Where-Object { $_.Kind -eq 'Yanked' }).Message | Should -Match 'bad file'
+            @($result.Errors).Count | Should -Be 1
+            $result.Errors[0] | Should -Match 'attrs==23.1.0 \(timeout\)'
+
+            $offline = Get-DeployedPackageNotice -Manifest $manifest -Denylist $deny -SkipYanked
+            (@($offline.Notices).Count, @($offline.Errors).Count) -join ',' | Should -Be '1,0'
+        }
+
+        It 'treats a wheel Defender removed as a notice, not an integrity failure' {
+            $wheelhouse = Get-TestWheelhouse
+            $reports = Get-TestFolder
+            $manifest = Read-WheelhouseManifest -WheelhousePath $wheelhouse
+            $sixPath = Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl'
+            Remove-Item -Path $sixPath
+            $global:WhmScanDetections = @([PSCustomObject]@{ Resource = "file:_$sixPath"; ThreatName = 'Trojan:Test'; ThreatId = '1'; ActionSuccess = $true })
+            Mock -ModuleName WheelhouseManager -CommandName Test-WheelhouseDefenderAvailable -MockWith { $true }
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseThreatDetection -MockWith { $global:WhmScanDetections }
+
+            # Without the switch it is still an integrity failure (fail closed).
+            { Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports } | Should -Throw '*integrity check failed*'
+
+            $removed = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports -AllowDefenderRemoved)
+            $removed.Count | Should -Be 1
+            $removed[0].Entry.name | Should -Be 'six'
+            $removed[0].ThreatName | Should -Be 'Trojan:Test'
+
+            # A missing file Defender knows nothing about still fails.
+            $global:WhmScanDetections = @()
+            { Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports -AllowDefenderRemoved } | Should -Throw '*integrity check failed*'
+        }
+
+        It 'lets the lock holder clean up a removed wheel' {
+            $wheelhouse = Get-TestWheelhouse
+            $denyPath = Join-Path (Get-TestFolder) 'denylist.json'
+            Remove-Item -Path (Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl')
+            $lock = Enter-WheelhouseLock -WheelhousePath $wheelhouse
+            try {
+                $done = Remove-WheelhousePackage -WheelhousePath $wheelhouse -Name 'six' -Version '1.16.0' -Reason 'removed by Microsoft Defender: X' -DenylistPath $denyPath -LockHeld
+            }
+            finally {
+                Exit-WheelhouseLock -Lock $lock
+            }
+            $done.Groups -join ',' | Should -Be 'requirements-1.txt'
+            @(Read-WheelhouseManifest -WheelhousePath $wheelhouse | ForEach-Object { $_.name }) -join ',' | Should -Be 'attrs'
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'attrs==23.1.0'
+            (Read-WheelhouseDenylist -Path $denyPath)[0].reason | Should -Match 'Microsoft Defender'
+        }
+    }
+
+    Context 'Alert notices' {
+        It 'alerts on notices alone and lists them with a recommended action' {
+            $notice = New-WheelhouseNotice -Kind 'Yanked' -Package 'six' -Version '1.16.0' -File @('six-1.16.0-py3-none-any.whl') -Message 'Yanked on PyPI: <bad>'
+            $notice.PSObject.TypeNames | Should -Contain 'Wheelhouse.Notice'
+            $notice.Action | Should -Match 'quarantine'
+
+            Get-VulnerabilityAlertParameter -AuditResult @() | Should -BeNullOrEmpty
+            $params = Get-VulnerabilityAlertParameter -AuditResult @() -Notice @($notice) -CheckError @('PyPI yanked check could not be completed') -AlertParameters @{ SmtpServer = 'x' }
+            @($params.Notices).Count | Should -Be 1
+            $params.AuditErrors -join '|' | Should -Be 'PyPI yanked check could not be completed'
+            $params.SmtpServer | Should -Be 'x'
+
+            $html = ConvertTo-VulnerabilityAlertHtml -Notices @($notice) -AuditErrors @() -WheelhousePath ''
+            $html | Should -Match 'Packages that need attention \(1\)'
+            $html | Should -Match 'six==1.16.0'
+            $html | Should -Match '&lt;bad&gt;'
+        }
+    }
+
+    Context 'Exit codes' {
+        It 'maps outcomes and errors, with a separate code for a busy lock' {
+            Get-WheelhouseExitCode | Should -Be 0
+            Get-WheelhouseExitCode -Outcome Attention | Should -Be 1
+            Get-WheelhouseExitCode -Outcome Error | Should -Be 2
+            $wheelhouse = Get-TestFolder
+            $lock = Enter-WheelhouseLock -WheelhousePath $wheelhouse
+            try {
+                try { Enter-WheelhouseLock -WheelhousePath $wheelhouse } catch { $busy = $_ }
+            }
+            finally {
+                Exit-WheelhouseLock -Lock $lock
+            }
+            Get-WheelhouseExitCode -ErrorRecord $busy | Should -Be 3
+            try { throw 'anything else' } catch { $other = $_ }
+            Get-WheelhouseExitCode -ErrorRecord $other | Should -Be 2
         }
     }
 
@@ -922,6 +1302,9 @@ Describe 'WheelhouseManager' {
             { ConvertTo-WheelhouseSettingValue -Key 'Nope' -Value 'x' } | Should -Throw -ExceptionType ([System.ArgumentException])
             { ConvertTo-WheelhouseSettingValue -Key 'WheelhousePath' -Value (Join-Path $TestDrive 'does-not-exist') } | Should -Throw -ExceptionType ([System.ArgumentException])
             ConvertTo-WheelhouseSettingValue -Key 'WheelhousePath' -Value (Get-TestFolder) | Should -Not -BeNullOrEmpty
+            ConvertTo-WheelhouseSettingValue -Key 'RequireDefenderScanAtIntake' -Value $true | Should -Be $true
+            ConvertTo-WheelhouseSettingValue -Key 'DefenderScanInScheduledCheck' -Value 'false' | Should -Be $false
+            { ConvertTo-WheelhouseSettingValue -Key 'DefenderScanInScheduledCheck' -Value 'sometimes' } | Should -Throw -ExceptionType ([System.ArgumentException])
         }
 
         It 'returns services as an array and refuses an empty or unknown selection' {
@@ -1080,15 +1463,48 @@ Describe 'WheelhouseManager' {
             @($result.Body.added) -join ',' | Should -Be 'numpy>=2.0'
             @($result.Body.skipped).Count | Should -Be 1
             (Get-Content -Path (Join-Path $m.Root 'requirements.in')) -join '|' | Should -Be 'numpy>=2.0'
-            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1|Update-Wheelhouse.ps1'
-
-            $null = Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"specs":["pandas"],"resolve_only":true}')
+            # By default the job stops at requirements.txt, for review.
             $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
+
+            $null = Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"specs":["pandas"],"publish":true}')
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1|Update-Wheelhouse.ps1'
 
             $global:WhmUiJobSteps = $null
             $none = Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"specs":["numpy"]}')
             $none.Body.job | Should -BeNullOrEmpty
             $global:WhmUiJobSteps | Should -BeNullOrEmpty
+        }
+
+        It 'shows requirements.txt for review and publishes it only with a confirmation' {
+            $m = Get-TestManager
+            $txt = Join-Path $m.Root 'requirements.txt'
+            Set-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1') -Updates @{ LocalRequirementsPath = $txt }
+
+            $empty = Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root
+            $empty.Status | Should -Be 200
+            $empty.Body.pin_count | Should -Be 0
+
+            Set-Content -Path $txt -Value @('# via uv', 'numpy==2.3.1', 'pandas==2.2.3')
+            $review = Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root
+            $review.Body.pin_count | Should -Be 2
+            $review.Body.text | Should -Match 'numpy==2.3.1'
+
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/wheelhouse/update' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')).Status | Should -Be 400
+            $global:WhmUiJobSteps | Should -BeNullOrEmpty
+            $publish = Invoke-WheelhouseUiApi -Method POST -Path '/api/wheelhouse/update' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"confirm":true}')
+            $publish.Status | Should -Be 202
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Wheelhouse.ps1'
+        }
+
+        It 'saves on/off settings' {
+            $m = Get-TestManager
+            $saved = Invoke-WheelhouseUiApi -Method POST -Path '/api/settings' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"updates":{"DefenderScanInScheduledCheck":true}}')
+            $saved.Status | Should -Be 200
+            (Get-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1')).DefenderScanInScheduledCheck | Should -Be $true
+            $values = (Invoke-WheelhouseUiApi -Method GET -Path '/api/settings' -ManagerRoot $m.Root).Body.values
+            $values['DefenderScanInScheduledCheck'] | Should -Be $true
+            $values['RequireDefenderScanAtIntake'] | Should -Be $false
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/settings' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"updates":{"RequireDefenderScanAtIntake":"maybe"}}')).Status | Should -Be 400
         }
 
         It 'quarantines through the API, denylists the package and lists both' {
@@ -1163,6 +1579,7 @@ Describe 'WheelhouseManager' {
             New-Item -ItemType Directory -Path $script:uiJobs | Out-Null
             Set-Content -Path (Join-Path $script:uiJobs 'ok.ps1') -Value "param([string]`$Package)`nWrite-Host `"hello from ok `$Package`"`nexit 0"
             Set-Content -Path (Join-Path $script:uiJobs 'bad.ps1') -Value "Write-Host 'bad step'`nexit 3"
+            Set-Content -Path (Join-Path $script:uiJobs 'findings.ps1') -Value "Write-Host 'found something'`nexit 1"
             Set-Content -Path (Join-Path $script:uiJobs 'sleep.ps1') -Value 'Start-Sleep -Seconds 120'
             $script:uiContext = [PSCustomObject]@{ ManagerRoot = $script:uiRoot; JobsPath = $script:uiJobs }
 
@@ -1191,6 +1608,15 @@ Describe 'WheelhouseManager' {
             Wait-UiJob -Job $job
             $job.Status | Should -Be 'Failed'
             $job.ExitCode | Should -Be 3
+            $job.Message | Should -Match 'another wheelhouse operation'
+            (ConvertTo-WheelhouseUiJobSummary -Job $job -IncludeLog).log | Should -Not -Match 'hello from ok'
+        }
+
+        It 'reports exit code 1 as needing attention and does not run later steps' {
+            $job = Start-WheelhouseUiJob -Title 'findings' -Kind 'test' -Context $script:uiContext -Steps @(@{ Script = 'findings.ps1'; Arguments = @() }, @{ Script = 'ok.ps1'; Arguments = @() })
+            Wait-UiJob -Job $job
+            $job.Status | Should -Be 'Attention'
+            $job.Message | Should -Match 'findings or rejected packages'
             (ConvertTo-WheelhouseUiJobSummary -Job $job -IncludeLog).log | Should -Not -Match 'hello from ok'
         }
 

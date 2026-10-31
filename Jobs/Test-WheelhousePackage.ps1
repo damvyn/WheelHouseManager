@@ -11,8 +11,9 @@
     With -Package, only those name==version pins are audited. They must be tracked
     in manifest.json.
 
-    Writes one Wheelhouse.AuditResult per audit to the output stream and exits 1 if
-    any audit found a vulnerability or could not be completed.
+    Writes one Wheelhouse.AuditResult per audit to the output stream. Exits 1 if an
+    audit found a vulnerability, 2 if an audit could not be completed (never reported as
+    clean) or the run aborted.
 
 .PARAMETER WheelhousePath
     Wheelhouse folder. Optional if set in config\settings.psd1.
@@ -97,15 +98,18 @@ try {
         }
     }
 
-    $bad = @($auditResults | Where-Object { $_.Status -ne 'Passed' })
-    if ($bad.Count -gt 0) {
-        $exitCode = 1
-        $outcome = 'findings or failed audits'
+    if ($auditResults | Where-Object { $_.Status -eq 'Error' }) {
+        $exitCode = Get-WheelhouseExitCode -Outcome Error
+        $outcome = 'an audit could not be completed'
+    }
+    elseif ($auditResults | Where-Object { $_.Status -eq 'Vulnerable' }) {
+        $exitCode = Get-WheelhouseExitCode -Outcome Attention
+        $outcome = 'vulnerabilities found'
     }
 }
 catch {
     Write-Log $_.Exception.Message 'ERROR'
-    $exitCode = 1
+    $exitCode = Get-WheelhouseExitCode -ErrorRecord $_
     $outcome = 'ABORTED'
 }
 finally {

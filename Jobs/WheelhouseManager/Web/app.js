@@ -328,13 +328,13 @@
     var root = $('tab-add');
     clear(root);
     var specs = h('textarea', { placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
-    var resolveOnly = h('input', { type: 'checkbox' });
+    var publishNow = h('input', { type: 'checkbox' });
     var output = h('div', {});
-    var go = h('button', { class: 'btn primary', type: 'button' }, 'Add and process');
+    var go = h('button', { class: 'btn primary', type: 'button' }, 'Add and resolve');
     go.addEventListener('click', function () {
       var list = specs.value.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(function (s) { return s && s.charAt(0) !== '#'; });
       if (list.length === 0) { toast('Enter at least one package.', 'bad'); return; }
-      api('POST', '/api/packages/add', { specs: list, resolve_only: resolveOnly.checked }).then(function (data) {
+      api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked }).then(function (data) {
         clear(output);
         if (data.added.length) {
           output.append(h('p', {}, 'Added to requirements.in:'), h('ul', { class: 'result-list' }, data.added.map(function (a) { return h('li', { class: 'mono' }, a); })));
@@ -347,14 +347,39 @@
     });
     root.append(
       h('div', { class: 'card' },
-        h('h2', {}, 'Add packages to the wheelhouse'),
-        h('p', { class: 'muted' }, 'One requirement per line, for example numpy or pandas>=2.0. The names go into requirements.in; then Update-Requirement.ps1 resolves them (with the cooldown) and Update-Wheelhouse.ps1 audits, checks the age of and downloads every new package. A package that fails any check is rejected with the reason and never reaches the wheelhouse.'),
+        h('h2', {}, '1. Add packages'),
+        h('p', { class: 'muted' }, 'One requirement per line, for example numpy or pandas>=2.0. The names go into requirements.in, and Update-Requirement.ps1 resolves them (with the cooldown) into requirements.txt. Nothing is downloaded yet: review the result below first.'),
         specs,
-        h('p', {}, h('label', {}, resolveOnly, ' Resolve only: stop after requirements.txt so it can be reviewed first (nothing is downloaded)')),
+        h('p', {}, h('label', {}, publishNow, ' Also publish right away (skips the review step)')),
         h('div', { class: 'toolbar' }, go)),
       output,
+      h('div', { class: 'card', id: 'requirements-card' }),
       h('div', { class: 'card', id: 'rejected-card' }));
+    loadRequirements();
     loadRejected();
+  }
+
+  function loadRequirements() {
+    var card = $('requirements-card');
+    if (!card) { return; }
+    api('GET', '/api/requirements').then(function (data) {
+      clear(card);
+      card.append(h('h2', {}, '2. Review and publish'),
+        h('p', { class: 'muted' }, 'Resolved pins in ' + (data.path || 'requirements.txt') + (data.modified_utc ? ' (changed ' + fmtDate(data.modified_utc) + ')' : '') +
+          '. Publishing runs Update-Wheelhouse.ps1: every new pin is checked against the denylist, audited, checked for the cooldown and for yanked releases, downloaded into a staging folder, verified against the sha256 published on PyPI and scanned with Defender. Only then is it copied into the wheelhouse. Pins already in the wheelhouse are skipped.'));
+      if (!data.pin_count) {
+        card.append(h('div', { class: 'empty' }, 'requirements.txt is empty - add packages above first.'));
+        return;
+      }
+      var publish = h('button', { class: 'btn primary', type: 'button' }, 'Publish ' + data.pin_count + ' pin(s) to the wheelhouse');
+      publish.addEventListener('click', function () {
+        confirmDialog('Publish requirements.txt?', h('p', {}, 'Every pin that is not yet in the wheelhouse goes through all checks; a package that fails one is rejected with the reason and nothing about it is published.'), 'Publish', false).then(function (ok) {
+          if (!ok) { return; }
+          startJobRequest(api('POST', '/api/wheelhouse/update', { confirm: true }));
+        });
+      });
+      card.append(h('pre', { class: 'log' }, data.text), h('div', { class: 'toolbar' }, publish));
+    }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
   }
 
   function loadRejected() {
@@ -461,6 +486,10 @@
           var boxes = f.options.map(function (o) { return { option: o, box: h('input', { type: 'checkbox', checked: current.indexOf(o) >= 0 }) }; });
           control = h('div', { class: 'checks' }, boxes.map(function (b) { return h('label', {}, b.box, ' ' + b.option); }));
           inputs[f.key] = function () { return boxes.filter(function (b) { return b.box.checked; }).map(function (b) { return b.option; }); };
+        } else if (f.type === 'bool') {
+          var flag = h('input', { type: 'checkbox', checked: value === true });
+          control = h('label', {}, flag, ' On');
+          inputs[f.key] = function () { return flag.checked; };
         } else if (f.type === 'int') {
           control = h('input', { type: 'number', min: f.min, max: f.max, value: value });
           inputs[f.key] = function () { return control.value === '' ? '' : Number(control.value); };
@@ -492,10 +521,15 @@
   }
 
   // ---------------------------------------------------------------- jobs
+  // Succeeded / Running / Attention (findings or rejected packages) / Failed / Cancelled.
+  function jobKind(status) {
+    return status === 'Succeeded' ? 'ok' : (status === 'Running' || status === 'Attention') ? 'warn' : 'bad';
+  }
+  function jobLabel(status) {
+    return status === 'Failed' ? 'Failed' : status === 'Attention' ? 'Needs attention' : status;
+  }
   function jobBadge(job) {
-    var kind = job.status === 'Succeeded' ? 'ok' : job.status === 'Running' ? 'warn' : 'bad';
-    var label = job.status === 'Failed' ? 'Finished with problems' : job.status;
-    return badge(label, kind, job.message);
+    return badge(jobLabel(job.status), jobKind(job.status), job.message);
   }
 
   function loadJobs() {
@@ -532,8 +566,8 @@
       var job = data.job;
       $('jobbar-title').textContent = '#' + job.id + '  ' + job.title + (job.steps > 1 ? '  (step ' + job.step + '/' + job.steps + ')' : '');
       var state_ = $('jobbar-state');
-      state_.textContent = job.status === 'Failed' ? 'Finished with problems' : job.status;
-      state_.className = 'badge ' + (job.status === 'Succeeded' ? 'ok' : job.status === 'Running' ? 'warn' : 'bad');
+      state_.textContent = jobLabel(job.status);
+      state_.className = 'badge ' + jobKind(job.status);
       $('jobbar-cancel').classList.toggle('hidden', job.status !== 'Running');
       var log = $('jobbar-log');
       var atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
@@ -556,7 +590,7 @@
   function onJobFinished(job) {
     if (state.currentTab === 'packages') { loadPackages(); }
     else if (state.currentTab === 'jobs') { loadJobs(); }
-    else if (state.currentTab === 'add') { loadRejected(); }
+    else if (state.currentTab === 'add') { loadRequirements(); loadRejected(); }
     refreshState();
   }
 

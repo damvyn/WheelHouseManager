@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+`ARCHITECTURE.md` is the full developer reference (invariants, every function, core flows, data contracts, test conventions, how to extend); `README.md` is the user guide. Update both when behaviour changes.
+
 ## What this is
 
 A PowerShell tool that maintains an offline, audited pip/uv "wheelhouse" (a folder of `.whl` files on a share) for locked-down Windows clients. There are two independent parts:
@@ -55,21 +57,23 @@ Script roles:
 - `Update-Wheelhouse.ps1` (the worker) does:
   1. an integrity check against `manifest.json`;
   2. an in-memory merge plan of `Input\requirements.txt` into the `requirements-N.txt` groups;
-  3. per group, `Invoke-CandidateIntake`: audit → cooldown (`MinimumPackageAgeDays`) → download;
+  3. per group, `Invoke-CandidateIntake`: denylist → audit → PyPI release data (yanked, cooldown `MinimumPackageAgeDays`, `-ExpeditePackage` skips it per pin) → download into `<manager root>\staging\` → sha256/yanked/upload-date check of each file against PyPI → Defender scan of the staged files → `Publish-StagedWheel` (`.partial` copy, then rename); the manifest is updated after each group;
   4. an audit-only pass over existing groups;
-  5. a manifest update and a Defender scan.
+  5. a Defender scan of the whole wheelhouse.
 
-  It emits `Wheelhouse.AuditResult` objects and **sends no alerts**.
-- `Invoke-WheelhousePipeline.ps1` (repo root, the orchestrator) runs `Update-Wheelhouse.ps1`, keeps its `Wheelhouse.AuditResult` output, and calls `Send-VulnerabilityAlert.ps1` once for any `Vulnerable`/`Error` result.
-- `Test-Wheelhouse.ps1` is what the Scheduled Task runs. It only checks integrity, audits and alerts: no merge, no download.
+  It emits `Wheelhouse.AuditResult` and `Wheelhouse.Notice` objects and **sends no alerts**.
+- `Invoke-WheelhousePipeline.ps1` (repo root, the orchestrator) runs `Update-Wheelhouse.ps1`, keeps its `Wheelhouse.AuditResult` and `Wheelhouse.Notice` output, and calls `Send-VulnerabilityAlert.ps1` once for any `Vulnerable`/`Error` result or notice.
+- `Test-Wheelhouse.ps1` is what the Scheduled Task runs. It re-checks what is already published (integrity, denylist and PyPI yanked flag via `Get-DeployedPackageNotice`, audits, optional Defender rescan) and alerts: no merge, no download, no file changes.
 - `Test-WheelhousePackage.ps1` (audit the whole index or `-Package name==ver`, no alert) and `Invoke-WheelhouseScan.ps1` (Defender, whole folder or `-File`) back the UI's buttons.
 - `Start-WheelhouseUI.ps1` starts the local web UI (`Start-WheelhouseUiServer`, `localhost` only, session token in the URL). It is a third thin layer: it runs the scripts above as child processes and calls module functions for reads and for remove/quarantine/restore, settings and denylist edits.
 
 Invariants to preserve:
 - **Group files only ever list pins whose wheel was actually downloaded.** Intake is transactional per package. A rejected package is written to `Report_Rejected_*.json` and never reaches a group file. Pins already in a group file but missing a wheel are fed back through intake as candidates.
 - Groups are pinned and downloaded with `--no-deps --only-binary=:all:`. pip stops at the first unresolvable pin, so `Invoke-PipPinRetry` parses "No matching distribution found for X", drops X, and retries.
-- The manifest only gains files downloaded in the current run. New group numbers are max+1.
+- **Nothing reaches the wheelhouse folder unchecked.** Downloads go to the staging folder (under the manager root, not `%TEMP%`: 8.3 short paths would not match Defender's detection paths) and are published only after every check. The manifest only gains the entries `Invoke-CandidateIntake` returns as `Published` (verified against PyPI's sha256); the one exception is first-time setup, which adopts the wheels already there. New group numbers are max+1.
 - Audit status is `Passed`/`Vulnerable`/`Error`. A failed audit is never reported as clean.
+- A tracked wheel that Defender removed itself is not an integrity failure when `Assert-WheelhouseIntegrity -AllowDefenderRemoved` can match it to a detection; the worker then removes the pin with `Remove-WheelhousePackage -LockHeld`. Anything unexplained still fails closed.
+- **Exit codes** (`Get-WheelhouseExitCode`): 0 OK, 1 needs attention (findings, rejections), 2 error or a check could not be completed, 3 lock busy. UI jobs map 1 to the `Attention` status.
 - Module functions must never invoke `Jobs\*.ps1` scripts. A script run from inside a module function executes in module scope and breaks `$script:` variables. Instead, the module builds parameters (`Get-VulnerabilityAlertParameter`) and the calling script runs `Send-VulnerabilityAlert.ps1`.
 - Native commands (python, pip, uv) go through `Invoke-NativeCommand`. It merges stderr into stdout as text, because 5.1's `Start-Transcript` doesn't capture native stderr.
 - **Denylist.** `Invoke-CandidateIntake` rejects a denylisted package first (before the audit). `Remove-WheelhousePackage` adds the removed/quarantined `name==version` automatically; `Restore-WheelhousePackage` lifts only the entry quarantining created. A damaged `denylist.json` throws - it is never read as empty.

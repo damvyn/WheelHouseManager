@@ -151,7 +151,10 @@ function Enter-WheelhouseLock {
             [System.IO.FileOptions]::DeleteOnClose)
     }
     catch [System.IO.IOException] {
-        throw [System.InvalidOperationException]::new("Another wheelhouse operation is already running (lock file in use: $lockPath). Wait for it to finish and try again.")
+        $busy = [System.InvalidOperationException]::new("Another wheelhouse operation is already running (lock file in use: $lockPath). Wait for it to finish and try again.")
+        # Lets scripts exit with the "busy" code (Get-WheelhouseExitCode).
+        $busy.Data['WheelhouseLockBusy'] = $true
+        throw $busy
     }
 
     $info = [System.Text.Encoding]::ASCII.GetBytes("pid=$PID user=$env:USERNAME started=$((Get-Date).ToString('s'))")
@@ -169,4 +172,49 @@ function Exit-WheelhouseLock {
     )
 
     if ($null -ne $Lock) { $Lock.Dispose() }
+}
+
+function Get-WheelhouseExitCode {
+    # The exit codes every script uses, so a Scheduled Task, the pipeline or the UI can
+    # tell the outcomes apart:
+    #   0 - OK
+    #   1 - finished, but needs attention (vulnerabilities, rejected packages, threats)
+    #   2 - error: the run aborted, or a check could not be completed
+    #   3 - busy: another wheelhouse operation holds the lock
+    # With -ErrorRecord, returns 3 for a busy lock and 2 for anything else.
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [ValidateSet('Ok', 'Attention', 'Error', 'Busy')]
+        [string]$Outcome = 'Ok',
+
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    if ($ErrorRecord) {
+        if ($ErrorRecord.Exception.Data['WheelhouseLockBusy']) { return 3 }
+        return 2
+    }
+    switch ($Outcome) {
+        'Attention' { return 1 }
+        'Error' { return 2 }
+        'Busy' { return 3 }
+        default { return 0 }
+    }
+}
+
+function ConvertTo-UtcDateTime {
+    # JSON dates arrive as text on Windows PowerShell 5.1 and as [datetime] on
+    # PowerShell 7 (ConvertFrom-Json and Invoke-RestMethod parse ISO strings). Either way
+    # this returns a UTC [datetime].
+    [CmdletBinding()]
+    [OutputType([datetime])]
+    param(
+        [Parameter(Mandatory)]
+        $Value
+    )
+
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    if ($Value -is [System.DateTimeOffset]) { return $Value.UtcDateTime }
+    return [System.DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime
 }

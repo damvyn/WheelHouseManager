@@ -22,9 +22,12 @@
         DIFFERENT version everywhere goes to a new group file. Nothing is written yet.
 
       - For EACH group, the candidates - the planned new pins plus any pins the group
-        already lists without a wheel in the wheelhouse - go through the vulnerability
-        audit, the package-age (cooldown) check and the download, one package at a
-        time as far as the outcome goes. A package that fails a step is rejected with
+        already lists without a wheel in the wheelhouse - go through the denylist, the
+        vulnerability audit, PyPI's yanked flag, the package-age (cooldown) check and
+        the download into a staging folder outside the wheelhouse. Each downloaded file
+        must match the sha256 PyPI publishes for it and pass a Microsoft Defender scan
+        before it is copied into the wheelhouse - clients never see an unchecked file.
+        Each package is judged on its own. A package that fails a step is rejected with
         the reason (log + Report_Rejected_<timestamp>.json) and never holds back the
         others. Only packages whose wheel was actually downloaded are written into the
         group file - a group file never lists a package that isn't in the wheelhouse.
@@ -38,12 +41,21 @@
         transitive dependency is already pinned in them and goes through the same
         audit and cooldown checks. Nothing unpinned is ever pulled in.
 
-      - After all groups are processed, new wheel files are hashed and added to the
-        manifest (existing entries are kept unchanged), and a single Microsoft Defender
+      - The wheels published for a group are added to the manifest right after that
+        group (existing entries are kept unchanged). At the end, one Microsoft Defender
         scan covers the whole wheelhouse folder.
 
-    Writes one Wheelhouse.AuditResult object per audit to the output stream, so a
-    caller (Invoke-WheelhousePipeline.ps1) can alert on exactly this run's findings.
+      - A tracked wheel that Microsoft Defender removed by itself does not block the
+        run: its pin is taken out of the group files and the manifest, the version is
+        denylisted, and a notice is raised.
+
+    Writes one Wheelhouse.AuditResult object per audit and one Wheelhouse.Notice per
+    finding that is not an audit (Defender detections, removed or blocked downloads) to
+    the output stream, so a caller (Invoke-WheelhousePipeline.ps1) can alert on exactly
+    this run's findings.
+
+    Exit codes: 0 OK; 1 rejected packages, vulnerabilities or threats (needs attention);
+    2 aborted or an audit could not be completed; 3 another operation holds the lock.
 
     Function definitions live in the WheelhouseManager module next to this script.
 
@@ -70,10 +82,18 @@
 
 .PARAMETER MinimumPackageAgeDays
     Minimum days a package version must be published on PyPI before it can be downloaded
-    (default: 10). Applies only to new/changed packages.
+    (default: 10). Applies only to new/changed packages. For an urgent fix, prefer
+    -ExpeditePackage: it skips the cooldown for that one pin only.
 
 .PARAMETER VulnerabilityServices
     pip-audit vulnerability service(s) to check (default: osv, pypi).
+
+.PARAMETER ExpeditePackage
+    name==version pins whose cooldown is skipped in this run (e.g. a security fix that is
+    only a few days old). Every other check still applies. Needs -ExpediteReason.
+
+.PARAMETER ExpediteReason
+    Why the cooldown is skipped; logged with the user name.
 
 .EXAMPLE
     # Process existing group files only - no merge
@@ -82,6 +102,10 @@
 .EXAMPLE
     # Merge an approved local requirements.txt, then process every group
     .\Update-Wheelhouse.ps1 -WheelhousePath "\\server\share\wheelhouse" -LocalRequirementsPath "C:\WheelHouseManager\Input\requirements.txt"
+
+.EXAMPLE
+    # Urgent security fix published 2 days ago: skip the cooldown for this pin only
+    .\Update-Wheelhouse.ps1 -ExpeditePackage requests==2.32.4 -ExpediteReason "CVE-2026-1234 fix"
 
 .NOTES
     Start-MpScan (Defender scan) typically requires administrative privileges - deliberately
@@ -110,22 +134,43 @@ param(
     [int]$MinimumPackageAgeDays,
 
     [ValidateSet('osv', 'pypi')]
-    [string[]]$VulnerabilityServices
+    [string[]]$VulnerabilityServices,
+
+    [string[]]$ExpeditePackage,
+
+    [string]$ExpediteReason
 )
 
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths
+    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake
 
 $title = 'Wheelhouse maintenance script'
 $outcome = $null
 $exitCode = 0
 $auditResults = [System.Collections.Generic.List[object]]::new()
+$notices = [System.Collections.Generic.List[object]]::new()
 $lock = $null
 
 try {
     $reportsFolder = Start-WheelhouseRun -WheelhousePath $cfg.WheelhousePath -Title $title -LogPrefix 'Log' -RetentionMonths $cfg.ReportRetentionMonths
+
+    # Pins whose cooldown is skipped in this run - validated before anything else happens.
+    $expedite = @{}
+    foreach ($pin in @($ExpeditePackage | ForEach-Object { $_ -split '[,;]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        if ($pin -notmatch '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)==(?<version>[A-Za-z0-9][A-Za-z0-9._+!-]*)$') {
+            throw "-ExpeditePackage: not a name==version pin: '$pin'"
+        }
+        $expedite[(Get-NormalizedPackageName $Matches['name'])] = $Matches['version']
+    }
+    if ($expedite.Count -gt 0) {
+        if ([string]::IsNullOrWhiteSpace($ExpediteReason)) {
+            throw '-ExpeditePackage needs -ExpediteReason: say why the cooldown is skipped.'
+        }
+        $user = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
+        Write-Log "Cooldown is skipped for $(($expedite.Keys | Sort-Object | ForEach-Object { "$_==$($expedite[$_])" }) -join ', ') - requested by $user. Reason: $ExpediteReason" 'WARN'
+    }
 
     # Only one operation at a time may change the manifest and the group files
     # (the UI's remove/quarantine actions take the same lock).
@@ -136,6 +181,9 @@ try {
     $denylist = @(Read-WheelhouseDenylist)
     if ($denylist.Count -gt 0) { Write-Log "Denylist: $($denylist.Count) blocked package entr(y/ies) will be rejected at intake." }
 
+    $overallPassed = $true
+    $auditIncomplete = $false
+
     # -----------------------------------------------------------------------
     # Step 1: manifest integrity check - must pass before anything else happens
     # -----------------------------------------------------------------------
@@ -144,15 +192,41 @@ try {
     $manifest = Read-WheelhouseManifest -WheelhousePath $cfg.WheelhousePath
     Write-Log "Manifest contains $($manifest.Count) tracked file(s)."
 
-    if ($manifest.Count -eq 0) {
+    $isBootstrap = ($manifest.Count -eq 0)
+    if ($isBootstrap) {
         Write-Log 'Manifest is empty - assuming first-time setup.' 'OK'
     }
-    Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $cfg.WheelhousePath -ReportsFolder $reportsFolder
+    $removedByDefender = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $cfg.WheelhousePath -ReportsFolder $reportsFolder -AllowDefenderRemoved)
 
-    # Snapshot taken after the integrity check: anything that appears after this
-    # point was downloaded by this run.
-    $preRunFiles = [string[]]@(Get-ChildItem -Path $cfg.WheelhousePath -Filter '*.whl' -File -ErrorAction SilentlyContinue |
-            ForEach-Object { $_.Name })
+    # A wheel Defender removed by itself: take its pin out of the group files and the
+    # manifest and denylist the version, so the rest of the wheelhouse keeps working.
+    $handled = @{}
+    foreach ($item in $removedByDefender) {
+        $pinKey = "$($item.Entry.name)==$($item.Entry.version)"
+        if ($handled.ContainsKey($pinKey)) { continue }
+        $handled[$pinKey] = $true
+        $removeParams = @{
+            WheelhousePath = $cfg.WheelhousePath
+            Name           = [string]$item.Entry.name
+            Version        = [string]$item.Entry.version
+            Reason         = "removed by Microsoft Defender: $($item.ThreatName)"
+            LockHeld       = $true
+        }
+        $removal = Remove-WheelhousePackage @removeParams
+        $noticeParams = @{
+            Kind    = 'DefenderRemoved'
+            Package = $removal.Name
+            Version = $removal.Version
+            File    = $removal.Files
+            Message = "Microsoft Defender detected $($item.ThreatName) and removed the wheel. The pin was taken out of $(@($removal.Groups).Count) group file(s) and the manifest, and the version was denylisted."
+            Action  = 'Review the detection in Microsoft Defender. Pin a different version in requirements.in if the package is still needed.'
+        }
+        $notices.Add((New-WheelhouseNotice @noticeParams))
+        $overallPassed = $false
+    }
+    if ($removedByDefender.Count -gt 0) {
+        $manifest = Read-WheelhouseManifest -WheelhousePath $cfg.WheelhousePath
+    }
 
     # -----------------------------------------------------------------------
     # Step 2: plan the merge of local requirements - nothing is written yet
@@ -201,16 +275,16 @@ try {
     Write-Log "Processing $($targetGroups.Count) requirement group file(s)."
 
     # -----------------------------------------------------------------------
-    # Step 3: per group - take candidates through audit, cooldown and download,
-    # write only the accepted ones, then audit the group as deployed
+    # Step 3: per group - take candidates through every check into the
+    # wheelhouse, write only the accepted ones, then audit the group as deployed
     # -----------------------------------------------------------------------
 
     $expectedPythonTag = 'cp' + ($cfg.PythonVersion -replace '\.', '')
     Write-Log "Target tag for matching: $expectedPythonTag / $($cfg.Platform)"
 
-    $overallPassed = $true
     $anyDownloadHappened = $false
     $rejectedAll = [System.Collections.Generic.List[object]]::new()
+    $expediteUsed = @{}
 
     foreach ($groupFile in $targetGroups) {
         $groupName = [System.IO.Path]::GetFileNameWithoutExtension($groupFile)
@@ -241,30 +315,40 @@ try {
             foreach ($name in ($candidates.Keys | Sort-Object)) {
                 $kind = if ($additions.ContainsKey($name)) { 'new' } else { 'listed, no wheel yet' }
                 Write-Log "  Candidate: $name==$($candidates[$name]) ($kind)" 'WARN'
+                if ($expedite.ContainsKey($name) -and $expedite[$name] -eq $candidates[$name]) { $expediteUsed[$name] = $true }
             }
 
             $intakeParams = @{
-                Packages       = $candidates
-                GroupName      = $groupName
-                WheelhousePath = $cfg.WheelhousePath
-                ReportsFolder  = $reportsFolder
-                Services       = $cfg.VulnerabilityServices
-                MinimumAgeDays = $cfg.MinimumPackageAgeDays
-                PythonVersion  = $cfg.PythonVersion
-                Platform       = $cfg.Platform
-                Denylist       = $denylist
+                Packages            = $candidates
+                GroupName           = $groupName
+                WheelhousePath      = $cfg.WheelhousePath
+                ReportsFolder       = $reportsFolder
+                Services            = $cfg.VulnerabilityServices
+                MinimumAgeDays      = $cfg.MinimumPackageAgeDays
+                PythonVersion       = $cfg.PythonVersion
+                Platform            = $cfg.Platform
+                Denylist            = $denylist
+                Expedite            = $expedite
+                RequireDefenderScan = [bool]$cfg.RequireDefenderScanAtIntake
             }
-            $intake =Invoke-CandidateIntake @intakeParams
+            $intake = Invoke-CandidateIntake @intakeParams
             foreach ($result in $intake.AuditResults) { $auditResults.Add($result) }
 
-            if ($intake.Accepted.Count -gt 0) { $anyDownloadHappened = $true }
+            # Record what was published before touching the group file, so a pin is never
+            # listed for a wheel the manifest does not know.
+            if (@($intake.Published).Count -gt 0) {
+                $anyDownloadHappened = $true
+                $manifest = [object[]](@($manifest) + @($intake.Published))
+                Save-WheelhouseManifest -Manifest $manifest -WheelhousePath $cfg.WheelhousePath
+                Write-Log "Manifest updated: $(@($intake.Published).Count) wheel(s) added for $groupName." 'OK'
+            }
             foreach ($name in ($intake.Accepted.Keys | Sort-Object)) {
                 if ($additions.ContainsKey($name)) {
                     Add-RequirementToGroupFile -GroupFile $groupFile -Name $name -Version $intake.Accepted[$name]
                     Write-Log "  Accepted and added to ${groupName}: $name==$($intake.Accepted[$name])" 'OK'
                 }
                 else {
-                    Write-Log "  Accepted, wheel now downloaded: $name==$($intake.Accepted[$name])" 'OK'
+                    Write-Log "  Accepted, wheel now published: $name==$($intake.Accepted[$name])" 'OK'
                 }
             }
 
@@ -277,12 +361,19 @@ try {
                 }
                 Write-Log "  Rejected: $($item.Name)==$($item.Version) - $($item.Reason) -> $action" 'ERROR'
                 $rejectedAll.Add([PSCustomObject]@{
-                        Group   = $groupName
-                        Package = $item.Name
-                        Version = $item.Version
-                        Kind    = $(if ($additions.ContainsKey($item.Name)) { 'new' } else { 'listed' })
-                        Reason  = $item.Reason
+                        Group    = $groupName
+                        Package  = $item.Name
+                        Version  = $item.Version
+                        Kind     = $(if ($additions.ContainsKey($item.Name)) { 'new' } else { 'listed' })
+                        Category = $item.Category
+                        Reason   = $item.Reason
                     })
+                # A download that differed from PyPI or was detected by Defender is a
+                # security event, not just a rejection.
+                if ($item.Category -in 'integrity', 'defender') {
+                    $notices.Add((New-WheelhouseNotice -Kind 'IntakeBlocked' -Package $item.Name -Version $item.Version -Message $item.Reason))
+                }
+                if ($item.Category -eq 'audit-error') { $auditIncomplete = $true }
             }
             if ($intake.Rejected.Count -gt 0) { $overallPassed = $false }
         }
@@ -291,12 +382,19 @@ try {
         # only packages that were just audited as candidates.
         if ($groupExisted -and $listed.Count -gt 0) {
             Write-Log "Auditing $groupName as deployed (no download)..."
-            $groupResults = Invoke-GroupAudit -GroupFile $groupFile -Services $cfg.VulnerabilityServices -Stage 'Scheduled' -ReportsFolder $reportsFolder
+            $groupResults = Invoke-GroupAudit -GroupFile $groupFile -Services $cfg.VulnerabilityServices -Stage 'Deployed' -ReportsFolder $reportsFolder
             foreach ($result in $groupResults) { $auditResults.Add($result) }
             if ($groupResults | Where-Object { $_.Status -ne 'Passed' }) {
                 Write-Log "$groupName has known vulnerabilities (or an incomplete audit) in listed packages." 'ERROR'
                 $overallPassed = $false
             }
+            if ($groupResults | Where-Object { $_.Status -eq 'Error' }) { $auditIncomplete = $true }
+        }
+    }
+
+    foreach ($name in ($expedite.Keys | Sort-Object)) {
+        if (-not $expediteUsed.ContainsKey($name)) {
+            Write-Log "-ExpeditePackage $name==$($expedite[$name]) was not a candidate in any group - nothing was expedited for it." 'WARN'
         }
     }
 
@@ -307,33 +405,57 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Step 4: add this run's downloads to the manifest, then scan
+    # Step 4: first-time setup only - adopt the wheels that were already there
     # -----------------------------------------------------------------------
 
-    if ($anyDownloadHappened) {
-        Write-Log "Updating manifest with this run's downloads..."
-        $newManifest = Merge-WheelhouseManifest -WheelhousePath $cfg.WheelhousePath -Manifest $manifest -PreRunFiles $preRunFiles
-        Save-WheelhouseManifest -Manifest $newManifest -WheelhousePath $cfg.WheelhousePath
-        Write-Log "Manifest updated: $($newManifest.Count) tracked file(s) total ($($newManifest.Count - $manifest.Count) added)." 'OK'
+    if ($isBootstrap -and $anyDownloadHappened) {
+        # Every run's own downloads are already in the manifest (verified against PyPI);
+        # this adds the wheels the folder held before the manager was set up.
+        $adopted = Merge-WheelhouseManifest -WheelhousePath $cfg.WheelhousePath -Manifest $manifest -PreRunFiles @()
+        if ($adopted.Count -gt $manifest.Count) {
+            Write-Log "First-time setup: $($adopted.Count - $manifest.Count) wheel(s) that were already in the folder were added to the manifest (not verified against PyPI)." 'WARN'
+            Save-WheelhouseManifest -Manifest $adopted -WheelhousePath $cfg.WheelhousePath
+        }
     }
-    else {
+    elseif (-not $anyDownloadHappened) {
         Write-Log 'No downloads occurred this run - manifest left unchanged.'
     }
+
+    # -----------------------------------------------------------------------
+    # Step 5: Defender scan of the whole wheelhouse
+    # -----------------------------------------------------------------------
 
     # A failed or unavailable scan is logged but does not fail the run (as before);
     # a detection does.
     $scan = Invoke-WheelhouseDefenderScan -Path $cfg.WheelhousePath -ReportsFolder $reportsFolder
-    if ($scan.Status -eq 'Threat') { $overallPassed = $false }
+    if ($scan.Status -eq 'Threat') {
+        $overallPassed = $false
+        foreach ($threat in @($scan.Threats)) {
+            $hit = $manifest | Where-Object { ([string]$threat.Resource).IndexOf((Join-Path $cfg.WheelhousePath ([string]$_.file)), [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -First 1
+            $noticeParams = @{
+                Kind    = 'DefenderThreat'
+                Package = $(if ($hit) { [string]$hit.name } else { '' })
+                Version = $(if ($hit) { [string]$hit.version } else { '' })
+                File    = @([string]$threat.Resource)
+                Message = "Microsoft Defender detected $($threat.ThreatName)."
+            }
+            $notices.Add((New-WheelhouseNotice @noticeParams))
+        }
+    }
 
-    if (-not $overallPassed) {
-        $exitCode = 1
+    if ($auditIncomplete) {
+        $exitCode = Get-WheelhouseExitCode -Outcome Error
+        $outcome = 'an audit could not be completed'
+    }
+    elseif (-not $overallPassed) {
+        $exitCode = Get-WheelhouseExitCode -Outcome Attention
         $outcome = 'with failures'
     }
 }
 catch {
     Write-Log $_.Exception.Message 'ERROR'
-    $exitCode = 1
-    $outcome = 'ABORTED'
+    $exitCode = Get-WheelhouseExitCode -ErrorRecord $_
+    $outcome = $(if ($exitCode -eq 3) { 'BUSY' } else { 'ABORTED' })
 }
 finally {
     Exit-WheelhouseLock -Lock $lock
@@ -341,4 +463,5 @@ finally {
 }
 
 $auditResults.ToArray()
+$notices.ToArray()
 exit $exitCode

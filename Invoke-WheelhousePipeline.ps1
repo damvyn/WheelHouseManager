@@ -9,8 +9,14 @@
     timestamps), and passes every vulnerable or failed audit straight into
     Send-VulnerabilityAlert.ps1 - no manual -ReportPaths needed.
 
+    Wheelhouse.Notice objects of the same run (Defender detections, a wheel Defender
+    removed, a download that did not match PyPI) go into the same alert.
+
     If Update-Wheelhouse.ps1 aborts before running any audit (e.g. an integrity
     check failure), this script skips the alert step and says why.
+
+    Exit code: Update-Wheelhouse.ps1's code if it is not 0 (1 needs attention, 2 error,
+    3 busy), otherwise the alert script's (2 if the alert could not be delivered).
 
     Every parameter is only passed down if you supply it; otherwise each child
     script resolves it from config\settings.psd1 itself.
@@ -27,6 +33,8 @@
 .PARAMETER Platform
 .PARAMETER MinimumPackageAgeDays
 .PARAMETER VulnerabilityServices
+.PARAMETER ExpeditePackage
+.PARAMETER ExpediteReason
     Passed through to Update-Wheelhouse.ps1.
 
 .PARAMETER SmtpServer
@@ -60,6 +68,8 @@ param(
     [int]$MinimumPackageAgeDays,
     [ValidateSet('osv', 'pypi')]
     [string[]]$VulnerabilityServices,
+    [string[]]$ExpeditePackage,
+    [string]$ExpediteReason,
 
     [string]$SmtpServer,
     [string]$To,
@@ -76,7 +86,7 @@ Write-Log '=== Wheelhouse pipeline started ==='
 foreach ($scriptPath in $UpdateWheelhouseScriptPath, $SendAlertScriptPath) {
     if (-not (Test-Path -Path $scriptPath)) {
         Write-Log "Required script not found: $scriptPath" 'ERROR'
-        exit 1
+        exit 2
     }
 }
 
@@ -88,7 +98,9 @@ $updateParamsIn = @(
     'PythonVersion',
     'Platform',
     'MinimumPackageAgeDays',
-    'VulnerabilityServices'
+    'VulnerabilityServices',
+    'ExpeditePackage',
+    'ExpediteReason'
 )
 foreach ($name in $updateParamsIn) {
     if ($PSBoundParameters.ContainsKey($name)) {
@@ -115,23 +127,24 @@ foreach ($name in $alertParamsIn) {
 # ---------------------------------------------------------------------------
 
 Write-Log 'Running Update-Wheelhouse.ps1...'
-$auditResults = @(& $UpdateWheelhouseScriptPath @updateParams |
-        Where-Object { $_.PSObject.TypeNames -contains 'Wheelhouse.AuditResult' })
+$output = @(& $UpdateWheelhouseScriptPath @updateParams)
 $wheelhouseExitCode = $LASTEXITCODE
+$auditResults = @($output | Where-Object { $_.PSObject.TypeNames -contains 'Wheelhouse.AuditResult' })
+$notices = @($output | Where-Object { $_.PSObject.TypeNames -contains 'Wheelhouse.Notice' })
 Write-Log "Update-Wheelhouse.ps1 finished with exit code $wheelhouseExitCode."
 
 # ---------------------------------------------------------------------------
-# Step 2: alert on every vulnerable or failed audit of this run
+# Step 2: alert on every vulnerable or failed audit and every notice of this run
 # ---------------------------------------------------------------------------
 
-if ($auditResults.Count -eq 0) {
+if ($auditResults.Count -eq 0 -and $notices.Count -eq 0) {
     Write-Log 'No audits ran this run - skipping the alert step.' 'WARN'
     Write-Log '(This is expected if script aborted early.)'
     Write-Log '=== Wheelhouse pipeline finished ==='
     exit $wheelhouseExitCode
 }
 
-$alertParams = Get-VulnerabilityAlertParameter -AuditResult $auditResults -AlertParameters $alertParams
+$alertParams = Get-VulnerabilityAlertParameter -AuditResult $auditResults -Notice $notices -AlertParameters $alertParams
 $alertExitCode = 0
 if ($null -ne $alertParams) {
     Write-Log 'Running Send-VulnerabilityAlert.ps1...'

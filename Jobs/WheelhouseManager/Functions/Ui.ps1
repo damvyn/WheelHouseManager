@@ -40,7 +40,8 @@ function Get-WheelhouseUiContext {
     $settingsPath = Get-WheelhouseSettingsPath -ManagerRoot $ManagerRoot
     $settings = Get-WheelhouseSetting -SettingsPath $settingsPath
     $names = @('WheelhousePath', 'RequirementsInPath', 'LocalRequirementsPath', 'PythonVersion', 'Platform',
-        'MinimumPackageAgeDays', 'VulnerabilityServices', 'ReportRetentionMonths', 'SmtpServer', 'MailTo', 'MailFrom')
+        'MinimumPackageAgeDays', 'VulnerabilityServices', 'ReportRetentionMonths', 'SmtpServer', 'MailTo', 'MailFrom',
+        'RequireDefenderScanAtIntake', 'DefenderScanInScheduledCheck')
     $effective = Resolve-WheelhouseParameter -BoundParameters @{} -Name $names -Settings $settings
 
     $wheelhousePath = [string]$effective.WheelhousePath
@@ -258,8 +259,16 @@ function Sync-WheelhouseUiJob {
         $job.EndedUtc = (Get-Date).ToUniversalTime().ToString('o')
     }
 
-    if ($step.ExitCode -ne 0) {
-        & $finish 'Failed' "$($step.Script) finished with exit code $($step.ExitCode). Read the log for details."
+    # Exit codes: see Get-WheelhouseExitCode. 1 is a normal outcome that needs a look
+    # (findings, rejected packages); later steps still do not run.
+    if ($step.ExitCode -eq 1) {
+        & $finish 'Attention' "$($step.Script) finished with findings or rejected packages. Read the log for details."
+    }
+    elseif ($step.ExitCode -eq 3) {
+        & $finish 'Failed' "$($step.Script) did not run: another wheelhouse operation holds the lock. Try again when it has finished."
+    }
+    elseif ($step.ExitCode -ne 0) {
+        & $finish 'Failed' "$($step.Script) failed (exit code $($step.ExitCode)). Read the log for details."
     }
     elseif ($job.StepIndex + 1 -lt $job.Steps.Count) {
         $job.StepIndex++
@@ -462,7 +471,12 @@ function Invoke-WheelhouseUiApi {
 
             '^GET /api/packages$' {
                 Assert-WheelhouseUiConfigured -Context $context
-                $inventory = Get-WheelhousePackage -WheelhousePath $context.WheelhousePath -Denylist @(Read-WheelhouseDenylist -Path $context.DenylistPath)
+                $inventoryParams = @{
+                    WheelhousePath = $context.WheelhousePath
+                    Denylist       = @(Read-WheelhouseDenylist -Path $context.DenylistPath)
+                    Services       = [string[]]@($context.Settings.VulnerabilityServices)
+                }
+                $inventory = Get-WheelhousePackage @inventoryParams
                 return @{ Status = 200; Body = @{ packages = @($inventory.Packages); groups = @($inventory.Groups); untracked = @($inventory.Untracked) } }
             }
 
@@ -518,12 +532,38 @@ function Invoke-WheelhouseUiApi {
                 $job = $null
                 if ($addResult.Added.Count -gt 0) {
                     $steps = @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
-                    # By default the new pins also go straight into the wheelhouse
-                    # (audit, cooldown, download); "resolve only" stops at requirements.txt.
-                    if (-not (Get-UiBodyValue -Body $Body -Name 'resolve_only')) { $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() } }
+                    # By default the job stops at requirements.txt, so the resolved pins can
+                    # be reviewed before anything is downloaded. "publish": true also runs
+                    # Update-Wheelhouse.ps1 (audit, cooldown, download) straight away.
+                    if ((Get-UiBodyValue -Body $Body -Name 'publish') -eq $true) { $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() } }
                     $job = Start-WheelhouseUiJob -Title "Add: $($addResult.Added -join ', ')" -Kind 'add' -Context $context -Steps $steps
                 }
                 return @{ Status = 200; Body = @{ added = @($addResult.Added); skipped = @($addResult.Skipped); job = $(if ($job) { ConvertTo-WheelhouseUiJobSummary -Job $job } else { $null }) } }
+            }
+
+            '^GET /api/requirements$' {
+                # The resolved file Update-Wheelhouse.ps1 merges - shown for review.
+                $path = [string]$context.Settings.LocalRequirementsPath
+                $text = ''
+                $modified = ''
+                if ($path -and (Test-Path -Path $path -PathType Leaf)) {
+                    $item = Get-Item -Path $path
+                    if ($item.Length -gt 1MB) { throw [System.InvalidOperationException]::new("requirements.txt is too large to show here: $path") }
+                    $text = [System.IO.File]::ReadAllText($path)
+                    $modified = $item.LastWriteTimeUtc.ToString('o')
+                }
+                $pins = @()
+                if ($text.Trim()) { $pins = @((Read-RequirementFile -FilePath $path).Keys | Sort-Object) }
+                return @{ Status = 200; Body = @{ path = $path; text = $text; modified_utc = $modified; pin_count = $pins.Count } }
+            }
+
+            '^POST /api/wheelhouse/update$' {
+                Assert-WheelhouseUiConfigured -Context $context
+                if ((Get-UiBodyValue -Body $Body -Name 'confirm') -ne $true) {
+                    throw [System.ArgumentException]::new('Publishing needs an explicit confirmation.')
+                }
+                $job = Start-WheelhouseUiJob -Title 'Publish: Update-Wheelhouse' -Kind 'update' -Context $context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() })
+                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
 
             '^POST /api/packages/remove$' {

@@ -25,6 +25,8 @@ function Get-WheelhouseDefaultSetting {
         SmtpServer            = ''
         MailTo                = 'servicedesk@company.com'
         MailFrom              = 'NoReply@company.com'
+        RequireDefenderScanAtIntake  = $false
+        DefenderScanInScheduledCheck = $false
     }
 }
 
@@ -244,6 +246,8 @@ function Get-WheelhouseSettingSchema {
         @{ Key = 'SmtpServer'; Type = 'string'; Label = 'SMTP server'; Help = 'Empty: alerts are saved as HTML instead of emailed.' }
         @{ Key = 'MailTo'; Type = 'string'; Label = 'Alert recipient'; Help = 'Where vulnerability alerts go.' }
         @{ Key = 'MailFrom'; Type = 'string'; Label = 'Alert sender'; Help = 'From address of alert mails.' }
+        @{ Key = 'RequireDefenderScanAtIntake'; Type = 'bool'; Label = 'Require a Defender scan at intake'; Help = 'On: a new package is rejected when its download cannot be scanned (for example, the run is not elevated). Off: it is published with a warning.' }
+        @{ Key = 'DefenderScanInScheduledCheck'; Type = 'bool'; Label = 'Defender scan in the scheduled check'; Help = 'Test-Wheelhouse.ps1 re-scans the whole wheelhouse with the current signatures. The Scheduled Task must then run elevated.' }
     )
     foreach ($item in $schema) { [PSCustomObject]$item }
 }
@@ -267,6 +271,13 @@ function ConvertTo-WheelhouseSettingValue {
     $fail = { param($Text) throw [System.ArgumentException]::new("$($definition.Label): $Text") }
 
     switch ($definition.Type) {
+        'bool' {
+            if ($Value -is [bool]) { return $Value }
+            $text = ([string]$Value).Trim().ToLowerInvariant()
+            if ($text -in 'true', '1', 'yes') { return $true }
+            if ($text -in 'false', '0', 'no') { return $false }
+            & $fail 'must be true or false.'
+        }
         'int' {
             $number = 0
             if (-not [int]::TryParse([string]$Value, [ref]$number)) { & $fail 'must be a whole number.' }
