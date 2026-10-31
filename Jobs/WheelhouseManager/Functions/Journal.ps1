@@ -118,8 +118,9 @@ function Complete-WheelhousePublishJournal {
     # with the recorded sha256 is added to the manifest (if missing), and each addition
     # whose wheels are all there is listed in the group file (if missing). Leftover
     # *.partial copies are deleted; an entry whose wheel is missing or different is
-    # left out, and so is its pin.
-    # Data: group_file; entries[] (manifest entries); additions[] ({ name; version }).
+    # left out, and so is its pin. An addition with "replaces" (a remediation) swaps the
+    # group's pin of that package instead of adding a line.
+    # Data: group_file; entries[] (manifest entries); additions[] ({ name; version; replaces }).
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -172,7 +173,12 @@ function Complete-WheelhousePublishJournal {
         $name = Get-NormalizedPackageName ([string]$addition.name)
         if (-not $complete[$name]) { continue }
         $listed = if (Test-Path -Path $groupFile) { Read-RequirementFile -FilePath $groupFile } else { @{} }
-        if ($listed[$name] -ne [string]$addition.version) {
+        if ($listed[$name] -eq [string]$addition.version) { continue }
+        # A dictionary (in-process) or an object (read back from a journal) - both answer .replaces.
+        if ([string]$addition.replaces) {
+            Set-RequirementInGroupFile -GroupFile $groupFile -Name $name -Version ([string]$addition.version)
+        }
+        else {
             Add-RequirementToGroupFile -GroupFile $groupFile -Name $name -Version ([string]$addition.version)
         }
     }

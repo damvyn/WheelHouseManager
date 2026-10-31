@@ -13,6 +13,9 @@ Describe 'WheelhouseManager' {
         Import-Module $modulePath -Force
         # No test reaches the real OSV API; the severity tests mock it themselves.
         Mock -ModuleName WheelhouseManager -CommandName Get-OsvVulnerability -MockWith { throw 'OSV is not reachable from the tests.' }
+        # Proposals go to the test drive, never to the repository's Input folder.
+        $global:WhmProposalPath = Join-Path $TestDrive 'proposal.json'
+        Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseProposalPath -MockWith { $global:WhmProposalPath }
 
         function Get-TestFolder {
             $path = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
@@ -170,7 +173,7 @@ Describe 'WheelhouseManager' {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
         Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded, WhmIntakeCandidates, WhmScanDetections, WhmUiJobSteps,
             WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI, WhmScannedPath,
-            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline, WhmTask, WhmTaskRegistered, WhmTaskError, WhmTaskCalls -Scope Global -ErrorAction SilentlyContinue
+            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline, WhmProposalPath, WhmTask, WhmTaskRegistered, WhmTaskError, WhmTaskCalls -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -1784,6 +1787,117 @@ Describe 'WheelhouseManager' {
         }
     }
 
+    Context 'Proposals and approval' {
+        BeforeEach {
+            $script:proposalFile = Join-Path (Get-TestFolder) 'proposal.json'
+            $script:resolved = Join-Path (Get-TestFolder) 'requirements.txt'
+            Set-Content -Path $script:resolved -Value @('six==1.16.0', 'attrs==24.0')
+        }
+
+        It 'orders versions like PEP 440' {
+            Compare-PackageVersion -Left '2.32.4' -Right '2.32.3' | Should -Be 1
+            Compare-PackageVersion -Left '2.0' -Right '10.0' | Should -Be -1
+            Compare-PackageVersion -Left '1.0' -Right '1.0.0' | Should -Be 0
+            Compare-PackageVersion -Left '1.0rc1' -Right '1.0' | Should -Be -1
+            Compare-PackageVersion -Left '1.0.dev1' -Right '1.0a1' | Should -Be -1
+            Compare-PackageVersion -Left '1.0.post1' -Right '1.0' | Should -Be 1
+            Compare-PackageVersion -Left '1!1.0' -Right '9.0' | Should -Be 1
+            { Compare-PackageVersion -Left 'abc' -Right '1.0' } | Should -Throw '*Not a version*'
+        }
+
+        It 'records who proposed and who approved, and keeps a history' {
+            $proposal = New-WheelhouseProposal -RequirementsPath $script:resolved -RequestedBy 'CONTOSO\alice' -Path $script:proposalFile
+            $proposal.state | Should -Be 'Proposed'
+            $proposal.pins -join ',' | Should -Be 'attrs==24.0,six==1.16.0'
+            $approved = Approve-WheelhouseProposal -Id $proposal.id -By 'CONTOSO\alice' -Path $script:proposalFile
+            $approved.state | Should -Be 'Approved'
+            $approved.approved_by | Should -Be 'CONTOSO\alice'
+            { Approve-WheelhouseProposal -Id $proposal.id -By 'CONTOSO\bob' -Path $script:proposalFile } | Should -Throw '*already Approved*'
+            $history = @(Get-Content -Path (Join-Path (Split-Path $script:proposalFile) 'proposal-history.jsonl') | ForEach-Object { ($_ | ConvertFrom-Json).action })
+            $history -join ',' | Should -Be 'Proposed,Approved'
+        }
+
+        It 'needs another person under SeparateApprover, and refuses a file changed since' {
+            $proposal = New-WheelhouseProposal -RequirementsPath $script:resolved -RequestedBy 'CONTOSO\alice' -Path $script:proposalFile
+            { Approve-WheelhouseProposal -Id $proposal.id -By 'contoso\ALICE' -Mode SeparateApprover -Path $script:proposalFile } | Should -Throw '*another person*'
+            Add-Content -Path $script:resolved -Value 'newpkg==1.0'
+            { Approve-WheelhouseProposal -Id $proposal.id -By 'CONTOSO\bob' -Mode SeparateApprover -Path $script:proposalFile } | Should -Throw '*changed after proposal*'
+
+            $proposal = New-WheelhouseProposal -RequirementsPath $script:resolved -RequestedBy 'CONTOSO\alice' -Path $script:proposalFile
+            (Approve-WheelhouseProposal -Id $proposal.id -By 'CONTOSO\bob' -Mode SeparateApprover -Path $script:proposalFile).approved_by | Should -Be 'CONTOSO\bob'
+            { Deny-WheelhouseProposal -Id $proposal.id -Reason '' -Path $script:proposalFile } | Should -Throw '*reason*'
+            (Deny-WheelhouseProposal -Id $proposal.id -Reason 'not needed' -By 'CONTOSO\carol' -Path $script:proposalFile).state | Should -Be 'Rejected'
+        }
+
+        It 'gates publishing by the approval mode' {
+            # No proposal: SamePersonAllowed proposes and approves it as the publisher.
+            $gate = Resolve-WheelhouseProposalForPublish -RequirementsPath $script:resolved -User 'CONTOSO\alice' -Path $script:proposalFile
+            $gate.Allowed | Should -Be $true
+            $gate.Proposal.kind | Should -Be 'manual'
+            $gate.Proposal.approved_by | Should -Be 'CONTOSO\alice'
+
+            # SeparateApprover: the requester cannot publish (= approve) it; someone else can.
+            $proposal = New-WheelhouseProposal -RequirementsPath $script:resolved -RequestedBy 'CONTOSO\alice' -Path $script:proposalFile
+            $gate = Resolve-WheelhouseProposalForPublish -RequirementsPath $script:resolved -Mode SeparateApprover -User 'CONTOSO\alice' -Path $script:proposalFile
+            $gate.Allowed | Should -Be $false
+            $gate.Reason | Should -Match 'waiting for approval'
+            $gate = Resolve-WheelhouseProposalForPublish -RequirementsPath $script:resolved -Mode SeparateApprover -User 'CONTOSO\bob' -Path $script:proposalFile
+            $gate.Allowed | Should -Be $true
+            $gate.Proposal.approved_by | Should -Be 'CONTOSO\bob'
+
+            # A hand-edited file under SeparateApprover, and a rejected proposal, are refused.
+            Add-Content -Path $script:resolved -Value 'newpkg==1.0'
+            (Resolve-WheelhouseProposalForPublish -RequirementsPath $script:resolved -Mode SeparateApprover -User 'CONTOSO\bob' -Path $script:proposalFile).Reason | Should -Match 'changed after proposal'
+            $proposal = New-WheelhouseProposal -RequirementsPath $script:resolved -RequestedBy 'CONTOSO\alice' -Path $script:proposalFile
+            [void](Deny-WheelhouseProposal -Id $proposal.id -Reason 'too big' -Path $script:proposalFile)
+            (Resolve-WheelhouseProposalForPublish -RequirementsPath $script:resolved -User 'CONTOSO\alice' -Path $script:proposalFile).Reason | Should -Match 'rejected'
+        }
+
+        It 'plans a fix: the lowest version that fixes every advisory, kept upper bounds, expedite when too new' {
+            $wheelhouse = Get-TestWheelhouse
+            Update-WheelhouseCatalog -WheelhousePath $wheelhouse -DenylistPath (Join-Path $wheelhouse 'deny.json') -Update {
+                param($catalog)
+                $report = Join-Path $wheelhouse 'report.json'
+                Set-Content -Path $report -Value '{"dependencies":[{"name":"attrs","version":"23.1.0","vulns":[{"id":"GHSA-a","fix_versions":["23.2.0"]},{"id":"GHSA-b","fix_versions":["22.0","24.1.0"]},{"id":"GHSA-c","fix_versions":[]}]}]}'
+                Update-CatalogAuditResult -Catalog $catalog -AuditResult @('osv', 'pypi' | ForEach-Object { [PSCustomObject]@{ Service = $_; Status = 'Vulnerable'; ReportPath = $report; GroupFile = 'x' } })
+            }
+            $in = Join-Path $wheelhouse 'requirements.in'
+            Set-Content -Path $in -Value @('six', 'attrs[tests]>=20,<30,!=25.0')
+            Mock -ModuleName WheelhouseManager -CommandName Get-PyPIProjectRelease -MockWith {
+                foreach ($item in @(@('23.2.0', 200), @('24.1.0', 100), @('24.2.0', 50), @('25.0', 20), @('26.0rc1', 5))) {
+                    [PSCustomObject]@{ Version = $item[0]; FirstUploadUtc = (Get-Date).ToUniversalTime().AddDays(-$item[1]); Yanked = $false }
+                }
+            }
+            $plan = Get-WheelhouseRemediationPlan -WheelhousePath $wheelhouse -Name 'attrs' -Version '23.1.0' -RequirementsInPath $in -MinimumAgeDays 10
+            $plan.FixVersion | Should -Be '24.1.0'
+            $plan.Unfixable -join ',' | Should -Be 'GHSA-c'
+            $plan.NeedsExpedite | Should -Be $false
+            $plan.NewLine | Should -Be 'attrs[tests]>=24.1.0,<30,!=25.0'
+            $plan.Eligible -join ',' | Should -Be '24.1.0,24.2.0,25.0'
+
+            # Nothing fixed is old enough: pin the lowest fixed release, to be expedited.
+            $tooNew = Get-WheelhouseRemediationPlan -WheelhousePath $wheelhouse -Name 'attrs' -Version '23.1.0' -RequirementsInPath $in -MinimumAgeDays 365
+            $tooNew.NeedsExpedite | Should -Be $true
+            $tooNew.NewLine | Should -Be 'attrs[tests]==24.1.0,<30,!=25.0'
+
+            Set-RequirementInSpec -Path $in -Name 'attrs' -Line $plan.NewLine
+            Set-RequirementInSpec -Path $in -Name 'urllib3' -Line 'urllib3>=2.5' -Comment 'added by remediation'
+            (Get-Content -Path $in) -join '|' | Should -Be 'six|attrs[tests]>=24.1.0,<30,!=25.0|# added by remediation|urllib3>=2.5'
+            { Get-WheelhouseRemediationPlan -WheelhousePath $wheelhouse -Name 'six' -Version '1.16.0' -RequirementsInPath $in } | Should -Throw '*no open vulnerability*'
+        }
+
+        It 'swaps a pin in place when finishing a journal, from an object read back' {
+            $wheelhouse = Get-TestWheelhouse
+            $group = Join-Path $wheelhouse 'requirements-1.txt'
+            $data = '{"group_file":"' + ($group -replace '\\', '\\') + '","entries":[],"additions":[{"name":"attrs","version":"24.0","replaces":"23.1.0"},{"name":"newpkg","version":"1.0"}]}' | ConvertFrom-Json
+            # No wheels arrived: nothing is listed.
+            Complete-WheelhousePublishJournal -WheelhousePath $wheelhouse -Data $data
+            (Get-Content -Path $group) -join ',' | Should -Be 'six==1.16.0,attrs==23.1.0'
+            Set-RequirementInGroupFile -GroupFile $group -Name 'Attrs' -Version '24.0'
+            (Get-Content -Path $group) -join ',' | Should -Be 'six==1.16.0,attrs==24.0'
+        }
+    }
+
     Context 'Journal' {
         It 'finishes an interrupted publish: manifest and pin only for wheels that arrived intact' {
             $wheelhouse = Get-TestWheelhouse
@@ -1911,6 +2025,89 @@ Describe 'WheelhouseManager' {
             foreach ($name in '.wheelhouse.lock', '.wheelhouse-sync.lock') { Test-Path -Path (Join-Path $wheelhouse $name) | Should -Be $false }
             @(Get-ChildItem -Path (Join-Path $work 'staging') -Force).Count | Should -Be 0
             @(Get-ChildItem -Path (Get-WheelhouseJournalFolder -WheelhousePath $wheelhouse) -Filter '*.json').Count | Should -Be 0
+        }
+
+        It 'merges only an approved proposal, and records it in the history' {
+            $wheelhouse = Get-TestWheelhouse
+            $work = Get-TestFolder
+            $local = Join-Path $work 'requirements.txt'
+            Set-Content -Path $local -Value @('newpkg==1.0', 'six==1.16.0')
+            $proposalFile = Join-Path $work 'proposal.json'
+            $syncParams = @{
+                WheelhousePath = $wheelhouse; ReportsFolder = $work; LocalRequirementsPath = $local; PythonVersion = '3.14'; Platform = 'win_amd64'
+                MinimumAgeDays = 10; Services = @('osv'); DenylistPath = (Join-Path $work 'denylist.json'); StagingRoot = (Join-Path $work 'staging')
+                ApprovalMode = 'SeparateApprover'; ProposalPath = $proposalFile
+            }
+            $proposal = New-WheelhouseProposal -RequirementsPath $local -Path $proposalFile
+            $refused = $null
+            try { [void](Invoke-WheelhouseSync @syncParams) } catch { $refused = $_ }
+            $refused.Exception.Data['WheelhouseAwaitingApproval'] | Should -Be $true
+            Get-WheelhouseExitCode -ErrorRecord $refused | Should -Be 1
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'six==1.16.0,attrs==23.1.0'
+            Test-Path -Path (Join-Path $wheelhouse '.wheelhouse-sync.lock') | Should -Be $false
+
+            [void](Approve-WheelhouseProposal -Id $proposal.id -By 'CONTOSO\approver' -Mode SeparateApprover -Path $proposalFile)
+            $result = Invoke-WheelhouseSync @syncParams
+            $result.Outcome | Should -Be 'Ok'
+            $result.Proposal.id | Should -Be $proposal.id
+            (Read-WheelhouseProposal -Path $proposalFile).state | Should -Be 'Published'
+            @(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'newpkg')[0].detail | Should -Match 'approved by CONTOSO\\approver'
+        }
+
+        It 'swaps a remediated version into the groups that listed it, then quarantines the old one' {
+            $wheelhouse = Get-TestWheelhouse
+            $work = Get-TestFolder
+            $local = Join-Path $work 'requirements.txt'
+            Set-Content -Path $local -Value @('six==1.16.0', 'attrs==24.0')
+            $proposalFile = Join-Path $work 'proposal.json'
+            $deny = Join-Path $work 'denylist.json'
+            $remediation = @{
+                RequirementsPath = $local; Kind = 'remediation'; Path = $proposalFile
+                Replace = @([PSCustomObject]@{ name = 'attrs'; from = '23.1.0'; to = '24.0' })
+                Retire = @([PSCustomObject]@{ name = 'attrs'; version = '23.1.0'; ids = @('GHSA-1') })
+            }
+            [void](New-WheelhouseProposal @remediation)
+            $syncParams = @{
+                WheelhousePath = $wheelhouse; ReportsFolder = $work; LocalRequirementsPath = $local; PythonVersion = '3.14'; Platform = 'win_amd64'
+                MinimumAgeDays = 10; Services = @('osv'); DenylistPath = $deny; StagingRoot = (Join-Path $work 'staging'); ProposalPath = $proposalFile
+            }
+            $result = Invoke-WheelhouseSync @syncParams
+
+            $result.Outcome | Should -Be 'Ok'
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'six==1.16.0,attrs==24.0'
+            Test-Path -Path (Join-Path $wheelhouse 'requirements-2.txt') | Should -Be $false
+            $result.Retired -join ',' | Should -Be 'attrs==23.1.0'
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Records['attrs==23.1.0'].state | Should -Be 'Quarantined'
+            $catalog.Records['attrs==24.0'].groups -join ',' | Should -Be 'requirements-1.txt'
+            Get-DenylistMatch -Name 'attrs' -Version '23.1.0' -Denylist @(Read-WheelhouseDenylist -Path $deny) | Should -Not -BeNullOrEmpty
+            @(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'attrs' -Version '24.0')[0].detail | Should -Match 'replaced attrs==23.1.0'
+            (Read-WheelhouseProposal -Path $proposalFile).outcome | Should -Match 'quarantined attrs==23.1.0'
+        }
+
+        It 'keeps the vulnerable version when its replacement is rejected' {
+            $wheelhouse = Get-TestWheelhouse
+            $work = Get-TestFolder
+            $local = Join-Path $work 'requirements.txt'
+            Set-Content -Path $local -Value @('six==1.16.0', 'attrs==24.0')
+            $proposalFile = Join-Path $work 'proposal.json'
+            $deny = Join-Path $work 'denylist.json'
+            [void](Add-WheelhouseDenylistEntry -Name 'attrs' -Version '24.0' -Reason 'test' -Source 'manual' -Path $deny)
+            $remediation = @{
+                RequirementsPath = $local; Kind = 'remediation'; Path = $proposalFile
+                Replace = @([PSCustomObject]@{ name = 'attrs'; from = '23.1.0'; to = '24.0' })
+                Retire = @([PSCustomObject]@{ name = 'attrs'; version = '23.1.0'; ids = @('GHSA-1') })
+            }
+            [void](New-WheelhouseProposal @remediation)
+            $syncParams = @{
+                WheelhousePath = $wheelhouse; ReportsFolder = $work; LocalRequirementsPath = $local; PythonVersion = '3.14'; Platform = 'win_amd64'
+                MinimumAgeDays = 10; Services = @('osv'); DenylistPath = $deny; StagingRoot = (Join-Path $work 'staging'); ProposalPath = $proposalFile
+            }
+            $result = Invoke-WheelhouseSync @syncParams
+            $result.Outcome | Should -Be 'Attention'
+            @($result.Retired).Count | Should -Be 0
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'six==1.16.0,attrs==23.1.0'
+            (Read-WheelhouseCatalog -WheelhousePath $wheelhouse).Records['attrs==23.1.0'].state | Should -Be 'Published'
         }
 
         It 'takes out a wheel the file server removed and carries on - or stops when AutoQuarantine is off' {
@@ -2396,6 +2593,45 @@ Describe 'WheelhouseManager' {
             (@($body.pending) | ForEach-Object { "$($_.name)==$($_.version)" }) -join ',' | Should -Be 'numpy==2.3.1,requests==2.32.3'
             @($body.pending | Where-Object { $_.name -eq 'requests' })[0].rejected | Should -Match 'GHSA-9hjg'
             @($body.pending | Where-Object { $_.name -eq 'numpy' })[0].rejected | Should -BeNullOrEmpty
+        }
+
+        It 'shows the proposal and what this user may do under SeparateApprover' {
+            $m = Get-TestManager
+            $resolved = Join-Path $m.Root 'requirements.txt'
+            Set-Content -Path $resolved -Value @('six==1.16.0', 'numpy==2.3.1')
+            Set-WheelhouseSetting -SettingsPath (Join-Path $m.Root 'config\settings.psd1') -Updates @{ LocalRequirementsPath = $resolved; ApprovalMode = 'SeparateApprover' }
+            Remove-Item -Path $global:WhmProposalPath -ErrorAction SilentlyContinue
+
+            $approval = (Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root).Body.approval
+            $approval.mode | Should -Be 'SeparateApprover'
+            $approval.can_publish | Should -Be $false
+            $approval.blocked_by | Should -Match 'Propose it'
+
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/proposal/new' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')).Status | Should -Be 200
+            $approval = (Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root).Body.approval
+            $approval.current | Should -Be $true
+            $approval.proposal.state | Should -Be 'Proposed'
+            $approval.can_approve | Should -Be $false
+            $approval.can_publish | Should -Be $false
+            $id = $approval.proposal.id
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/proposal/approve' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson "{`"id`":`"$id`"}")).Status | Should -Be 409
+
+            [void](Approve-WheelhouseProposal -Id $id -By 'CONTOSO\other' -Mode SeparateApprover -Path $global:WhmProposalPath)
+            $approval = (Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root).Body.approval
+            $approval.can_publish | Should -Be $true
+            $approval.proposal.approved_by | Should -Be 'CONTOSO\other'
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/proposal/reject' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson "{`"id`":`"$id`",`"reason`":`"`"}")).Status | Should -Be 400
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/proposal/reject' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson "{`"id`":`"$id`",`"reason`":`"no`"}")).Status | Should -Be 200
+            (Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root).Body.approval.blocked_by | Should -Match 'Rejected'
+        }
+
+        It 'starts a fix job only for a published version, with a plain expedite reason' {
+            $m = Get-TestManager
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/remediate' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"nope","version":"1.0"}')).Status | Should -Be 404
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/remediate' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","expedite_reason":"bad\" quote"}')).Status | Should -Be 400
+            $started = Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/remediate' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"Attrs","version":"23.1.0","expedite_reason":"CVE-2026-1 is exploited"}')
+            $started.Status | Should -Be 202
+            $global:WhmUiJobSteps -join ';' | Should -Be 'Invoke-WheelhouseRemediation.ps1 -Package attrs==23.1.0 -ExpediteReason CVE-2026-1 is exploited'
         }
 
         It 'shows, registers and removes the weekly check task' {

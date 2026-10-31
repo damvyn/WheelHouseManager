@@ -306,7 +306,8 @@ function Get-WheelhouseExitCode {
     #   1 - finished, but needs attention (vulnerabilities, rejected packages, threats)
     #   2 - error: the run aborted, or a check could not be completed
     #   3 - busy: another wheelhouse operation holds the lock
-    # With -ErrorRecord, returns 3 for a busy lock and 2 for anything else.
+    # With -ErrorRecord, returns 3 for a busy lock, 1 for a change still waiting for
+    # approval (nothing was done; someone has to approve it) and 2 for anything else.
     [CmdletBinding()]
     [OutputType([int])]
     param(
@@ -318,6 +319,7 @@ function Get-WheelhouseExitCode {
 
     if ($ErrorRecord) {
         if ($ErrorRecord.Exception.Data['WheelhouseLockBusy']) { return 3 }
+        if ($ErrorRecord.Exception.Data['WheelhouseAwaitingApproval']) { return 1 }
         return 2
     }
     switch ($Outcome) {

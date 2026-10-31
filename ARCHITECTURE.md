@@ -234,6 +234,14 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
     (`MAL-*`, `Resolve-MaliciousPackage`; a waived one is left alone) and wheels in the folder that
     the manifest does not know (`Move-UntrackedWheelFile`, moved to `_untracked\`; never on
     first-time setup, which adopts them).
+27. **Nothing new is merged without an approved proposal for exactly that requirements.txt.**
+    `Invoke-WheelhouseSync` runs `Resolve-WheelhouseProposalForPublish` once the merge plan adds
+    something; refused -> exception with `Data['WheelhouseAwaitingApproval']` (exit 1, nothing
+    written). `ApprovalMode` decides who may approve; approver and requester are recorded in the
+    proposal history and in every `Published` event.
+28. **A fix replaces in place.** A remediation proposal's changed pins go into the group files that
+    list the vulnerable version (swap, never a second group), and the vulnerable version is
+    quarantined only when no group lists it any more and its replacement is published.
 
 ---
 
@@ -284,7 +292,7 @@ flowchart TD
 
 **Loading.** `WheelhouseManager.psm1` sets `$script:ManagerRoot` and dot-sources `Common`,
 `Settings`, `Requirements`, `Manifest`, `Catalog`, `Journal`, `Audit`, `Vulnerability`, `Intake`, `Sync`, `Alert`,
-`Run`, `Denylist`, `Package`, `Scan`, `Schedule`, `Ui` (order is for readability; calls resolve at run time).
+`Run`, `Denylist`, `Package`, `Proposal`, `Remediation`, `Scan`, `Schedule`, `Ui` (order is for readability; calls resolve at run time).
 `Ui.ps1` builds `$script:UiRoutes` at load time. The psd1's
 `FunctionsToExport` is the public surface; CI fails if a listed function is missing.
 
@@ -603,6 +611,35 @@ request), `Get-WheelhouseUiToolStatus` (`Get-WheelhouseToolStatus` cached for 30
 |---|---|---|
 | `Invoke-WheelhouseSync` | the update run (section 9.2); returns `{Outcome Ok/Attention/Error; AuditResults; Notices; Rejected; Published}`; throws when it cannot start | Update-Wheelhouse.ps1 |
 
+### 8.18 `Proposal.ps1`
+
+Proposals (decision D3): `Input\proposal.json` holds the current proposal, `Input\proposal-history.jsonl`
+every change of it. The update run merges new pins only for an approved proposal whose
+`requirements_sha256` matches the file.
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Get-WheelhouseProposalPath` / `Get-WheelhouseCurrentUser` / `Get-RequirementFileHash` | `<root>\Input\proposal.json` / `DOMAIN\user` / SHA256 of a requirements file | everything below |
+| `Read-WheelhouseProposal` / `Save-WheelhouseProposal` | read (damaged -> throws) / write + append to the history | proposal functions, UI |
+| `New-WheelhouseProposal` | propose a requirements file (`resolve`/`remediation`/`manual`), with `-Replace`, `-Retire`, `-Expedite` (+ reason) for a fix | Update-Requirement, remediation, UI |
+| `Test-WheelhouseApprovalAllowed` | `$null` or the reason the user may not approve (`SeparateApprover`: not the requester) | approve, gate, UI |
+| `Approve-WheelhouseProposal` / `Deny-WheelhouseProposal` | approve (only `Proposed`, file unchanged, mode rule) / reject with a reason | UI, gate |
+| `Resolve-WheelhouseProposalForPublish` | the update run's gate: `{Allowed; Proposal; Reason}`; with `SamePersonAllowed` publishing approves a pending proposal and proposes+approves an unproposed file | `Invoke-WheelhouseSync` |
+| `Set-WheelhouseProposalPublished` | state `Published` with a one-line outcome | `Invoke-WheelhouseSync` |
+
+### 8.19 `Remediation.ps1`
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Get-RequirementInLine` | a package's `requirements.in` line split into name, extras, clauses | plan, `Set-RequirementInSpec` |
+| `Get-WheelhouseRemediationPlan` | from the catalog's open findings and `Get-PyPIProjectRelease`: lowest version fixing every fixable advisory, eligible releases (not yanked, past the cooldown), `NeedsExpedite`, the new line (`name>=fix`, upper bounds and `!=` kept; `name==fix` when it must be expedited) | remediation script, UI |
+| `Set-RequirementInSpec` | replace the package's line in `requirements.in`, or append it with a comment | remediation script |
+
+Also new: `Compare-PackageVersion` / `ConvertTo-PackageVersionKey` and `Set-RequirementInGroupFile`
+(Requirements.ps1), `Get-PyPIProjectRelease` (Audit.ps1), `Get-WheelhouseUiApproval` (Ui.ps1).
+`Publish-CandidateIntake -Replaces` and the publish journal's `additions[].replaces` swap a group's
+pin instead of appending (`Complete-WheelhousePublishJournal` -> `Set-RequirementInGroupFile`).
+
 ### 8.17 `Schedule.ps1`
 
 The weekly check as a Scheduled Task (`$script:ScheduledCheckTaskName` = `Wheelhouse Weekly Check`,
@@ -692,6 +729,11 @@ C per group (existing first, then new by number):
    [no lock]    rejections -> list (+ IntakeBlocked notice for integrity/defender; audit-error => incomplete)
                 if the group existed and lists pins: Invoke-GroupAudit -Stage Deployed
                 warn about unused -ExpeditePackage; write Report_Rejected_*
+                (B, if anything is added) Resolve-WheelhouseProposalForPublish -> refused: throw
+                    (AwaitingApproval); a remediation proposal: its changed pins target the
+                    groups listing the vulnerable version, with Replaces (swap)
+R [write lock]  remediation: Remove-WheelhousePackage -Quarantine for each retire pin no group
+                lists any more whose replacement is published
 D [write lock]  if isBootstrap and something published: Merge-WheelhouseManifest -PreRunFiles @()
 E [no lock]     Get-AuditResultSeverity(all audits)                      (OSV, cached)
   [write lock]  catalog: Sync + Update-CatalogAuditResult(all audits, Severity, DueDays, Waiver)
@@ -828,6 +870,9 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 | `GET /api/schedule` | - | `Get-WheelhouseScheduledCheck` + `last_check_utc` (catalog), `current_user`, `mapped_drive {drive; unc}` | 200 |
 | `POST /api/schedule` | `{days[], time 'HH:mm', user, password}` | `Register-WheelhouseScheduledCheck` (password -> SecureString at once) | 200 / 400 / 409 |
 | `POST /api/schedule/run`, `POST /api/schedule/remove` | - / `{confirm:true}` | `Start-` / `Unregister-WheelhouseScheduledCheck` | 200 / 400 / 404 / 409 |
+| `POST /api/proposal/approve`, `/reject`, `/new` | `{id, note}` / `{id, reason}` / - | approve (mode rule) / reject / propose the file as it is (Idle) | 200 / 400 / 404 / 409 |
+| `GET /api/packages/<name>/<version>/remediation` | - | `Get-WheelhouseRemediationPlan` (asks PyPI) | 200 / 404 / 409 |
+| `POST /api/packages/remediate` | `{name, version, expedite_reason?}` | job `Invoke-WheelhouseRemediation.ps1 -Package ... [-ExpediteReason ...]` (reason: plain sentence only) | 202 / 400 / 404 |
 | `GET /api/waivers` | - | every waiver with `expired`, and `max_days` | 200 |
 | `POST /api/waivers/add`, `POST /api/waivers/remove` | `{name, version, id, reason, days}` / `{name, version, id}` | `Add-/Remove-WheelhouseWaiver` + `Set-CatalogFindingWaiver` inside `Update-WheelhouseCatalog -TimeoutSeconds 0` (history at once) | 200 / 400 / 404 / 409 |
 | `POST /api/packages/audit` | `{all}` or `{packages:[{name,version}]}` (<= 500) | job `Test-WheelhousePackage.ps1 [-Package ...]` | 202 |
@@ -859,7 +904,9 @@ external resources - keep everything in these three files. Node is not required;
 Deno or a browser console) or an ES5 parser (e.g. Python `esprima` in a throw-away folder) -
 Windows' JScript cannot, because the code uses ES5 reserved-word properties (`.catch`, `class:`).
 The package table shows the worst open severity and the fix-by date (or `overdue`) and filters
-`overdue` and `waived`. `showPackageNotices` turns `check_overdue` and a missing Defender/elevation
+`overdue` and `waived`. `renderApproval` draws the proposal (requester, approver, fix changes) and
+only the buttons `approval.can_*` allow; `planFix` shows the remediation plan before starting the
+`remediate` job, whose success leads to the review card (`loadRequirements('fix')`). `showPackageNotices` turns `check_overdue` and a missing Defender/elevation
 into sticky toasts (`toast(..., sticky = true)`, once per page load via `state.shown`); the first
 leads to the Schedule tab. `fmtDay` formats dates only. The review card lists `pending` pins only
 (`GET /api/requirements`) with the latest rejection reason.
@@ -937,6 +984,13 @@ New|Overdue|Waived|Resolved|'', `notified_utc`), `checks`:
 `audit {status Passed|Vulnerable|Unknown; last_run; last_ok; vulnerabilities[]; services {<service>:
 {status; last_run; vulnerabilities[]; last_error; error}}}`, `scan {status Clean|Threat; last_run;
 threat_files[]}`, `pypi {status Ok|Yanked; last_run; reason}`. Timestamps are ISO 8601 UTC strings.
+
+**Proposal** (`Input\proposal.json`): `id`, `kind` (`resolve`/`remediation`/`manual`), `state`
+(`Proposed`/`Approved`/`Rejected`/`Published`), `requested_by`, `requested_utc`,
+`requirements_path`, `requirements_sha256`, `pins[]`, `replace[{name; from; to}]`,
+`retire[{name; version; ids[]}]`, `expedite {name: version}`, `expedite_reason`, `note`,
+`approved_by`, `approved_utc`, `rejected_by`, `rejected_utc`, `decision_note`, `published_utc`,
+`outcome`. History: one `{ts; user; action; proposal}` per line.
 
 **History line** (`events.jsonl`): `{ ts; user; action; package; version; detail }`.
 
@@ -1109,6 +1163,8 @@ Which code runs for each user scenario (user steps are in the README):
 | Urgent fix | worker `-ExpeditePackage` -> intake `-Expedite` -> `Test-PackageAge -Expedite` + file cooldown skip |
 | Weekly check | `Test-Wheelhouse.ps1` -> 9.3 -> `Get-DeployedPackageNotice`, `Invoke-GroupAudit`, `Get-AuditResultSeverity`, `Get-CatalogFindingAlert` -> alert -> `Set-CatalogFindingNotified` |
 | Schedule the weekly check | Schedule tab -> `POST /api/schedule` -> `Register-WheelhouseScheduledCheck` -> `Register-ScheduledTask` |
+| Approve and publish | Add tab -> `POST /api/proposal/approve` or `/api/wheelhouse/update` -> `Invoke-WheelhouseSync` -> `Resolve-WheelhouseProposalForPublish` |
+| Fix a vulnerable version | History -> Fix -> `GET .../remediation`, `POST /api/packages/remediate` -> `Invoke-WheelhouseRemediation.ps1` (plan, `Set-RequirementInSpec`, `Update-Requirement.ps1 -PreferCurrent -NoProposal`, `New-WheelhouseProposal -Kind remediation`) -> approve/publish -> sync swaps pins (R step retires) |
 | Accept a risk | History dialog -> `POST /api/waivers/add` -> `Add-WheelhouseWaiver` + `Set-CatalogFindingWaiver`; waivers listed on the Denylist tab (`GET /api/waivers`) |
 | Malicious package advisory | check or update: `Get-CatalogMaliciousRecord` -> `Resolve-MaliciousPackage` -> `Remove-WheelhousePackage -Quarantine -LockHeld` |
 | Wheel copied in by hand | check or update: `Move-UntrackedWheelFile` -> `_untracked\<ts>\` |

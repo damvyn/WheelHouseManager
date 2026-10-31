@@ -165,3 +165,6 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .toast.actionable:hover, .toast.actionable:focus { outline: 2px solid var(--accent); }
 .toast-action { margin-top: 6px; font-weight: 600; color: var(--accent); }
 .kv { display: grid; gap: 4px; margin: 8px 0 12px; }
+/* Add tab: the proposal behind requirements.txt and its approval buttons. */
+.approval { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }

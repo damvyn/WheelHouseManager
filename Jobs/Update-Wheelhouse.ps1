@@ -21,6 +21,14 @@
         the first group that doesn't already use that name; a name already pinned to a
         DIFFERENT version everywhere goes to a new group file. Nothing is written yet.
 
+      - Anything new is merged only for an APPROVED proposal of exactly that
+        requirements.txt (Update-Requirement.ps1 or Invoke-WheelhouseRemediation.ps1 record
+        one). With ApprovalMode SamePersonAllowed (default) running this script approves a
+        pending proposal - recorded under your name. With SeparateApprover, another person
+        must approve it first (UI: Add packages tab); otherwise the run stops with exit
+        code 1 and changes nothing. A remediation proposal swaps the fixed version into the
+        group files that list the vulnerable one, then quarantines the vulnerable version.
+
       - For EACH group, the candidates - the planned new pins plus any pins the group
         already lists without a wheel in the wheelhouse - go through the denylist, the
         vulnerability audit, PyPI's yanked flag, the package-age (cooldown) check and
@@ -56,7 +64,8 @@
     downloads) to the output stream, so a caller (Invoke-WheelhousePipeline.ps1) can alert on exactly
     this run's findings.
 
-    Exit codes: 0 OK; 1 rejected packages, vulnerabilities or threats (needs attention);
+    Exit codes: 0 OK; 1 rejected packages, vulnerabilities, threats, or a change still
+    waiting for approval (needs attention);
     2 aborted or an audit could not be completed; 3 another operation holds the lock.
 
     Function definitions live in the WheelhouseManager module next to this script.
@@ -159,7 +168,7 @@ param(
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays
+    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays, ApprovalMode
 
 $title = 'Wheelhouse maintenance script'
 $outcome = $null
@@ -195,6 +204,7 @@ try {
         RequireDefenderScan   = [bool]$cfg.RequireDefenderScanAtIntake
         # -AutoQuarantine On|Off wins over the setting (a bool).
         AutoQuarantine        = ConvertTo-WheelhouseBoolean $cfg.AutoQuarantine
+        ApprovalMode          = [string]$cfg.ApprovalMode
         DueDays               = Get-WheelhouseDueDayTable -Settings $cfg
         AuditFreshnessDays    = [int]$cfg.AuditFreshnessDays
     }
@@ -212,7 +222,7 @@ try {
 catch {
     Write-Log $_.Exception.Message 'ERROR'
     $exitCode = Get-WheelhouseExitCode -ErrorRecord $_
-    $outcome = $(if ($exitCode -eq 3) { 'BUSY' } else { 'ABORTED' })
+    $outcome = $(if ($exitCode -eq 3) { 'BUSY' } elseif ($_.Exception.Data['WheelhouseAwaitingApproval']) { 'WAITING FOR APPROVAL - nothing was published' } else { 'ABORTED' })
 }
 finally {
     Stop-WheelhouseRun -Title $title -Outcome $outcome

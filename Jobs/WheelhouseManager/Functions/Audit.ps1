@@ -568,3 +568,29 @@ function Get-WheelhouseToolStatus {
         message   = $(if ($uv) { '' } else { 'uv was not found on the PATH of the account running the UI. Adding packages (resolving requirements.in with Update-Requirement.ps1) does not work. Install uv on this server and restart the UI.' })
     }
 }
+
+function Get-PyPIProjectRelease {
+    # Every release of a project on PyPI (https://pypi.org/pypi/<name>/json): { Version;
+    # FirstUploadUtc; Yanked } - Yanked when every file of the release is yanked. Releases
+    # without files are left out. Throws if PyPI cannot be read.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+    $response = Invoke-RestMethod -Uri "https://pypi.org/pypi/$([uri]::EscapeDataString($Name))/json" -TimeoutSec 60 -ErrorAction Stop
+    foreach ($property in $response.releases.PSObject.Properties) {
+        $files = @(@($property.Value) | Where-Object { $_ })
+        if ($files.Count -eq 0) { continue }
+        $times = @($files | ForEach-Object { ConvertTo-OptionalUtcDateTime -Value $_.upload_time_iso_8601 } | Where-Object { $_ } | Sort-Object)
+        [PSCustomObject]@{
+            Version        = [string]$property.Name
+            FirstUploadUtc = $(if ($times.Count -gt 0) { $times[0] } else { $null })
+            Yanked         = (@($files | Where-Object { -not $_.yanked }).Count -eq 0)
+        }
+    }
+}

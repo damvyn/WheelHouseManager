@@ -210,6 +210,9 @@
 
   // Where to look after a job that ended with findings or failed, as a toast action.
   function jobNextStep(job) {
+    if (job.kind === 'remediate' && job.status === 'Succeeded') {
+      return { label: 'Review and publish the fix', run: function () { state.reviewFix = true; showTab('add'); } };
+    }
     if (job.status === 'Succeeded' || job.status === 'Cancelled' || job.status === 'Running') { return null; }
     var showLog = { label: 'Open the log', run: function () { watchJob(job.id); } };
     if (job.status === 'Failed') { return showLog; }
@@ -220,6 +223,7 @@
       return { label: 'Show what needs attention', run: function () { showUpdateResult(job); } };
     }
     if (job.kind === 'add') { return { label: 'Open the log to see why', run: function () { watchJob(job.id); } }; }
+    if (job.kind === 'remediate') { return { label: 'Open the log to see why', run: function () { watchJob(job.id); } }; }
     if (job.kind === 'audit') { return { label: 'Show the vulnerable packages', run: function () { showPackagesFiltered('vulnerable', job); } }; }
     if (job.kind === 'scan') { return { label: 'Show the threats', run: function () { showPackagesFiltered('threat', job); } }; }
     return showLog;
@@ -441,6 +445,11 @@
               action = h('button', { class: 'btn small', type: 'button' }, 'Accept risk');
               action.addEventListener('click', function () { acceptRisk(data.name, data.version, f); });
             }
+            if ([].concat(f.fix_versions || []).length) {
+              var fix = h('button', { class: 'btn small primary', type: 'button' }, 'Fix');
+              fix.addEventListener('click', function () { planFix(data.name, data.version); });
+              action = h('div', { class: 'row-actions' }, fix, action);
+            }
             var status = f.status === 'Overdue' ? badge('overdue', 'bad') : f.status === 'Waived'
               ? badge('waived', 'warn', f.waiver.reason + ' (' + f.waiver.by + ')') : badge('open');
             return h('tr', {},
@@ -468,6 +477,28 @@
   }
   function closeOpenDialogs() {
     Array.prototype.forEach.call(document.querySelectorAll('dialog[open]'), function (d) { d.close(); });
+  }
+
+  // Remediation: show the plan (fix version, the requirements.in change), ask for an
+  // expedite reason when the fix is newer than the cooldown, then start the job that
+  // resolves and proposes it. Nothing is published before the proposal is approved.
+  function planFix(name, version) {
+    closeOpenDialogs();
+    toast('Working out the fix for ' + name + '==' + version + ' (asks PyPI)...');
+    api('GET', '/api/packages/' + name + '/' + version + '/remediation').then(function (plan) {
+      var reason = h('input', { type: 'text', class: 'wide', placeholder: 'Why can the fix not wait for the cooldown? (required)' });
+      var body = h('div', {},
+        h('p', {}, plan.summary),
+        h('p', {}, 'requirements.in: ', h('span', { class: 'mono' }, plan.old_line || '(not listed - added as a direct requirement)'), ' -> ', h('span', { class: 'mono' }, plan.new_line)),
+        h('p', { class: 'muted' }, 'This resolves requirements.txt again and records a fix proposal. After it is approved and published, the fixed version replaces ' + name + '==' + version + ' in its group files and ' + name + '==' + version + ' is quarantined.'),
+        plan.needs_expedite ? h('div', {}, h('p', {}, badge('cooldown', 'warn'), ' The fix (' + plan.expedite_version + ') is newer than the cooldown. Only this package skips it, with your reason:'), reason) : null);
+      confirmDialog('Fix ' + name + '==' + version + '?', body, 'Prepare the fix', false).then(function (ok) {
+        if (!ok) { return; }
+        var request = { name: name, version: version };
+        if (plan.needs_expedite) { request.expedite_reason = reason.value; }
+        startJobRequest(api('POST', '/api/packages/remediate', request));
+      });
+    }).catch(fail);
   }
 
   // A waiver accepts one advisory for one version until a date; it is never permanent.
@@ -536,6 +567,8 @@
   function renderAdd() {
     var root = $('tab-add');
     clear(root);
+    var reviewFix = state.reviewFix;
+    state.reviewFix = false;
     var specs = h('textarea', { placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
     var publishNow = h('input', { type: 'checkbox' });
     var output = h('div', {});
@@ -564,7 +597,7 @@
       output,
       h('div', { class: 'card', id: 'requirements-card' }),
       h('div', { class: 'card', id: 'rejected-card' }));
-    loadRequirements();
+    loadRequirements(reviewFix ? 'fix' : false);
     loadRejected();
   }
 
@@ -575,7 +608,9 @@
       clear(card);
       if (showNextStep) {
         card.classList.add('next-step');
-        card.append(h('p', { class: 'next-hint' }, 'Resolved. Next: review the pins below, then publish them to the wheelhouse.'));
+        card.append(h('p', { class: 'next-hint' }, showNextStep === 'fix'
+          ? 'Fix proposed. Next: review what changes below, approve it, then publish it to the wheelhouse.'
+          : 'Resolved. Next: review the pins below, then publish them to the wheelhouse.'));
         setTimeout(function () { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 50);
       } else {
         card.classList.remove('next-step');
@@ -607,15 +642,79 @@
       if (rejectedCount > 0) {
         card.append(h('p', { class: 'muted' }, rejectedCount + ' pin(s) were rejected by the latest update for the reason shown. Publishing again rejects them again unless the reason is gone (for example the cooldown has passed); otherwise change them in requirements.in (step 1).'));
       }
-      var publish = h('button', { class: 'btn primary', type: 'button' }, 'Publish ' + pending.length + ' pin(s) to the wheelhouse');
-      publish.addEventListener('click', function () {
-        confirmDialog('Publish requirements.txt?', h('p', {}, 'Every pin that is not yet in the wheelhouse goes through all checks; a package that fails one is rejected with the reason and nothing about it is published.'), 'Publish', false).then(function (ok) {
+      card.append(renderApproval(data.approval, pending.length), whole);
+    }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
+  }
+
+  // The proposal behind requirements.txt: who asked, who approved, and the buttons the
+  // approval mode allows this user (decision D3).
+  function renderApproval(a, pendingCount) {
+    var box = h('div', { class: 'approval' });
+    var p = a.proposal;
+    var modeText = a.mode === 'SeparateApprover' ? 'Another person than the requester must approve it.' : 'The requester may approve it; publishing approves it. Who did what is recorded.';
+    if (p && a.current) {
+      var stateKind = p.state === 'Approved' || p.state === 'Published' ? 'ok' : p.state === 'Rejected' ? 'bad' : 'warn';
+      box.append(h('p', {}, h('strong', {}, (p.kind === 'remediation' ? 'Fix proposal ' : 'Proposal ') + p.id), ' ', badge(p.state, stateKind),
+        ' requested by ' + p.requested_by + ' on ' + fmtDate(p.requested_utc),
+        p.approved_by ? ', approved by ' + p.approved_by + (p.approved_utc ? ' on ' + fmtDate(p.approved_utc) : '') : '',
+        p.rejected_by ? ', rejected by ' + p.rejected_by + ': ' + p.decision_note : ''));
+      if (p.note) { box.append(h('p', { class: 'muted' }, p.note)); }
+      var retire = [].concat(p.retire || []);
+      if (p.kind === 'remediation' && retire.length) {
+        box.append(h('ul', { class: 'result-list' },
+          [].concat(p.replace || []).map(function (r) { return h('li', { class: 'mono' }, r.name + ': ' + (r.from || '(new)') + ' -> ' + r.to); }),
+          retire.map(function (r) { return h('li', {}, 'then quarantine ', h('span', { class: 'mono' }, r.name + '==' + r.version), ' (' + [].concat(r.ids).join(', ') + ')'); })),
+          h('p', { class: 'muted' }, 'The fixed versions replace the old ones in the group files that list the vulnerable version - the files clients install from.'));
+      }
+      if (p.expedite_reason) { box.append(h('p', {}, badge('cooldown skipped', 'warn'), ' ' + p.expedite_reason)); }
+    } else if (p) {
+      box.append(h('p', { class: 'muted' }, 'requirements.txt changed after proposal ' + p.id + ' was made - it is not covered by it.'));
+    } else {
+      box.append(h('p', { class: 'muted' }, 'No proposal yet for requirements.txt.'));
+    }
+    box.append(h('p', { class: 'muted' }, 'Approval: ' + modeText + ' You are ' + a.current_user + '.'));
+    if (a.blocked_by) { box.append(h('div', { class: 'banner' }, a.blocked_by)); }
+
+    var buttons = h('div', { class: 'toolbar after-output' });
+    if (a.can_approve && p && p.state === 'Proposed') {
+      var approve = h('button', { class: 'btn', type: 'button' }, 'Approve');
+      approve.addEventListener('click', function () {
+        api('POST', '/api/proposal/approve', { id: p.id }).then(function () { toast('Proposal ' + p.id + ' approved.'); loadRequirements(); }).catch(fail);
+      });
+      buttons.append(approve);
+    }
+    if (a.can_reject && p) {
+      var reject = h('button', { class: 'btn danger', type: 'button' }, 'Reject');
+      reject.addEventListener('click', function () {
+        var reason = h('input', { type: 'text', class: 'wide', placeholder: 'Why? (required, recorded)' });
+        confirmDialog('Reject proposal ' + p.id + '?', h('div', {}, h('p', {}, 'Nothing of it is published. To try again, change requirements.in and resolve again.'), reason), 'Reject', true).then(function (ok) {
           if (!ok) { return; }
-          startJobRequest(api('POST', '/api/wheelhouse/update', { confirm: true }));
+          api('POST', '/api/proposal/reject', { id: p.id, reason: reason.value }).then(function () { toast('Proposal rejected.'); loadRequirements(); }).catch(fail);
         });
       });
-      card.append(h('div', { class: 'toolbar after-output' }, publish), whole);
-    }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
+      buttons.append(reject);
+    }
+    if (!a.current && a.mode === 'SeparateApprover') {
+      var propose = h('button', { class: 'btn', type: 'button' }, 'Propose this requirements.txt');
+      propose.addEventListener('click', function () {
+        api('POST', '/api/proposal/new', {}).then(function () { toast('Proposed. Another person has to approve it before it can be published.'); loadRequirements(); }).catch(fail);
+      });
+      buttons.append(propose);
+    }
+    var approving = a.can_publish && !(p && a.current && (p.state === 'Approved' || p.state === 'Published'));
+    var publish = h('button', { class: 'btn primary', type: 'button', disabled: !a.can_publish },
+      (approving ? 'Approve and publish ' : 'Publish ') + pendingCount + ' pin(s) to the wheelhouse');
+    publish.addEventListener('click', function () {
+      confirmDialog('Publish requirements.txt?', h('div', {},
+        h('p', {}, 'Every pin that is not yet in the wheelhouse goes through all checks; a package that fails one is rejected with the reason and nothing about it is published.'),
+        approving ? h('p', {}, 'Publishing also approves the proposal, recorded as ' + a.current_user + '.') : null), 'Publish', false).then(function (ok) {
+        if (!ok) { return; }
+        startJobRequest(api('POST', '/api/wheelhouse/update', { confirm: true }));
+      });
+    });
+    buttons.append(publish);
+    box.append(buttons);
+    return box;
   }
 
   function loadRejected() {
@@ -968,8 +1067,12 @@
     else if (state.currentTab === 'add') {
       // After a successful "Add and resolve", the next step is reviewing the result.
       var next = job.kind === 'add' && job.status === 'Succeeded';
+      if (job.kind === 'remediate' && job.status === 'Succeeded') { next = 'fix'; }
       loadRequirements(next);
       loadRejected();
+    }
+    if (job.kind === 'remediate' && job.status === 'Succeeded' && state.currentTab !== 'add') {
+      state.reviewFix = true;
     }
     refreshState();
   }

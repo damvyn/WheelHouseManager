@@ -336,6 +336,10 @@ function Publish-CandidateIntake {
         # verified packages are pins the group already lists (their wheel was missing).
         [hashtable]$Additions = @{},
 
+        # name -> version the addition replaces in -GroupFile (remediation): the group's pin
+        # is swapped instead of a line being added.
+        [hashtable]$Replaces = @{},
+
         [string]$DenylistPath = (Get-WheelhouseDenylistPath),
 
         # name -> text added to the "Published" history entry (e.g. why the cooldown was skipped).
@@ -389,7 +393,12 @@ function Publish-CandidateIntake {
 
             if ($plans.Count -gt 0) {
                 # 2. Journal - a crash from here on is finished by the next writer.
-                $plannedAdditions = @(foreach ($name in $plans.Keys) { if ($Additions.ContainsKey($name)) { [ordered]@{ name = $name; version = $versions[$name] } } })
+                $plannedAdditions = @(foreach ($name in $plans.Keys) {
+                        if (-not $Additions.ContainsKey($name)) { continue }
+                        $planned = [ordered]@{ name = $name; version = $versions[$name] }
+                        if ($Replaces.ContainsKey($name)) { $planned['replaces'] = [string]$Replaces[$name] }
+                        $planned
+                    })
                 $journal = New-WheelhouseJournal -WheelhousePath $WheelhousePath -Operation 'publish' -Data ([ordered]@{
                         group_file = $GroupFile
                         entries    = @(foreach ($name in $plans.Keys) { $plans[$name] })
@@ -427,7 +436,7 @@ function Publish-CandidateIntake {
                 # 5. Catalog and history.
                 $changes = @(foreach ($name in @($accepted.Keys | Sort-Object)) {
                         $files = @($published | Where-Object { $_.name -eq $name } | ForEach-Object { $_.file })
-                        $where = if ($Additions.ContainsKey($name)) { "added to $groupName" } else { "wheel for the pin already listed in $groupName" }
+                        $where = if ($Replaces.ContainsKey($name)) { "replaced $name==$($Replaces[$name]) in $groupName" } elseif ($Additions.ContainsKey($name)) { "added to $groupName" } else { "wheel for the pin already listed in $groupName" }
                         $extra = if ($EventDetail.ContainsKey($name)) { "; $($EventDetail[$name])" } else { '' }
                         [PSCustomObject]@{
                             Name    = $name

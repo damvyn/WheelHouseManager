@@ -328,6 +328,7 @@ settings file** > **the built-in default**. A key missing from the file uses its
 | `WaiverMaxDays` | `90` | Longest allowed waiver. |
 | `AuditFreshnessDays` | `8` | A published version without a completed audit for this long is alerted as *Unverified*; the UI warns when the weekly check has not completed for this long. |
 | `OverdueReminderDays` | `7` | How often an overdue vulnerability is alerted again. |
+| `ApprovalMode` | `SamePersonAllowed` | Who may approve a resolved `requirements.txt` or a fix before it is published. `SamePersonAllowed`: anyone, also the requester (publishing approves; recorded). `SeparateApprover`: another account than the requester. |
 
 Example:
 
@@ -365,7 +366,19 @@ it in the [web UI](#6-the-web-ui).
    package has no wheel for your Python/platform, nothing is changed: the problem packages are
    listed, the attempt is saved as `Input\requirements.rejected.txt`, and you fix
    `requirements.in` (remove the package or constrain its version) and run it again.
-3. **Review** `Input\requirements.txt` and get it approved if your process requires that.
+3. **Review and approve.** Resolving records a **proposal** for exactly this `requirements.txt`
+   (who requested it, when; `Input\proposal.json`, history in `Input\proposal-history.jsonl`).
+   Only an approved proposal is published. Who may approve depends on `ApprovalMode`:
+   - `SamePersonAllowed` (default): anyone, including the requester - publishing approves it, and
+     the publisher is recorded as the approver.
+   - `SeparateApprover`: another account than the requester must approve it first (UI: **Add
+     packages** -> **Approve**). Until then `Update-Wheelhouse.ps1` stops with exit code 1 and
+     changes nothing.
+
+   A rejected proposal is never published; change `requirements.in` and resolve again. If you
+   edit `requirements.txt` by hand, it no longer matches its proposal: with `SamePersonAllowed`
+   publishing proposes and approves it as you; with `SeparateApprover` propose it again (UI:
+   **Propose this requirements.txt**) and have it approved.
 4. **Publish.**
    ```powershell
    .\Update-Wheelhouse.ps1
@@ -379,7 +392,8 @@ it in the [web UI](#6-the-web-ui).
    run found (vulnerable candidates, Defender detections, ...).
 
 In the UI: **Add packages** tab -> enter the packages -> **Add and resolve** -> check the
-**Review and publish** card -> **Publish**.
+**Review and publish** card -> **Approve** (or **Approve and publish**) -> **Publish**. The card
+shows the proposal, who requested and approved it, and only the buttons you are allowed to use.
 
 ### 5.2 Handle rejected packages
 
@@ -447,13 +461,15 @@ each finding also has a **severity**, a **fix-by** date and a **status**: `NEW`,
 Overdue ones come first; resolved findings are listed in a short section of their own. The weekly
 check alerts only when there is something new to say (a new, newly overdue, reminded, unwaived or
 resolved finding, a notice, or a failed check). A finding marked *Blocked before download* was a
-candidate that never reached the wheelhouse - just change `requirements.in`. For a published package:
+candidate that never reached the wheelhouse - just change `requirements.in`. For a published
+package, **fix it** (see 5.14): UI **Packages** -> **History** of the version -> **Fix** on the
+vulnerability, then approve and publish the fix proposal. The fixed version takes the old one's
+place in the group files clients install from, and the old one is quarantined.
 
-1. Quarantine (or delete) it - UI **Packages** tab. This removes the pin, the manifest entry and
-   the file, and denylists that version.
-2. Put the fixed version in `requirements.in` (e.g. `requests>=2.32.4`), run
-   `Update-Requirement.ps1`, review, run `Update-Wheelhouse.ps1`.
-3. If the fix is newer than the cooldown, see 5.6.
+To do it by hand instead: quarantine (or delete) the version on the **Packages** tab, put the
+fixed version in `requirements.in` (e.g. `requests>=2.32.4`), resolve, approve and publish. Note
+that the fixed version then goes to a *new* group file if the old one is still listed - the fix
+helper avoids that.
 
 If you decide not to fix it now - for example the vulnerable code path is not used - **accept the
 risk** for a limited time: UI **Packages** -> **History** of that version -> **Accept risk** on the
@@ -554,6 +570,33 @@ the process dies in between, the next operation that changes the wheelhouse fini
 (logged as *Finishing an interrupted ...* and recorded as *Recovered* in the history). You do not
 need to do anything, unless that repair itself fails - see [Troubleshooting](#10-troubleshooting).
 
+### 5.14 Fix a vulnerable package (remediation)
+
+```powershell
+.\Invoke-WheelhouseRemediation.ps1 -Package requests==2.19.0
+.\Invoke-WheelhouseRemediation.ps1 -Package requests==2.32.3 -ExpediteReason "CVE-2026-1234 is exploited"
+.\Update-Wheelhouse.ps1      # after approval (with SamePersonAllowed this approves it)
+```
+
+1. **Plan.** From the version's open vulnerabilities the helper takes the lowest version that
+   fixes them all, and checks PyPI for releases at or above it that are not yanked and old enough
+   for the cooldown. A vulnerability without any known fix stays open (consider a waiver).
+2. **Change `requirements.in`.** The package's line becomes `name>=fix` (upper bounds such as
+   `<3` are kept), or is added when the package is only a dependency. When no fixed release has
+   passed the cooldown yet, it pins the lowest fixed release instead, and you must give
+   `-ExpediteReason` - only that package skips the cooldown, and the reason is recorded.
+3. **Resolve.** `Update-Requirement.ps1` runs, keeping every other version where it still fits,
+   so only what has to change changes. If it fails, `requirements.in` is put back.
+4. **Propose.** A *fix proposal* lists each pin that changes and the version to quarantine.
+5. **Approve and publish.** The update checks the new versions like any other, writes them in
+   place of the old ones in the group files that list the vulnerable version (no new group
+   file), and then quarantines and denylists the vulnerable version. If the replacement is
+   rejected, the vulnerable version stays published and the run needs attention.
+
+In the UI: **Packages** -> **History** -> **Fix** shows the plan first (and asks for the reason
+when the fix is too new); when the job finishes, the message leads to the **Add packages** tab,
+where the fix proposal waits for approval.
+
 ---
 
 ## 6. The web UI
@@ -599,6 +642,7 @@ shows the details.
 | `Invoke-WheelhousePipeline.ps1` (root) | `Update-Wheelhouse.ps1` + one alert | as above, plus `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
 | `Jobs\Test-Wheelhouse.ps1` | Weekly check of everything published, with alert | `-AutoQuarantine On|Off`, `-VulnerabilityServices`, `-SmtpServer`, `-MailTo`, `-MailFrom` |
 | `Jobs\Test-WheelhousePackage.ps1` | Audit all or chosen pins, no alert | `-Package name==ver,...` |
+| `Jobs\Invoke-WheelhouseRemediation.ps1` | Prepare the fix of a vulnerable published version as a proposal (5.14) | `-Package name==ver`, `-ExpediteReason` |
 | `Jobs\Invoke-WheelhouseScan.ps1` | On-demand Defender scan of all or chosen wheels - copied locally and hash-checked first, never scanned on the share (elevated) | `-File name.whl,...` |
 | `Jobs\Send-VulnerabilityAlert.ps1` | Build and send/save an alert (used by the scripts above) | `-ReportPaths`, `-Findings`, `-AuditErrors`, `-Notices`, `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
 | `Jobs\Start-WheelhouseUI.ps1` | Start the web UI | `-Port`, `-NoBrowser` |
@@ -644,7 +688,7 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
 | Code | Meaning |
 |---|---|
 | `0` | OK. |
-| `1` | Finished, but **needs attention**: vulnerabilities (not waived), rejected packages, threats or other findings. |
+| `1` | Finished, but **needs attention**: vulnerabilities (not waived), rejected packages, threats or other findings - or the change still **waits for approval** (nothing was published). |
 | `2` | **Error**: the run aborted, or a check could not be completed (never reported as clean). |
 | `3` | **Busy**: another wheelhouse operation holds the lock. Try again later. |
 
@@ -672,6 +716,10 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
 | A package is "still listed without a wheel" | A group file lists a pin that could not be published. Fix the cause shown, or remove the line from the group file. |
 | UI: `Open the address printed by Start-WheelhouseUI.ps1 (it contains the session token)` | Use the full URL from the console; it changes at every start. |
 | UI: `Cannot listen on port 8765` | The UI is already running, or the port is used - use `-Port`. |
+| `Proposal ... is waiting for approval` / `Not approved: ... has no proposal` | `ApprovalMode` is `SeparateApprover`: another person approves it (UI: Add packages -> Approve), then publish again. A hand-edited `requirements.txt` needs a new proposal first. |
+| `... changed after proposal ... was made` | `requirements.txt` was edited after it was proposed. Resolve again, or propose the file as it is now. |
+| Fix: `No fixed version of ... is known` | No release fixes that advisory yet. Accept the risk for a while (waiver), pin another package, or remove it. |
+| Fix: `No fixed release ... is older than the cooldown` | Wait for the date shown, or give an expedite reason (UI asks for it). |
 | UI: *Task Scheduler refused the account or password* | Wrong password, or the account may not log on as a batch job (a domain policy). Check both, or ask for the *Log on as a batch job* right. |
 | UI: *Windows denied the change ... needs an elevated PowerShell* | You registered the task for another account, or someone else created it. Start `Start-WheelhouseUI.ps1` as administrator. |
 | Weekly check *Last run*: *the account could not log on (password changed?)* | The account's password changed. Enter the new one and click **Update the task**. |

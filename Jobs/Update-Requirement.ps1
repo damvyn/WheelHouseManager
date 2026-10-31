@@ -41,6 +41,15 @@
 .PARAMETER Platform
     Target wheel platform tag (default: settings.psd1's Platform, else win_amd64).
 
+.PARAMETER PreferCurrent
+    Keep the versions of the current requirements.txt wherever they still fit, so only what
+    has to change changes (uv prefers the pins of an existing output file). Used by
+    Invoke-WheelhouseRemediation.ps1: a fix should not upgrade unrelated packages.
+
+.PARAMETER NoProposal
+    Do not record a proposal for the result (Invoke-WheelhouseRemediation.ps1 records its
+    own, with what to replace and retire).
+
 .PARAMETER MinimumPackageAgeDays
     Cooldown window passed to `uv pip compile --exclude-newer`. Defaults to the value
     in config\settings.psd1, falling back to 10 if that's not set either.
@@ -73,7 +82,11 @@ param(
     [string]$Platform,
 
     [ValidateRange(0, 3650)]
-    [int]$MinimumPackageAgeDays
+    [int]$MinimumPackageAgeDays,
+
+    [switch]$PreferCurrent,
+
+    [switch]$NoProposal
 )
 
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
@@ -139,6 +152,11 @@ if ($constraintLines.Count -gt 0) {
     Write-Log "Excluding $($constraintLines.Count) denylisted version(s) from resolution."
 }
 
+if ($PreferCurrent -and (Test-Path -LiteralPath $cfg.RequirementsTxtPath)) {
+    # uv keeps the pins of an existing output file where they still satisfy requirements.in.
+    Copy-Item -LiteralPath $cfg.RequirementsTxtPath -Destination $candidatePath -Force
+    Write-Log 'Keeping the current versions wherever they still fit (only what has to change changes).'
+}
 Write-Log "Resolving with uv (binary wheels only, $($cfg.PythonVersion) / $uvPlatform)..."
 Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs
 Remove-Item -Path $constraintsPath -Force -ErrorAction SilentlyContinue
@@ -173,6 +191,14 @@ Move-Item -Path $candidatePath -Destination $cfg.RequirementsTxtPath -Force
 Remove-Item -Path $rejectedPath -Force -ErrorAction SilentlyContinue
 
 Write-Log "requirements.txt written successfully: $($cfg.RequirementsTxtPath)" "OK"
-Write-Log "Review it, get it approved, then run Update-Wheelhouse.ps1 to merge it into the central wheelhouse."
+if (-not $NoProposal) {
+    try {
+        [void](New-WheelhouseProposal -RequirementsPath $cfg.RequirementsTxtPath -Kind 'resolve')
+    }
+    catch {
+        Write-Log "The proposal could not be recorded ($($_.Exception.Message)); publishing will propose the file itself." 'WARN'
+    }
+}
+Write-Log "Review it, get it approved (UI: Add packages tab), then run Update-Wheelhouse.ps1 to merge it into the central wheelhouse."
 Write-Log "=== Update-Requirement finished ==="
 exit 0

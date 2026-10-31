@@ -48,6 +48,7 @@ function Get-WheelhouseUiContext {
         SettingsPath   = $settingsPath
         DenylistPath   = (Get-WheelhouseDenylistPath -ManagerRoot $ManagerRoot)
         WaiverPath     = (Get-WheelhouseWaiverPath -ManagerRoot $ManagerRoot)
+        ProposalPath   = (Get-WheelhouseProposalPath -ManagerRoot $ManagerRoot)
         Settings       = $effective
         WheelhousePath = $wheelhousePath
         ReportsFolder  = $(if ($wheelhousePath) { Join-Path $wheelhousePath 'reports' } else { '' })
@@ -66,6 +67,52 @@ function Get-WheelhouseUiToolStatus {
         $script:UiToolStatusTime = $now
     }
     return $script:UiToolStatus
+}
+
+function Get-WheelhouseUiApproval {
+    # The proposal state for the review card: the current proposal (if any), whether it is
+    # for requirements.txt as it is now, and what this user may do with it under the
+    # ApprovalMode (approve, reject, publish - publishing approves when allowed).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Context,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$RequirementsPath
+    )
+
+    $mode = [string]$Context.Settings.ApprovalMode
+    if ($script:ApprovalModes -notcontains $mode) { $mode = 'SamePersonAllowed' }
+    $user = Get-WheelhouseCurrentUser
+    $proposal = Read-WheelhouseProposal -Path $Context.ProposalPath
+    $current = [bool]($proposal -and $RequirementsPath -and $proposal.requirements_sha256 -eq (Get-RequirementFileHash -Path $RequirementsPath))
+    $refusal = if ($proposal) { Test-WheelhouseApprovalAllowed -Proposal $proposal -User $user -Mode $mode } else { $null }
+    $canApprove = $current -and $proposal.state -eq 'Proposed' -and -not $refusal
+    $canPublish = if ($current) { $proposal.state -in 'Approved', 'Published' -or $canApprove } else { $mode -eq 'SamePersonAllowed' }
+    $summary = $null
+    if ($proposal) {
+        # Plain assignments: one-element lists must stay lists in the JSON.
+        $replace = @($proposal.replace | ForEach-Object { @{ name = $_.name; from = $_.from; to = $_.to } })
+        $retire = @($proposal.retire | ForEach-Object { @{ name = $_.name; version = $_.version; ids = @($_.ids) } })
+        $summary = @{
+            id = $proposal.id; kind = $proposal.kind; state = $proposal.state; requested_by = $proposal.requested_by
+            requested_utc = $proposal.requested_utc; approved_by = $proposal.approved_by; approved_utc = $proposal.approved_utc
+            rejected_by = $proposal.rejected_by; decision_note = $proposal.decision_note; note = $proposal.note
+            replace = $replace; retire = $retire; expedite_reason = $proposal.expedite_reason; outcome = $proposal.outcome
+        }
+    }
+    return @{
+        mode         = $mode
+        current_user = $user
+        proposal     = $summary
+        current      = $current
+        can_approve  = [bool]$canApprove
+        can_reject   = [bool]($current -and $proposal.state -in 'Proposed', 'Approved')
+        can_publish  = [bool]$canPublish
+        blocked_by   = $(if ($current -and $proposal.state -eq 'Rejected') { "Rejected by $($proposal.rejected_by): $($proposal.decision_note)" } elseif ($current -and $proposal.state -eq 'Proposed' -and $refusal) { $refusal } elseif (-not $current -and $mode -eq 'SeparateApprover') { 'requirements.txt has no proposal (or changed since it was proposed). Propose it, then another person approves it.' } else { '' })
+    }
 }
 
 function Assert-WheelhouseUiConfigured {
@@ -665,8 +712,105 @@ function Get-WheelhouseUiRoute {
                         pin_count       = $pins.Count
                         pending         = @($pending)
                         published_count = $pins.Count - @($pending).Count
+                        approval        = (Get-WheelhouseUiApproval -Context $Context -RequirementsPath $path)
                     }
                 }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/proposal/approve$'
+            Idle    = 'A job is running. Wait for it to finish first.'
+            Handler = {
+                param($Context, $Body, $Match)
+                $approveParams = @{
+                    Id   = [string](Get-UiBodyValue -Body $Body -Name 'id')
+                    Mode = [string]$Context.Settings.ApprovalMode
+                    Note = [string](Get-UiBodyValue -Body $Body -Name 'note')
+                    Path = $Context.ProposalPath
+                }
+                $proposal = Approve-WheelhouseProposal @approveParams
+                return @{ Status = 200; Body = @{ id = $proposal.id; state = $proposal.state; approved_by = $proposal.approved_by } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/proposal/reject$'
+            Idle    = 'A job is running. Wait for it to finish first.'
+            Handler = {
+                param($Context, $Body, $Match)
+                $proposal = Deny-WheelhouseProposal -Id ([string](Get-UiBodyValue -Body $Body -Name 'id')) -Reason ([string](Get-UiBodyValue -Body $Body -Name 'reason')) -Path $Context.ProposalPath
+                return @{ Status = 200; Body = @{ id = $proposal.id; state = $proposal.state } }
+            }
+        }
+
+        @{
+            Method  = 'POST'
+            Pattern = '^/api/proposal/new$'
+            Idle    = 'A job is running. Wait for it to finish first.'
+            Handler = {
+                param($Context, $Body, $Match)
+                $path = [string]$Context.Settings.LocalRequirementsPath
+                if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw [System.Collections.Generic.KeyNotFoundException]::new("requirements.txt was not found: $path") }
+                $proposal = New-WheelhouseProposal -RequirementsPath $path -Kind 'manual' -Note 'proposed from the UI as the file is now' -Path $Context.ProposalPath
+                return @{ Status = 200; Body = @{ id = $proposal.id; state = $proposal.state } }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/packages/(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)/(?<version>[A-Za-z0-9][A-Za-z0-9._+!-]*)/remediation$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $planParams = @{
+                    WheelhousePath     = $Context.WheelhousePath
+                    Name               = $Match['name']
+                    Version            = $Match['version']
+                    RequirementsInPath = [string]$Context.Settings.RequirementsInPath
+                    MinimumAgeDays     = [int]$Context.Settings.MinimumPackageAgeDays
+                }
+                $plan = Get-WheelhouseRemediationPlan @planParams
+                return @{ Status = 200; Body = @{
+                        name             = $plan.Name
+                        version          = $plan.Version
+                        ids              = @($plan.Ids)
+                        unfixable        = @($plan.Unfixable)
+                        fix_version      = $plan.FixVersion
+                        needs_expedite   = [bool]$plan.NeedsExpedite
+                        expedite_version = $plan.ExpediteVersion
+                        eligible_utc     = $plan.EligibleUtc
+                        old_line         = $plan.OldLine
+                        new_line         = $plan.NewLine
+                        summary          = $plan.Summary
+                    }
+                }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/packages/remediate$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                $name = Get-NormalizedPackageName ([string](Get-UiBodyValue -Body $Body -Name 'name'))
+                $version = [string](Get-UiBodyValue -Body $Body -Name 'version')
+                if (-not (Test-WheelhousePackageName -Name $name) -or -not (Test-WheelhousePackageVersion -Version $version)) { throw [System.ArgumentException]::new('Not a valid package name or version.') }
+                $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+                if (-not ($manifest | Where-Object { $_.name -eq $name -and $_.version -eq $version })) { throw [System.Collections.Generic.KeyNotFoundException]::new("$name==$version is not in the wheelhouse.") }
+                $arguments = @('-Package', "$name==$version")
+                $reason = ([string](Get-UiBodyValue -Body $Body -Name 'expedite_reason')).Trim()
+                if ($reason) {
+                    # Free text on a command line: a short, plain sentence only.
+                    if ($reason -notmatch '^[A-Za-z0-9 .,:;()/#+_-]{5,200}$') { throw [System.ArgumentException]::new('Write the reason as a short sentence (5-200 letters, digits and . , : ; ( ) / # + _ -).') }
+                    $arguments += @('-ExpediteReason', $reason)
+                }
+                $job = Start-WheelhouseUiJob -Title "Fix: $name==$version" -Kind 'remediate' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseRemediation.ps1'; Arguments = $arguments })
+                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
         }
 

@@ -568,6 +568,16 @@ Acceptance: these scenario tests pass:
 
 ### Phase 3 - Proposals, approval, remediation (M)
 
+**Done (2026-11-01):** proposals and approval (`Proposal.ps1`, `ApprovalMode`, gate in the update
+run, UI approve/reject/propose), remediation (`Invoke-WheelhouseRemediation.ps1`, UI **Fix**). On
+purpose, differently from the design: one current proposal (`Input\proposal.json`) plus a history
+file instead of a proposal list; with `SamePersonAllowed`, publishing approves; the fix line is
+`name>=fix`, so the resolver takes the newest fixed release the cooldown allows (the exact lowest
+fix only when it must be expedited); the resolve keeps every other version (`-PreferCurrent`);
+the fix replaces the vulnerable pin in its group files instead of adding a group. Named sets are
+still open (optional).
+
+
 - Resolve creates a proposal (diff + content hash); approve and reject record the user; sync
   applies only approved proposals whose hash still matches.
 - `remediate` (section 4.5), with expedite per package.
@@ -617,7 +627,7 @@ depends on the catalog. After that, 3, 4 and 5 can be reordered by priority.
 |---|---|---|
 | D1 | Do clients install with `-r requirements-N.txt`, or only by name against the flat index? This decides whether group files must stay stable and whether named sets are worth building. | **Answered:** clients do use `-r requirements-N.txt`. Group files stay stable and are never regenerated (Phase 1). |
 | D2 | Should auto-quarantine be on by default? | **Answered:** yes, with a switch in the UI and on the command line: setting `AutoQuarantine` (default on), `-AutoQuarantine On|Off` per run. It covers wheels removed or changed on the share, malicious-package advisories (`MAL-*`) and untracked wheels (moved to `_untracked\`). An optional severity threshold for automatic quarantine was not built - overdue findings escalate by alert instead. |
-| D3 | Is a separate approver required (four-eyes), or can the requester approve their own proposal? | Configurable, default "same person allowed, recorded". |
+| D3 | Is a separate approver required (four-eyes), or can the requester approve their own proposal? | **Answered:** configurable (`ApprovalMode`), default `SamePersonAllowed` (recorded); `SeparateApprover` requires another account. |
 | D4 | Can the manager server reach `api.osv.dev` (for severity) as well as `pypi.org`? | **Answered: yes.** Severities are looked up per advisory ID and cached; if OSV is unreachable in a run, cached answers are used and unknown ones count as High (Phase 2). |
 | D5 | Should a scheduled task re-scan the wheelhouse with Defender? | **Answered: no.** Virus scanning of the share is the file server antivirus' job and out of scope. Defender scanning a share also runs as the computer account and may skip network files, so such scans were removed. The tool scans new downloads locally at intake, offers on-demand scans of hash-checked local copies, and detects wheels the file server's antivirus removed or changed (integrity check -> `FileMissing`/`FileModified`, taken out with `AutoQuarantine`). |
 | D6 | Does uv's flat index ignore subfolders (needed for `_staging`, `_untracked`, `_quarantine`)? Today's `_quarantine` already relies on this. | Verify with the deployed uv version before Phase 0. |
