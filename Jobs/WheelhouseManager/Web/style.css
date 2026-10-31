@@ -168,3 +168,14 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 /* Add tab: the proposal behind requirements.txt and its approval buttons. */
 .approval { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+/* Overview tab */
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; margin-bottom: 14px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.tile.link { cursor: pointer; }
+.tile.link:hover { border-color: var(--accent); }
+.tile.warn { border-color: var(--warn); }
+.tile.bad { border-color: var(--bad); background: var(--bad-bg); }
+.tile-value { font-size: 26px; font-weight: 700; }
+.tile-label { color: var(--muted); font-size: 12.5px; }
+.attention-item { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.attention-item:last-child { border-bottom: 0; }

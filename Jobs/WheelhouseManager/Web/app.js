@@ -123,7 +123,7 @@
     filter: '',
     statusFilter: 'all',
     settings: null,
-    currentTab: 'packages',
+    currentTab: 'overview',
     watchedJob: null,
     pollTimer: null,
     shown: {}
@@ -178,7 +178,7 @@
       s.classList.toggle('hidden', s.id !== 'tab-' + name);
     });
     var loaders = {
-      packages: loadPackages, add: renderAdd, quarantine: loadQuarantine,
+      overview: loadOverview, packages: loadPackages, add: renderAdd, quarantine: loadQuarantine,
       denylist: loadDenylist, schedule: loadScheduleTab, settings: loadSettings, jobs: loadJobs
     };
     return loaders[name]();
@@ -255,6 +255,53 @@
         showPackagesFiltered('vulnerable', job);
       }
     }).catch(function () { watchJob(job.id); });
+  }
+
+  // ---------------------------------------------------------------- overview tab
+  // The state of the wheelhouse at a glance, and what needs attention - each item leads to
+  // the tab (and filter) where it is handled.
+  function loadOverview() {
+    var root = $('tab-overview');
+    return api('GET', '/api/overview').then(function (o) {
+      clear(root);
+      var tile = function (value, label, kind, target) {
+        var el = h('div', { class: 'tile' + (kind && value ? ' ' + kind : '') + (target ? ' link' : '') }, h('div', { class: 'tile-value' }, String(value)), h('div', { class: 'tile-label' }, label));
+        if (target) { el.addEventListener('click', function () { goTo(target); }); }
+        return el;
+      };
+      root.append(h('div', { class: 'tiles' },
+        tile(o.packages, 'packages (' + o.published + ' versions, ' + o.groups + ' group files)', null, 'packages'),
+        tile(o.open, 'open vulnerabilities', 'warn', 'packages:vulnerable'),
+        tile(o.overdue, 'past their fix-by date', 'bad', 'packages:overdue'),
+        tile(o.waived, 'risks accepted (waived)', null, 'packages:waived'),
+        tile(o.yanked, 'yanked on PyPI', 'warn', 'packages:yanked'),
+        tile(o.unverified, 'without a recent audit', 'bad', 'packages:unaudited'),
+        tile(o.quarantined, 'quarantined', null, 'quarantine')));
+
+      var attention = [].concat(o.attention || []);
+      var list = h('div', { class: 'card' }, h('h2', {}, 'Needs attention'));
+      if (attention.length === 0) {
+        list.append(h('p', {}, badge('all clear', 'ok'), ' Nothing needs attention right now.'));
+      }
+      attention.forEach(function (a) {
+        list.append(h('div', { class: 'attention-item' }, badge(a.level === 'bad' ? 'act now' : 'review', a.level), ' ', a.text, ' ',
+          h('button', { class: 'btn small', type: 'button', onclick: function () { goTo(a.target); } }, 'Open')));
+      });
+      root.append(list);
+
+      var task = o.task;
+      root.append(h('div', { class: 'card' }, h('h2', {}, 'Weekly check'),
+        h('p', {}, 'Last completed: ', o.last_check_utc ? fmtDate(o.last_check_utc) : 'never', o.check_overdue ? [' ', badge('overdue', 'bad')] : ''),
+        h('p', {}, 'Scheduled Task: ', task ? task.state + (task.next_run_utc ? ', next run ' + fmtDate(task.next_run_utc) : '') + (task.last_result ? ' - last result: ' + task.last_result : '') : 'not registered', ' ',
+          h('button', { class: 'btn small', type: 'button', onclick: function () { showTab('schedule'); } }, task ? 'Manage' : 'Set it up'))));
+    }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
+  }
+
+  // "tab" or "packages:<status filter>".
+  function goTo(target) {
+    var parts = String(target).split(':');
+    if (parts[0] === 'packages') { state.statusFilter = parts[1] || 'all'; }
+    showTab(parts[0]);
   }
 
   // ---------------------------------------------------------------- packages tab
@@ -1116,10 +1163,10 @@
 
     refreshState().then(function (info) {
       if (!info) { return; }
-      var tabs = ['packages', 'add', 'quarantine', 'denylist', 'schedule', 'settings', 'jobs'];
+      var tabs = ['overview', 'packages', 'add', 'quarantine', 'denylist', 'schedule', 'settings', 'jobs'];
       var wanted = location.hash.replace('#', '');
       if (!info.configured) { showTab('settings'); }
-      else { showTab(tabs.indexOf(wanted) >= 0 ? wanted : 'packages'); }
+      else { showTab(tabs.indexOf(wanted) >= 0 ? wanted : 'overview'); }
       if (info.running_job) { watchJob(info.running_job.id); }
     });
   }

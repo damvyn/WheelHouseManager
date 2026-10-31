@@ -248,6 +248,9 @@ function Save-WheelhouseCatalog {
     if ($PSCmdlet.ShouldProcess($Catalog.Path, 'Save catalog')) {
         Write-JsonFile -Path $Catalog.Path -InputObject $document -Depth 12
         $Catalog.Exists = $true
+        # Clients' view of the same state (Client Install\Test-PythonEnvironment.ps1).
+        try { Export-WheelhouseAdvisory -Catalog $Catalog }
+        catch { Write-Log "advisories.json could not be written: $($_.Exception.Message)" 'WARN' }
     }
 }
 

@@ -292,7 +292,7 @@ flowchart TD
 
 **Loading.** `WheelhouseManager.psm1` sets `$script:ManagerRoot` and dot-sources `Common`,
 `Settings`, `Requirements`, `Manifest`, `Catalog`, `Journal`, `Audit`, `Vulnerability`, `Intake`, `Sync`, `Alert`,
-`Run`, `Denylist`, `Package`, `Proposal`, `Remediation`, `Scan`, `Schedule`, `Ui` (order is for readability; calls resolve at run time).
+`Run`, `Denylist`, `Package`, `Proposal`, `Remediation`, `Scan`, `Schedule`, `Status`, `Ui` (order is for readability; calls resolve at run time).
 `Ui.ps1` builds `$script:UiRoutes` at load time. The psd1's
 `FunctionsToExport` is the public surface; CI fails if a listed function is missing.
 
@@ -611,6 +611,22 @@ request), `Get-WheelhouseUiToolStatus` (`Get-WheelhouseToolStatus` cached for 30
 |---|---|---|
 | `Invoke-WheelhouseSync` | the update run (section 9.2); returns `{Outcome Ok/Attention/Error; AuditResults; Notices; Rejected; Published}`; throws when it cannot start | Update-Wheelhouse.ps1 |
 
+### 8.20 `Status.ps1`
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Get-WheelhouseStatus` | counts (published, open/overdue/waived findings, yanked, quarantined, unverified, untracked), last weekly check, current proposal, and `Attention[] {Level; Text; Target}` worst first (`Target` = UI tab or `packages:<filter>`); counts from the manifest while no catalog exists; read only | `whm status`, UI overview, doctor |
+| `Export-WheelhouseAdvisory` | `<wh>\advisories.json`: every version with an open/waived vulnerability or a yank, every quarantined/removed one, each with `status` and `recommended` (highest problem-free published version that is newer) | `Save-WheelhouseCatalog` (every save; a failure only warns) |
+| `Test-WheelhouseHealth` | doctor: settings, wheelhouse reachable + writable, mapped drive, tools, PyPI/OSV (unless `-Offline`), data files, journals, weekly check freshness, Scheduled Task, SMTP; `{Name; Level; Message; Fix}`; never throws | `whm doctor`, Setup.ps1 |
+
+`whm.ps1` (repo root, deployed by Setup.ps1 next to `Jobs\`) is a script, not module code: it
+turns the remaining words into named parameters itself (`ConvertTo-WhmArgument` - array splatting
+would pass `-Package` as a value), runs `Jobs\*.ps1` for the changing commands and calls module
+functions for `status`, `doctor`, `list`, `info`, `approve`, `reject`, `quarantine`, `restore`,
+`waive`, `unwaive`, `schedule`. `Client Install\Test-PythonEnvironment.ps1` stands alone (no
+module): it reads `advisories.json` (path from `%PROGRAMDATA%\uv\uv.toml`) and `uv pip list` /
+`pip list` and matches normalized name + version.
+
 ### 8.18 `Proposal.ps1`
 
 Proposals (decision D3): `Input\proposal.json` holds the current proposal, `Input\proposal-history.jsonl`
@@ -864,6 +880,7 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 
 | Route | Body | Action | Status |
 |---|---|---|---|
+| `GET /api/overview` | - | `Get-WheelhouseStatus` (counts, `attention[]`, last check) + the Scheduled Task's state | 200 |
 | `GET /api/state` | - | path, configured, reachable, defender, is_admin, python/platform, `tools` (python, pip-audit, uv), running job | 200 |
 | `GET /api/packages` | - | `Get-WheelhousePackage` (denylist, configured services) + `last_check_utc`, `check_overdue` (no completed weekly check within `AuditFreshnessDays`), `audit_freshness_days` | 200 |
 | `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks, findings) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
@@ -892,7 +909,8 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 
 One IIFE, ES5, no dependencies. `api()` adds the token header and JSON content type; `h()`
 builds DOM nodes (never `innerHTML` with data); `confirmDialog` / `infoDialog` use the page's one
-`<dialog>`. Tabs: Packages (`loadPackages`, `renderPackages`, `runAudit`, `runScan`,
+`<dialog>`. Tabs: Overview (`loadOverview`, the default; tiles and attention items lead elsewhere
+through `goTo('tab'|'packages:<filter>')`), Packages (`loadPackages`, `renderPackages`, `runAudit`, `runScan`,
 `removeSelected`, `showHistory` - the per-row History dialog with the findings table and
 `acceptRisk`), Add (`renderAdd`, `loadRequirements`, `loadRejected`),
 Quarantine (`loadQuarantine`), Denylist (`loadDenylist`, then `loadWaivers`), Schedule (`loadScheduleTab` ->
@@ -984,6 +1002,10 @@ New|Overdue|Waived|Resolved|'', `notified_utc`), `checks`:
 `audit {status Passed|Vulnerable|Unknown; last_run; last_ok; vulnerabilities[]; services {<service>:
 {status; last_run; vulnerabilities[]; last_error; error}}}`, `scan {status Clean|Threat; last_run;
 threat_files[]}`, `pypi {status Ok|Yanked; last_run; reason}`. Timestamps are ISO 8601 UTC strings.
+
+**advisories.json** (`<wheelhouse>\advisories.json`): `{ schema: 1; generated_utc; note; packages:
+[{ name; version; status quarantined|removed|overdue|vulnerable|waived|yanked; reason;
+advisories[{id; severity; due; fix_versions[]}]; recommended }] }`.
 
 **Proposal** (`Input\proposal.json`): `id`, `kind` (`resolve`/`remediation`/`manual`), `state`
 (`Proposed`/`Approved`/`Rejected`/`Published`), `requested_by`, `requested_utc`,
@@ -1154,7 +1176,7 @@ Which code runs for each user scenario (user steps are in the README):
 
 | Scenario | Code path |
 |---|---|
-| Deploy / upgrade | `Setup.ps1` -> `Save-/Set-WheelhouseSetting`, `Initialize-ManagerFile` |
+| Deploy / upgrade | `Setup.ps1` -> `Save-/Set-WheelhouseSetting`, `Initialize-ManagerFile`, optional `Register-WheelhouseScheduledCheck`, `Test-WheelhouseHealth` |
 | Resolve | `Update-Requirement.ps1` -> uv -> `Test-RequirementWheelAvailability` -> `Invoke-PipPinRetry` |
 | Publish | `Update-Wheelhouse.ps1` -> `Invoke-WheelhouseSync` (9.2) -> `Invoke-CandidateIntake` -> `Publish-CandidateIntake` (9.1) |
 | Crash recovery | any writer -> `Open-WheelhouseWrite` -> `Repair-WheelhouseJournal` -> `Complete-*` -> `Update-WheelhouseCatalog` |
@@ -1165,6 +1187,8 @@ Which code runs for each user scenario (user steps are in the README):
 | Schedule the weekly check | Schedule tab -> `POST /api/schedule` -> `Register-WheelhouseScheduledCheck` -> `Register-ScheduledTask` |
 | Approve and publish | Add tab -> `POST /api/proposal/approve` or `/api/wheelhouse/update` -> `Invoke-WheelhouseSync` -> `Resolve-WheelhouseProposalForPublish` |
 | Fix a vulnerable version | History -> Fix -> `GET .../remediation`, `POST /api/packages/remediate` -> `Invoke-WheelhouseRemediation.ps1` (plan, `Set-RequirementInSpec`, `Update-Requirement.ps1 -PreferCurrent -NoProposal`, `New-WheelhouseProposal -Kind remediation`) -> approve/publish -> sync swaps pins (R step retires) |
+| Status / doctor | `whm status` / `whm doctor` (and Setup.ps1's last step) -> `Get-WheelhouseStatus` / `Test-WheelhouseHealth` |
+| Client check | `Client Install\Test-PythonEnvironment.ps1` -> `advisories.json` (written by `Save-WheelhouseCatalog` -> `Export-WheelhouseAdvisory`) |
 | Accept a risk | History dialog -> `POST /api/waivers/add` -> `Add-WheelhouseWaiver` + `Set-CatalogFindingWaiver`; waivers listed on the Denylist tab (`GET /api/waivers`) |
 | Malicious package advisory | check or update: `Get-CatalogMaliciousRecord` -> `Resolve-MaliciousPackage` -> `Remove-WheelhousePackage -Quarantine -LockHeld` |
 | Wheel copied in by hand | check or update: `Move-UntrackedWheelFile` -> `_untracked\<ts>\` |

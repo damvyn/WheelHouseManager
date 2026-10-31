@@ -185,15 +185,22 @@ From a copy of this repository:
 
 # Another destination (default: C:\WheelHouseManager)
 .\Setup.ps1 -DestinationPath "D:\WheelHouseManager" -WheelhousePath "\\server\share\wheelhouse"
+
+# Also register the weekly check (asks for the account's password)
+.\Setup.ps1 -WheelhousePath "\\server\share\wheelhouse" -RegisterScheduledTask -TaskDays Sunday -TaskTime 02:00
 ```
 
 `Setup.ps1` is safe to re-run - do so to deploy a newer version. It always replaces the code in
-`Jobs\`, but never overwrites your settings, denylist or `Input\` files.
+`Jobs\`, but never overwrites your settings, denylist or `Input\` files. At the end it checks the
+installation (`whm doctor`, see [5.0](#50-whm---one-command-for-everything)) and lists anything
+still missing - the wheelhouse share not writable, Python or uv not found, PyPI or OSV not
+reachable, the weekly check not scheduled, no mail server - each with what to do.
 
 Result:
 
 ```
 C:\WheelHouseManager\
+    whm.ps1                         one command for everything (whm help)
     Invoke-WheelhousePipeline.ps1   update + alert in one call
     Jobs\                           the scripts and the WheelhouseManager module (keep together)
     config\
@@ -206,8 +213,8 @@ C:\WheelHouseManager\
     logs\ui\                        output of jobs started from the web UI
 ```
 
-The wheelhouse share gets `manifest.json`, `catalog.json`, `events.jsonl`, the group files,
-`reports\` and `_quarantine\` as they are needed. After an upgrade from a version without a
+The wheelhouse share gets `manifest.json`, `catalog.json`, `events.jsonl`, `advisories.json`, the
+group files, `reports\` and `_quarantine\` as they are needed. After an upgrade from a version without a
 catalog, the first run that changes or checks the wheelhouse creates `catalog.json` from what is
 there (including the latest audit and scan results); nothing needs to be done by hand.
 
@@ -301,6 +308,21 @@ versions your project needs (a second version of a package lives in a different 
 wheelhouse, so such an install never fails for a missing file. A package that is later
 quarantined or deleted is removed from its group file too.
 
+**Optional - check an environment on a client.** `Client Install\Test-PythonEnvironment.ps1`
+(a separate script; `Startup_UV.ps1` is unchanged) tells a user whether anything installed in an
+environment has since been found vulnerable, yanked, quarantined or removed, and what to install
+instead. It works offline: it reads `advisories.json` from the wheelhouse share - found through
+the machine-wide uv configuration - and the environment's package list.
+
+```powershell
+.\Test-PythonEnvironment.ps1                              # the .venv in the current folder
+.\Test-PythonEnvironment.ps1 -Project C:\Work\analysis    # another project's .venv
+.\Test-PythonEnvironment.ps1 -Python C:\envs\x\Scripts\python.exe
+```
+
+Exit code 0 nothing affected, 1 something affected, 2 the check could not run. Copy it to the
+clients the way you deploy other tools (it needs nothing else from this repository).
+
 ---
 
 ## 4. Configuration
@@ -352,6 +374,31 @@ Example:
 
 All commands assume `cd C:\WheelHouseManager\Jobs` unless noted. Each guide also says how to do
 it in the [web UI](#6-the-web-ui).
+
+### 5.0 whm - one command for everything
+
+`C:\WheelHouseManager\whm.ps1` covers the everyday work; the scripts in `Jobs\` keep working as
+before (whm runs them, with the same options).
+
+```powershell
+cd C:\WheelHouseManager
+.\whm.ps1 status                   # what needs attention now
+.\whm.ps1 doctor                   # check the installation end to end
+.\whm.ps1 list -Vulnerable         # published packages with their audit status
+.\whm.ps1 info requests            # one package: state, vulnerabilities, history
+.\whm.ps1 resolve                  # requirements.in -> requirements.txt
+.\whm.ps1 approve                  # approve the current proposal (or: whm reject <reason>)
+.\whm.ps1 publish                  # check and publish it
+.\whm.ps1 fix requests==2.19.0     # prepare the fix of a vulnerable version
+.\whm.ps1 quarantine six==1.16.0 -Reason "not needed"
+.\whm.ps1 waive attrs==23.1.0 GHSA-xxxx 30 "code path not used"
+.\whm.ps1 check                    # the weekly check now
+.\whm.ps1 schedule                 # the weekly check's Scheduled Task
+.\whm.ps1 ui                       # the web UI
+.\whm.ps1 help                     # every command
+```
+
+`status` and `doctor` exit with 0 (all good), 1 (something to review) or 2 (act now).
 
 ### 5.1 Add packages (the normal workflow)
 
@@ -616,6 +663,7 @@ what to do about it.
 
 | Tab | What you can do |
 |---|---|
+| **Overview** (opens first) | The state at a glance - packages, open and overdue vulnerabilities, waived, yanked, unverified, quarantined (click a tile to see them) - a **Needs attention** list where each item leads to the place to handle it, and the weekly check's last run and task. |
 | **Packages** | See every published wheel with its groups, latest audit (for a vulnerable one: worst severity and fix-by date, or *overdue*) and Defender result, a *yanked* badge if PyPI withdrew it, and the denylist flag; filter by name or status (vulnerable, fix overdue, risk accepted, threat, never audited/scanned, yanked, denylisted, file missing). Select rows to **Audit**, **Scan**, **Quarantine** or **Delete**; **History** shows one version's state, checks, vulnerabilities (with **Accept risk** / **Remove waiver**) and history. A banner warns when the weekly check has not run for `AuditFreshnessDays`. |
 | **Add packages** | **1. Add**: enter packages; they are added to `requirements.in` and resolved - nothing is downloaded. **2. Review and publish**: lists only the resolved pins that are **not yet in the wheelhouse** (pins already published are only counted; the whole `requirements.txt` is behind *Show the whole requirements.txt*), each marked *new* or *rejected last time* with the reason, then **Publish** (runs every check, then publishes). *Also publish right away* does both at once. When resolving succeeds, the page scrolls to step 2 and highlights it. A running job's log is shown in a panel at the bottom of the window (**Hide log** / **Show log**); it takes its own space, so it never covers the page. The card at the bottom lists the latest rejected packages with their reasons. |
 | **Quarantine** | Quarantined packages; **Restore** one. |
@@ -636,7 +684,9 @@ shows the details.
 
 | Script | Purpose | Main parameters |
 |---|---|---|
-| `Setup.ps1` (repo) | Deploy or upgrade the manager | `-DestinationPath`, `-WheelhousePath` |
+| `Setup.ps1` (repo) | Deploy or upgrade the manager, check it, optionally schedule the weekly check | `-DestinationPath`, `-WheelhousePath`, `-RegisterScheduledTask`, `-TaskCredential`, `-TaskDays`, `-TaskTime`, `-SkipDoctor` |
+| `whm.ps1` (root) | One command for everything (5.0) | `whm help` |
+| `Client Install\Test-PythonEnvironment.ps1` | Optional, on clients: is anything installed affected? (3.4) | `-Project`, `-Python`, `-AdvisoriesPath`, `-InstalledJson` |
 | `Jobs\Update-Requirement.ps1` | `requirements.in` -> `requirements.txt` | `-RequirementsInPath`, `-RequirementsTxtPath`, `-PythonVersion`, `-Platform`, `-MinimumPackageAgeDays` |
 | `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins; audit what is published; take out wheels missing/changed on the share | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-AutoQuarantine On|Off`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
 | `Invoke-WheelhousePipeline.ps1` (root) | `Update-Wheelhouse.ps1` + one alert | as above, plus `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
@@ -675,7 +725,8 @@ is deleted after `ReportRetentionMonths`.
 Next to `reports\`, the wheelhouse holds `catalog.json` (current state, latest check results and
 vulnerability findings per package version) and `events.jsonl` (history). Neither is deleted by the
 retention setting, nor is `reports\osv-cache.json` (severities looked up on OSV, refreshed weekly).
-Waivers are kept on the manager server in `config\waivers.json`.
+Waivers are kept on the manager server in `config\waivers.json`. `advisories.json` (every version
+that needs attention, for the client check) is rewritten whenever the catalog changes.
 
 Jobs started from the UI also keep their console output in `C:\WheelHouseManager\logs\ui\`.
 

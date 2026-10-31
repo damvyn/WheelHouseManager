@@ -536,6 +536,37 @@ function Get-WheelhouseUiRoute {
 
         @{
             Method     = 'GET'
+            Pattern    = '^/api/overview$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $status = Get-WheelhouseStatus -WheelhousePath $Context.WheelhousePath -FreshnessDays ([int]$Context.Settings.AuditFreshnessDays) -ProposalPath $Context.ProposalPath
+                $task = $null
+                try { $task = Get-WheelhouseScheduledCheck -ManagerRoot $Context.ManagerRoot } catch { Write-Verbose "Task Scheduler unreadable: $($_.Exception.Message)" }
+                # Plain assignment: one-element lists must stay lists in the JSON.
+                $attention = @($status.Attention | ForEach-Object { @{ level = $_.Level; text = $_.Text; target = $_.Target } })
+                return @{ Status = 200; Body = @{
+                        published      = $status.Published
+                        packages       = $status.Packages
+                        groups         = $status.Groups
+                        open           = $status.Open
+                        overdue        = $status.Overdue
+                        waived         = $status.Waived
+                        yanked         = $status.Yanked
+                        quarantined    = $status.Quarantined
+                        unverified     = $status.Unverified
+                        untracked      = $status.Untracked
+                        last_check_utc = $status.LastCheckUtc
+                        check_overdue  = $status.CheckOverdue
+                        attention      = $attention
+                        task           = $(if ($task -and $task.Registered) { @{ state = $task.State; next_run_utc = $task.NextRunTime; last_result = $task.LastResultText; for_this_installation = [bool]$task.ForThisInstallation } } else { $null })
+                    }
+                }
+            }
+        }
+
+        @{
+            Method     = 'GET'
             Pattern    = '^/api/packages$'
             Wheelhouse = $true
             Handler    = {

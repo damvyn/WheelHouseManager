@@ -1898,6 +1898,111 @@ Describe 'WheelhouseManager' {
         }
     }
 
+    Context 'Status, doctor, advisories and whm' {
+        BeforeAll {
+            function New-TestVulnerableWheelhouse {
+                $wheelhouse = Get-TestWheelhouse
+                Update-WheelhouseCatalog -WheelhousePath $wheelhouse -DenylistPath (Join-Path $wheelhouse 'deny.json') -Update {
+                    param($catalog)
+                    $report = Join-Path $wheelhouse 'report.json'
+                    Set-Content -Path $report -Value '{"dependencies":[{"name":"attrs","version":"23.1.0","vulns":[{"id":"GHSA-s","fix_versions":["24.0"]}]},{"name":"six","version":"1.16.0","vulns":[]}]}'
+                    Update-CatalogAuditResult -Catalog $catalog -AuditResult @('osv', 'pypi' | ForEach-Object { [PSCustomObject]@{ Service = $_; Status = 'Vulnerable'; ReportPath = $report; GroupFile = 'x' } }) -Severity @{ 'GHSA-s' = [PSCustomObject]@{ Severity = 'High'; Score = 8.0; Source = 't'; Error = '' } }
+                }
+                return $wheelhouse
+            }
+        }
+
+        It 'summarizes what needs attention' {
+            $wheelhouse = New-TestVulnerableWheelhouse
+            $status = Get-WheelhouseStatus -WheelhousePath $wheelhouse -ProposalPath (Join-Path (Get-TestFolder) 'none.json')
+            $status.Published | Should -Be 2
+            $status.Open | Should -Be 1
+            $status.Overdue | Should -Be 0
+            $status.CheckOverdue | Should -Be $true
+            @($status.Attention | ForEach-Object { $_.Target }) -join ',' | Should -Be 'schedule,packages:vulnerable'
+
+            Update-WheelhouseCatalog -WheelhousePath $wheelhouse -DenylistPath (Join-Path $wheelhouse 'deny.json') -Update {
+                param($catalog)
+                $catalog.Records['attrs==23.1.0'].findings[0].due = (Get-Date).ToUniversalTime().AddDays(-1).ToString('o')
+                $catalog.ScheduledCheckUtc = (Get-Date).ToUniversalTime().ToString('o')
+            }
+            $status = Get-WheelhouseStatus -WheelhousePath $wheelhouse -ProposalPath (Join-Path (Get-TestFolder) 'none.json')
+            $status.Overdue | Should -Be 1
+            $status.Attention[0].Level | Should -Be 'bad'
+            $status.Attention[0].Target | Should -Be 'packages:overdue'
+        }
+
+        It 'writes advisories.json with what to install instead' {
+            $wheelhouse = New-TestVulnerableWheelhouse
+            $advisories = Get-Content -Path (Join-Path $wheelhouse 'advisories.json') -Raw | ConvertFrom-Json
+            $item = @($advisories.packages)[0]
+            "$($item.name)==$($item.version) $($item.status)" | Should -Be 'attrs==23.1.0 vulnerable'
+            @($item.advisories)[0].id | Should -Be 'GHSA-s'
+            $item.recommended | Should -BeNullOrEmpty
+            @($advisories.packages).Count | Should -Be 1
+
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Records['attrs==24.0'] = New-CatalogRecord -Name 'attrs' -Version '24.0'
+            $catalog.Records['six==1.16.0'].state = 'Quarantined'
+            Export-WheelhouseAdvisory -Catalog $catalog
+            $advisories = Get-Content -Path (Join-Path $wheelhouse 'advisories.json') -Raw | ConvertFrom-Json
+            (@($advisories.packages) | Where-Object { $_.name -eq 'attrs' }).recommended | Should -Be '24.0'
+            (@($advisories.packages) | Where-Object { $_.name -eq 'six' }).status | Should -Be 'quarantined'
+        }
+
+        It 'checks the installation and says how to fix each problem' {
+            $root = Get-TestFolder
+            New-Item -ItemType Directory -Path (Join-Path $root 'config') | Out-Null
+            $wheelhouse = Get-TestWheelhouse
+            Save-WheelhouseSetting -SettingsPath (Join-Path $root 'config\settings.psd1') -Settings @{ WheelhousePath = $wheelhouse }
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseToolStatus -MockWith {
+                [PSCustomObject]@{ name = 'python'; available = $true; version = '3.14.0'; level = 'ok'; message = '' }
+                [PSCustomObject]@{ name = 'uv'; available = $false; version = ''; level = 'bad'; message = 'uv was not found' }
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseScheduledCheck -MockWith { [PSCustomObject]@{ Registered = $false; TaskName = 'Wheelhouse Weekly Check'; Script = 'x' } }
+            $checks = @(Test-WheelhouseHealth -ManagerRoot $root -Offline)
+            $byName = @{}; foreach ($check in $checks) { $byName[$check.Name] = $check }
+            $byName['Wheelhouse'].Level | Should -Be 'ok'
+            $byName['Tool: uv'].Level | Should -Be 'bad'
+            $byName['Data: Catalog'].Level | Should -Be 'ok'
+            $byName['Scheduled Task'].Level | Should -Be 'warn'
+            $byName['Scheduled Task'].Fix | Should -Match 'Schedule tab'
+            $byName['Alerts'].Level | Should -Be 'warn'
+            $byName.ContainsKey('Network: PyPI') | Should -Be $false
+
+            Set-Content -Path (Join-Path $wheelhouse 'catalog.json') -Value '{ broken'
+            (@(Test-WheelhouseHealth -ManagerRoot $root -Offline) | Where-Object { $_.Name -eq 'Data: Catalog' }).Level | Should -Be 'bad'
+            Save-WheelhouseSetting -SettingsPath (Join-Path $root 'config\settings.psd1') -Settings @{ WheelhousePath = (Join-Path $root 'missing') }
+            (@(Test-WheelhouseHealth -ManagerRoot $root -Offline) | Where-Object { $_.Name -eq 'Wheelhouse' }).Level | Should -Be 'bad'
+        }
+
+        It 'whm answers unknown commands and missing arguments with exit codes' {
+            $whm = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'whm.ps1'
+            $host_ = (Get-Process -Id $PID).Path
+            $output = & $host_ -NoProfile -File $whm bogus 2>&1 | Out-String
+            $LASTEXITCODE | Should -Be 2
+            $output | Should -Match 'Unknown command'
+            $output = & $host_ -NoProfile -File $whm fix 2>&1 | Out-String
+            $LASTEXITCODE | Should -Be 2
+            $output | Should -Match 'Usage: whm fix'
+        }
+
+        It 'the client check lists installed versions the advisories mention' {
+            $wheelhouse = New-TestVulnerableWheelhouse
+            $installed = Join-Path (Get-TestFolder) 'installed.json'
+            Set-Content -Path $installed -Value '[{"name":"Attrs","version":"23.1.0"},{"name":"six","version":"1.16.0"}]'
+            $client = Join-Path (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Client Install') 'Test-PythonEnvironment.ps1'
+            $host_ = (Get-Process -Id $PID).Path
+            $output = & $host_ -NoProfile -File $client -AdvisoriesPath (Join-Path $wheelhouse 'advisories.json') -InstalledJson $installed 2>&1 | Out-String
+            $LASTEXITCODE | Should -Be 1
+            $output | Should -Match 'Attrs==23.1.0\s+VULNERABLE \(High\)'
+            Set-Content -Path $installed -Value '[{"name":"six","version":"1.16.0"}]'
+            $output = & $host_ -NoProfile -File $client -AdvisoriesPath (Join-Path $wheelhouse 'advisories.json') -InstalledJson $installed 2>&1 | Out-String
+            $LASTEXITCODE | Should -Be 0
+            $output | Should -Match 'Nothing installed is affected'
+        }
+    }
+
     Context 'Journal' {
         It 'finishes an interrupted publish: manifest and pin only for wheels that arrived intact' {
             $wheelhouse = Get-TestWheelhouse
@@ -2578,6 +2683,17 @@ Describe 'WheelhouseManager' {
             (Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9"}')).Status | Should -Be 200
             (Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9"}')).Status | Should -Be 404
             @((Invoke-WheelhouseUiApi -Method GET -Path '/api/packages/attrs/23.1.0/history' -ManagerRoot $m.Root).Body.record.findings)[0].status | Should -Be 'Open'
+        }
+
+        It 'gives the overview' {
+            $m = Get-TestManager
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseScheduledCheck -MockWith { [PSCustomObject]@{ Registered = $false; TaskName = 'x'; Script = 'x' } }
+            $overview = Invoke-WheelhouseUiApi -Method GET -Path '/api/overview' -ManagerRoot $m.Root
+            $overview.Status | Should -Be 200
+            $overview.Body.published | Should -Be 2
+            $overview.Body.check_overdue | Should -Be $true
+            @($overview.Body.attention)[0].target | Should -Be 'schedule'
+            $overview.Body.task | Should -BeNullOrEmpty
         }
 
         It 'lists only the resolved pins that are not in the wheelhouse yet, with the last rejection' {

@@ -586,6 +586,14 @@ still open (optional).
 
 ### Phase 4 - User-facing tools (M)
 
+**Done (2026-11-01):** `whm.ps1` (status, doctor, list, info, and the changing commands as
+wrappers), UI Overview tab, `Setup.ps1 -RegisterScheduledTask` with `doctor` at the end,
+`advisories.json` (rewritten on every catalog save) and `Client Install\Test-PythonEnvironment.ps1`
+(offline). Still open: an `index.html` page on the share, a fuller README restructure, and a
+dedicated waivers/proposals history view in the UI (both are reachable today from the Add and
+Denylist tabs and the package History).
+
+
 - `whm` dispatcher with `status`, `doctor`, `list`, `info`, `help` and the rest; old scripts become wrappers.
 - UI: Overview, Proposals, Waivers, package detail timeline, state legend.
 - `Setup.ps1 -RegisterScheduledTask` plus doctor at the end; new README structure. *(Registering the weekly check is already in the UI - Settings tab, `Register-WheelhouseScheduledCheck` - so the Setup switch only needs to call it.)*
