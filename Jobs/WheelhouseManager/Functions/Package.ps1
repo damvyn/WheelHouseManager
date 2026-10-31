@@ -158,11 +158,47 @@ function Get-PackageScanStatus {
     return $result
 }
 
+function ConvertTo-WheelhouseUiFinding {
+    # A record's unresolved findings for the UI: id, severity, due date, status
+    # (Open / Overdue / Waived) and waiver.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Record,
+
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
+
+    foreach ($finding in @($Record.findings)) {
+        if ($null -eq $finding -or $finding.resolved_utc) { continue }
+        # Plain assignments: one-element arrays must stay lists in the JSON.
+        $aliases = @($finding.aliases)
+        $fixVersions = @($finding.fix_versions)
+        $waiver = $null
+        if ($finding.waiver) {
+            $waiver = @{ reason = [string]$finding.waiver.reason; by = [string]$finding.waiver.by; expires_utc = [string]$finding.waiver.expires_utc }
+        }
+        @{
+            id           = $finding.id
+            aliases      = $aliases
+            summary      = $finding.summary
+            fix_versions = $fixVersions
+            severity     = $finding.severity
+            score        = $finding.score
+            first_seen   = $finding.first_seen
+            due          = $finding.due
+            status       = (Get-CatalogFindingStatus -Finding $finding -NowUtc $NowUtc)
+            waiver       = $waiver
+        }
+    }
+}
+
 function Get-WheelhousePackage {
     # The wheelhouse inventory: one row per wheel file in manifest.json, with the
     # group files that list it, its latest audit, Defender and PyPI (yanked) status from
-    # the catalog, and whether the denylist blocks it. Also returns the untracked wheel
-    # files and the groups.
+    # the catalog, its open findings (worst severity, earliest due date, overdue, waived),
+    # and whether the denylist blocks it. Also returns the untracked wheel files, the
+    # groups and when the scheduled check last completed.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -197,6 +233,8 @@ function Get-WheelhousePackage {
     $auditStatus = @{}
     $scanStatus = @{}
     $pypiStatus = @{}
+    $findingStatus = @{}
+    $now = (Get-Date).ToUniversalTime()
     if ($catalog.Exists) {
         foreach ($key in $catalog.Records.Keys) {
             $record = $catalog.Records[$key]
@@ -214,6 +252,17 @@ function Get-WheelhousePackage {
                 }
             }
             if ($record.checks.pypi) { $pypiStatus[$key] = $record.checks.pypi }
+            $findings = @(ConvertTo-WheelhouseUiFinding -Record $record -NowUtc $now)
+            $open = @($findings | Where-Object { $_.status -in 'Open', 'Overdue' })
+            $worst = $open | Sort-Object @{ Expression = { Get-SeverityRank -Severity $_.severity }; Descending = $true } | Select-Object -First 1
+            $earliest = $open | Sort-Object { $_.due } | Select-Object -First 1
+            $findingStatus[$key] = [PSCustomObject]@{
+                Severity = $(if ($worst) { [string]$worst.severity } else { '' })
+                Due      = $(if ($earliest) { [string]$earliest.due } else { '' })
+                Overdue  = [bool]($open | Where-Object { $_.status -eq 'Overdue' })
+                Open     = $open.Count
+                Waived   = @($findings | Where-Object { $_.status -eq 'Waived' }).Count
+            }
         }
     }
     else {
@@ -236,6 +285,7 @@ function Get-WheelhousePackage {
         $audit = if ($auditStatus.ContainsKey($key)) { $auditStatus[$key] } else { $unknownAudit }
         $scan = if ($scanStatus.ContainsKey([string]$entry.file)) { $scanStatus[[string]$entry.file] } else { $unknownScan }
         $pypi = $pypiStatus[$key]
+        $finding = $findingStatus[$key]
         $vulnerabilities = @($audit.Vulnerabilities)
         [PSCustomObject]@{
             name            = [string]$entry.name
@@ -254,13 +304,19 @@ function Get-WheelhousePackage {
             last_scan       = $scan.LastScan
             denylisted      = $(if ($deny) { [string]$deny.reason } else { $null })
             yanked          = $(if ($pypi -and $pypi.status -eq 'Yanked') { $(if ($pypi.reason) { [string]$pypi.reason } else { 'yanked' }) } else { $null })
+            severity        = $(if ($finding) { $finding.Severity } else { '' })
+            due             = $(if ($finding) { $finding.Due } else { '' })
+            overdue         = [bool]($finding -and $finding.Overdue)
+            open_findings   = $(if ($finding) { $finding.Open } else { 0 })
+            waived_findings = $(if ($finding) { $finding.Waived } else { 0 })
         }
     }
 
     return [PSCustomObject]@{
-        Packages  = @($rows)
-        Groups    = $groupNames.ToArray()
-        Untracked = @($untracked)
+        Packages          = @($rows)
+        Groups            = $groupNames.ToArray()
+        Untracked         = @($untracked)
+        ScheduledCheckUtc = $catalog.ScheduledCheckUtc
     }
 }
 
@@ -656,6 +712,111 @@ function Resolve-WheelhouseIntegrityProblem {
             $action = 'Quarantine or delete the version (UI: Packages tab), or turn AutoQuarantine on. Update-Wheelhouse.ps1 refuses to run until this is resolved.'
         }
         New-WheelhouseNotice -Kind $kind -Package $name -Version $version -File $files -Message $message -Action $action
+    }
+}
+
+function Move-UntrackedWheelFile {
+    # Wheels in the wheelhouse folder that the manifest does not know were never checked
+    # (copied in by hand, left over from an old tool), yet clients can install them from
+    # the flat index. With -AutoQuarantine they are moved to <wheelhouse>\_untracked\<time>\
+    # (uv does not read subfolders); without it they stay. Either way one Wheelhouse.Notice
+    # (Untracked) lists them; nothing is returned when there are none. A pin that needs one
+    # of them is downloaded and verified by the next Update-Wheelhouse.ps1 run. Call it
+    # while holding the write lock, and never on first-time setup (an empty manifest), when
+    # the wheels already there are adopted instead.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [switch]$AutoQuarantine
+    )
+
+    $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+    if ($manifest.Count -eq 0) { return }
+    $untracked = Get-UntrackedWheelFile -Manifest $manifest -WheelhousePath $WheelhousePath
+    if ($untracked.Count -eq 0) { return }
+
+    $moved = [System.Collections.Generic.List[string]]::new()
+    $failed = [System.Collections.Generic.List[string]]::new()
+    $folder = Join-Path (Join-Path $WheelhousePath '_untracked') (Get-Date -Format 'yyyyMMdd_HHmmss')
+    if ($AutoQuarantine -and $PSCmdlet.ShouldProcess($WheelhousePath, "Move $($untracked.Count) untracked wheel(s) to $folder")) {
+        foreach ($file in $untracked) {
+            try {
+                if (-not (Test-Path -Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+                Move-Item -LiteralPath (Join-Path $WheelhousePath $file) -Destination (Join-Path $folder $file) -ErrorAction Stop
+                $moved.Add($file)
+            }
+            catch {
+                $failed.Add("$file ($($_.Exception.Message))")
+            }
+        }
+        if ($moved.Count -gt 0) {
+            Write-WheelhouseEvent -WheelhousePath $WheelhousePath -Action 'UntrackedMoved' -Detail "$($moved.Count) wheel(s) not in the manifest moved to $folder`: $($moved -join ', ')"
+        }
+    }
+
+    if ($moved.Count -gt 0) {
+        $message = "$($moved.Count) wheel file(s) that were not published by the manager (not in manifest.json, never checked) were moved out of the index to $folder."
+        if ($failed.Count -gt 0) { $message += " Could not move: $($failed -join '; ')." }
+        $action = 'Find out who copied them in. If a package is needed, add it to requirements.in and publish it the normal way (it is downloaded and verified again); otherwise delete the folder.'
+    }
+    else {
+        $message = "$($untracked.Count) wheel file(s) are in the wheelhouse folder but not in manifest.json - they were never checked, yet clients can install them."
+        if ($failed.Count -gt 0) { $message += " Moving them failed: $($failed -join '; ')." }
+        $action = 'Remove them from the folder (or turn AutoQuarantine on to move them out automatically) and publish the packages you need through Update-Wheelhouse.ps1.'
+    }
+    Write-Log $message 'WARN'
+    New-WheelhouseNotice -Kind 'Untracked' -File @($untracked) -Message $message -Action $action
+}
+
+function Resolve-MaliciousPackage {
+    # Deals with published versions that OSV lists as malicious packages (MAL-* advisories
+    # recorded in the catalog, Get-CatalogMaliciousRecord). With -AutoQuarantine each one is
+    # quarantined and denylisted; without it nothing is changed. A waived MAL advisory (a
+    # confirmed false positive) is left alone. Returns one Wheelhouse.Notice (Malicious)
+    # per version. Call it while holding the write lock.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [switch]$AutoQuarantine,
+
+        [string]$DenylistPath = (Get-WheelhouseDenylistPath)
+    )
+
+    $catalog = Read-WheelhouseCatalog -WheelhousePath $WheelhousePath
+    foreach ($item in @(Get-CatalogMaliciousRecord -Catalog $catalog)) {
+        $record = $item.Record
+        $key = "$($record.name)==$($record.version)"
+        $ids = $item.Ids -join ', '
+        if ($AutoQuarantine -and $PSCmdlet.ShouldProcess($key, 'Quarantine malicious package')) {
+            try {
+                $removeParams = @{
+                    WheelhousePath = $WheelhousePath
+                    Name           = $record.name
+                    Version        = $record.version
+                    Quarantine     = $true
+                    Reason         = "malicious package advisory $ids"
+                    DenylistPath   = $DenylistPath
+                    LockHeld       = $true
+                }
+                $done = Remove-WheelhousePackage @removeParams
+                $message = "OSV lists this version as a malicious package ($ids). It was quarantined, taken out of $(@($done.Groups).Count) group file(s) and denylisted."
+                $action = 'Find out which clients installed it (uv pip list) and treat those machines as compromised. Do not restore it unless the advisory is withdrawn.'
+            }
+            catch {
+                $message = "OSV lists this version as a malicious package ($ids), and it could not be quarantined automatically: $($_.Exception.Message)"
+                $action = 'Quarantine the version by hand now (UI: Packages tab).'
+            }
+        }
+        else {
+            $message = "OSV lists this version as a malicious package ($ids). It is still published - nothing was changed automatically (AutoQuarantine is off)."
+            $action = 'Quarantine the version now (UI: Packages tab) and find out which clients installed it.'
+        }
+        Write-Log "${key}: $message" 'ERROR'
+        New-WheelhouseNotice -Kind 'Malicious' -Package $record.name -Version $record.version -File @($record.files) -Message $message -Action $action
     }
 }
 

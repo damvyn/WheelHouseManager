@@ -358,3 +358,16 @@ function ConvertTo-UtcDateTime {
     if ($Value -is [System.DateTimeOffset]) { return $Value.UtcDateTime }
     return [System.DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime
 }
+
+function ConvertTo-OptionalUtcDateTime {
+    # ConvertTo-UtcDateTime for values that may be missing: $null for an empty or
+    # unreadable value instead of an error.
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value -or ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value))) { return $null }
+    try { return ConvertTo-UtcDateTime -Value $Value } catch { return $null }
+}

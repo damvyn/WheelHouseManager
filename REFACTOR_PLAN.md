@@ -448,7 +448,7 @@ Implemented as listed below, with these decisions:
   pin, so safety holds, but a per-package resolver override (uv `--exclude-newer-package`, if the
   deployed uv supports it) is a follow-up.
 - **Untracked wheels (S7) are still only a warning.** Moving them to `_untracked\` belongs to Phase 2,
-  because it changes files on the share.
+  because it changes files on the share. *(Done in Phase 2: `Move-UntrackedWheelFile`.)*
 - **The alert now has a "Packages that need attention" section.** It is fed by `Wheelhouse.Notice`
   objects: `Denylisted`, `Yanked`, `DefenderThreat`, `DefenderRemoved`, `IntakeBlocked`.
 
@@ -513,9 +513,45 @@ Started 2026-10-31 with the antivirus scope decision (D5) and the automatic-quar
   With `AutoQuarantine` on (the default) they are taken out or quarantined, and denylisted, by the
   weekly check or the next update; with it off, they are only reported and updates stop. On-demand
   scans copy and hash-check wheels locally first. The intake scan result is recorded in the catalog.
-- **Still to do in this phase:** OSV severity (needs D4), due dates and escalation, waivers, malware
-  advisories (`MAL-*`) under `AutoQuarantine`, the Unverified state and heartbeat, stateful
-  alerts, untracked wheels moved out.
+- **Done (2026-10-31, after D4 = yes):**
+  - **Severity:** `Get-VulnerabilitySeverity` asks `api.osv.dev` per advisory ID (the ID, then up
+    to three aliases, GHSA first), scores CVSS 3 vectors itself, falls back to the database's own
+    rating, and caches the answers in `reports\osv-cache.json` for 7 days. When OSV cannot be
+    reached, a cached answer is used, otherwise Unknown (= High). `MAL-*` is always Critical.
+  - **Findings and due dates:** every advisory on a published version is a finding in the
+    catalog with `first_seen`, a severity and a due date (`DueDaysCritical/High/Medium/Low`,
+    3/7/30/90 days). Re-rating moves the due date; a failed lookup never downgrades a known
+    severity. New, re-rated, resolved and reopened findings go into the history.
+  - **Stateful alerts and escalation:** the weekly check alerts a finding when it is new, when it
+    becomes overdue, every `OverdueReminderDays` (7) while overdue, when its waiver ends, and once
+    when it is resolved. The alert lists every open finding, most urgent first, with Severity, Fix
+    by and Status columns. A finding is marked as alerted only after delivery.
+  - **Waivers:** `config\waivers.json`, one advisory for one exact version, a reason and an expiry
+    of at most `WaiverMaxDays` (90). Managed from a package's History in the UI (and listed on the
+    Denylist tab). Waived findings are not alerted and do not make the exit code 1.
+  - **Malware advisories:** a published version with an unwaived `MAL-*` finding is quarantined
+    and denylisted under `AutoQuarantine` (weekly check and update run).
+  - **Unverified and heartbeat:** a published version without a completed audit for
+    `AuditFreshnessDays` (8) is alerted as `Unverified`; the weekly check records
+    `scheduled_check_utc` in the catalog, and the UI (banner) and `Update-Wheelhouse.ps1` (log
+    warning) say when it has not run for that long.
+  - **Untracked wheels** are moved to `_untracked\<time>\` under `AutoQuarantine` (never on
+    first-time setup, which adopts them), with an `Untracked` notice.
+- **Deviations from the design above, on purpose:**
+  - Waivers are applied to the catalog's findings, not passed to pip-audit as `--ignore-vuln`:
+    that flag is global per run and would hide the advisory for every version of the package.
+  - Alert state is kept on each finding in `catalog.json` (`notified`, `notified_utc`) instead of a
+    separate `alert-state.json`, so it is written under the same lock as the findings.
+  - A `MAL-*` advisory quarantines the affected version only, not `name==*`: OSV lists the
+    affected versions, and a hijacked release of a legitimate package should not block the
+    package's clean versions. Other affected versions are flagged by their own audit.
+  - *Flagged*, *Waived*, *Overdue* and *Unverified* are derived from findings and audit times,
+    not stored catalog states; the stored states stay Published / Quarantined / Removed.
+  - There is no separate optional weekly digest: each alert already lists every open finding.
+- **Still to do:** `advisories.json` / `index.html` on the share (section 4.6, together with the
+  client check script in Phase 4); a stateful alert for the update pipeline (it still alerts
+  every vulnerable deployed audit); the `whm monitor` name belongs to Phase 4 (`Test-Wheelhouse.ps1`
+  stays the entry point).
 
 - `Invoke-WhMonitor` with every signal in section 4.2, plus the policy settings.
 - Severity enrichment and due dates; Unverified state, heartbeat, escalation.
@@ -580,9 +616,9 @@ depends on the catalog. After that, 3, 4 and 5 can be reordered by priority.
 | # | Question | Recommendation |
 |---|---|---|
 | D1 | Do clients install with `-r requirements-N.txt`, or only by name against the flat index? This decides whether group files must stay stable and whether named sets are worth building. | **Answered:** clients do use `-r requirements-N.txt`. Group files stay stable and are never regenerated (Phase 1). |
-| D2 | Should auto-quarantine be on by default? | **Answered:** yes, with a switch in the UI and on the command line: setting `AutoQuarantine` (default on), `-AutoQuarantine On|Off` per run. Today it covers wheels removed or changed on the share; Phase 2 adds malware advisories (and optionally a severity threshold) under the same switch. |
+| D2 | Should auto-quarantine be on by default? | **Answered:** yes, with a switch in the UI and on the command line: setting `AutoQuarantine` (default on), `-AutoQuarantine On|Off` per run. It covers wheels removed or changed on the share, malicious-package advisories (`MAL-*`) and untracked wheels (moved to `_untracked\`). An optional severity threshold for automatic quarantine was not built - overdue findings escalate by alert instead. |
 | D3 | Is a separate approver required (four-eyes), or can the requester approve their own proposal? | Configurable, default "same person allowed, recorded". |
-| D4 | Can the manager server reach `api.osv.dev` (for severity) as well as `pypi.org`? | **Open.** Explained: pip-audit gives no severity; OSV returns it per advisory ID (only the ID is sent). With the default `osv` service, pip-audit already queries `api.osv.dev`. Without it, every advisory counts as High. |
+| D4 | Can the manager server reach `api.osv.dev` (for severity) as well as `pypi.org`? | **Answered: yes.** Severities are looked up per advisory ID and cached; if OSV is unreachable in a run, cached answers are used and unknown ones count as High (Phase 2). |
 | D5 | Should a scheduled task re-scan the wheelhouse with Defender? | **Answered: no.** Virus scanning of the share is the file server antivirus' job and out of scope. Defender scanning a share also runs as the computer account and may skip network files, so such scans were removed. The tool scans new downloads locally at intake, offers on-demand scans of hash-checked local copies, and detects wheels the file server's antivirus removed or changed (integrity check -> `FileMissing`/`FileModified`, taken out with `AutoQuarantine`). |
 | D6 | Does uv's flat index ignore subfolders (needed for `_staging`, `_untracked`, `_quarantine`)? Today's `_quarantine` already relies on this. | Verify with the deployed uv version before Phase 0. |
 | D7 | Should alerts also go to Teams/Slack or the Event Log? | Webhook + Event Log in Phase 5. |

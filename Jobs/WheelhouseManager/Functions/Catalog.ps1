@@ -14,6 +14,12 @@
 #                    services: { <service>: { status; last_run; vulnerabilities[]; last_error; error } } }
 #   checks.scan  = { status Clean|Threat; last_run; threat_files[] }
 #   checks.pypi  = { status Ok|Yanked; last_run; reason }
+#   findings[]   = one per advisory the audits report: { id; aliases[]; summary; fix_versions[];
+#                  severity Critical|High|Medium|Low|Unknown; score; severity_source;
+#                  first_seen; due; resolved_utc; waiver { reason; by; expires_utc } | null;
+#                  notified (the level last alerted: New|Overdue|Waived|Resolved); notified_utc }
+# Document: schema, updated_utc, scheduled_check_utc (last completed Test-Wheelhouse.ps1 run),
+# packages[].
 # History: one JSON object per line - ts, user, action, package, version, detail.
 #
 # Only write either file while holding the write lock (Open-WheelhouseWrite).
@@ -99,6 +105,39 @@ function ConvertTo-CatalogCheck {
     }
 }
 
+function ConvertTo-CatalogFinding {
+    # One finding with every property present and ISO timestamps (see the header).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $InputObject
+    )
+
+    $waiver = $null
+    if ($InputObject.waiver -and $InputObject.waiver.expires_utc) {
+        $waiver = [ordered]@{
+            reason      = [string]$InputObject.waiver.reason
+            by          = [string]$InputObject.waiver.by
+            expires_utc = ConvertTo-IsoTimestamp -Value $InputObject.waiver.expires_utc
+        }
+    }
+    return [PSCustomObject]@{
+        id              = [string]$InputObject.id
+        aliases         = @(@($InputObject.aliases) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        summary         = [string]$InputObject.summary
+        fix_versions    = @(@($InputObject.fix_versions) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        severity        = $(if ($InputObject.severity) { [string]$InputObject.severity } else { 'Unknown' })
+        score           = $(if ($null -ne $InputObject.score -and "$($InputObject.score)" -ne '') { [double]$InputObject.score } else { $null })
+        severity_source = [string]$InputObject.severity_source
+        first_seen      = ConvertTo-IsoTimestamp -Value $InputObject.first_seen
+        due             = ConvertTo-IsoTimestamp -Value $InputObject.due
+        resolved_utc    = ConvertTo-IsoTimestamp -Value $InputObject.resolved_utc
+        waiver          = $waiver
+        notified        = [string]$InputObject.notified
+        notified_utc    = ConvertTo-IsoTimestamp -Value $InputObject.notified_utc
+    }
+}
+
 function ConvertTo-CatalogRecord {
     # A catalog record with every property present (an older catalog.json may lack some),
     # so callers can assign properties without checking first.
@@ -118,6 +157,7 @@ function ConvertTo-CatalogRecord {
         groups        = @(foreach ($group in @($InputObject.groups)) { if ($group) { [string]$group } })
         files         = @(foreach ($file in @($InputObject.files)) { if ($file) { [string]$file } })
         published_utc = ConvertTo-IsoTimestamp -Value $InputObject.published_utc
+        findings      = @(foreach ($finding in @($InputObject.findings)) { if ($finding -and $finding.id) { ConvertTo-CatalogFinding -InputObject $finding } })
         checks        = [PSCustomObject]@{
             audit = ConvertTo-CatalogCheck -Kind 'audit' -Check $(if ($checks) { $checks.audit } else { $null })
             scan  = ConvertTo-CatalogCheck -Kind 'scan' -Check $(if ($checks) { $checks.scan } else { $null })
@@ -155,7 +195,7 @@ function New-CatalogRecord {
 }
 
 function Read-WheelhouseCatalog {
-    # Returns { Path; WheelhousePath; Exists; Records } - Records maps "name==version" to a
+    # Returns { Path; WheelhousePath; Exists; Records; ScheduledCheckUtc } - Records maps "name==version" to a
     # record. A missing file gives an empty catalog (Exists = $false); a damaged one
     # throws - it is never read as empty.
     [CmdletBinding()]
@@ -166,6 +206,7 @@ function Read-WheelhouseCatalog {
 
     $path = Get-WheelhouseCatalogPath -WheelhousePath $WheelhousePath
     $records = [ordered]@{}
+    $scheduledCheck = ''
     $exists = Test-Path -Path $path
     if ($exists) {
         $content = Get-Content -Path $path -Raw -ErrorAction Stop
@@ -179,6 +220,7 @@ function Read-WheelhouseCatalog {
             if ([int]$parsed.schema -gt $script:CatalogSchemaVersion) {
                 throw "catalog.json was written by a newer version of the wheelhouse manager (schema $($parsed.schema)). Update this installation with Setup.ps1."
             }
+            $scheduledCheck = ConvertTo-IsoTimestamp -Value $parsed.scheduled_check_utc
             foreach ($item in @($parsed.packages)) {
                 if ($null -eq $item) { continue }
                 $record = ConvertTo-CatalogRecord -InputObject $item
@@ -186,7 +228,7 @@ function Read-WheelhouseCatalog {
             }
         }
     }
-    return [PSCustomObject]@{ Path = $path; WheelhousePath = $WheelhousePath; Exists = $exists; Records = $records }
+    return [PSCustomObject]@{ Path = $path; WheelhousePath = $WheelhousePath; Exists = $exists; Records = $records; ScheduledCheckUtc = $scheduledCheck }
 }
 
 function Save-WheelhouseCatalog {
@@ -198,9 +240,10 @@ function Save-WheelhouseCatalog {
 
     $packages = @($Catalog.Records.Keys | Sort-Object | ForEach-Object { $Catalog.Records[$_] })
     $document = [ordered]@{
-        schema      = $script:CatalogSchemaVersion
-        updated_utc = (Get-Date).ToUniversalTime().ToString('o')
-        packages    = $packages
+        schema              = $script:CatalogSchemaVersion
+        updated_utc         = (Get-Date).ToUniversalTime().ToString('o')
+        scheduled_check_utc = $(if ($Catalog.PSObject.Properties['ScheduledCheckUtc']) { [string]$Catalog.ScheduledCheckUtc } else { '' })
+        packages            = $packages
     }
     if ($PSCmdlet.ShouldProcess($Catalog.Path, 'Save catalog')) {
         Write-JsonFile -Path $Catalog.Path -InputObject $document -Depth 12
@@ -486,6 +529,9 @@ function Update-CatalogAuditResult {
     # configured service reports a vulnerability, Passed only if every configured service
     # passed, Unknown otherwise. A change of the overall status goes into the history.
     # Versions the catalog does not know (e.g. rejected candidates) are skipped.
+    # The record's findings follow its vulnerabilities (Update-CatalogRecordFinding), with
+    # the severities from -Severity (Get-AuditResultSeverity) and due dates from -DueDays;
+    # -Waiver (Read-WheelhouseWaiver) is then applied to every record.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -495,7 +541,15 @@ function Update-CatalogAuditResult {
         [AllowEmptyCollection()]
         [object[]]$AuditResult,
 
-        [string[]]$Services = @('osv', 'pypi')
+        [string[]]$Services = @('osv', 'pypi'),
+
+        # Advisory ID -> { Severity; Score; Source; Error }.
+        [hashtable]$Severity = @{},
+
+        [hashtable]$DueDays = (Get-WheelhouseDueDayTable),
+
+        [AllowEmptyCollection()]
+        [object[]]$Waiver
     )
 
     if (-not $PSCmdlet.ShouldProcess($Catalog.Path, 'Record audit results')) { return }
@@ -505,6 +559,8 @@ function Update-CatalogAuditResult {
     # a new last_run / last_ok - a failed audit must never look like a fresh pass.
     $completed = [System.Collections.Generic.HashSet[string]]::new()
     $maps = @{}
+    # "name==version" -> advisory ID -> { aliases; summary; fix_versions } from the reports.
+    $details = @{}
     $getMap = {
         param($Key)
         if (-not $maps.ContainsKey($Key)) { $maps[$Key] = Get-CatalogServiceMap -Record $Catalog.Records[$Key] }
@@ -521,6 +577,17 @@ function Update-CatalogAuditResult {
                 $key = "$(Get-NormalizedPackageName $dependency.name)==$($dependency.version)"
                 if (-not $Catalog.Records.Contains($key)) { continue }
                 $ids = @(@($dependency.vulns) | Where-Object { $_ } | ForEach-Object { [string]$_.id } | Select-Object -Unique)
+                if (-not $details.ContainsKey($key)) { $details[$key] = @{} }
+                foreach ($vuln in @($dependency.vulns)) {
+                    if ($null -eq $vuln -or -not $vuln.id) { continue }
+                    $summary = [string]$vuln.description
+                    if ($summary.Length -gt 300) { $summary = $summary.Substring(0, 297) + '...' }
+                    $details[$key][[string]$vuln.id] = @{
+                        aliases      = @(@($vuln.aliases) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+                        summary      = $summary
+                        fix_versions = @(@($vuln.fix_versions) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+                    }
+                }
                 $map = & $getMap $key
                 $map[$service] = [ordered]@{
                     status          = $(if ($ids.Count -gt 0) { 'Vulnerable' } else { 'Passed' })
@@ -575,6 +642,321 @@ function Update-CatalogAuditResult {
             $detail = "$previousStatus -> $status" + $(if (@($vulnerabilities).Count -gt 0) { ": $(@($vulnerabilities) -join ', ')" } else { '' })
             Write-WheelhouseEvent -WheelhousePath $Catalog.WheelhousePath -Action 'AuditChanged' -Package $record.name -Version $record.version -Detail $detail
         }
+        $findingParams = @{
+            Catalog  = $Catalog
+            Record   = $record
+            Id       = [string[]]@($vulnerabilities)
+            Detail   = $(if ($details.ContainsKey($key)) { $details[$key] } else { @{} })
+            Severity = $Severity
+            DueDays  = $DueDays
+        }
+        Update-CatalogRecordFinding @findingParams
+    }
+    if ($PSBoundParameters.ContainsKey('Waiver')) {
+        Set-CatalogFindingWaiver -Catalog $Catalog -Waiver $Waiver
+    }
+}
+
+function Update-CatalogRecordFinding {
+    # Brings a record's findings in line with the advisories its audits report now (-Id):
+    # a new advisory becomes a finding (first_seen now), a known one keeps its first_seen
+    # and gets the latest details and severity, one no longer reported is marked resolved
+    # (it is dropped once the resolution has been alerted, Set-CatalogFindingNotified).
+    # The due date is first_seen plus -DueDays for the severity, so it follows both a
+    # re-rated advisory and changed settings. New, resolved and re-rated findings go into
+    # the history. A failed lookup (Unknown with an Error) never replaces a known severity.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        $Catalog,
+
+        [Parameter(Mandatory)]
+        $Record,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Id,
+
+        # Advisory ID -> { aliases; summary; fix_versions }.
+        [hashtable]$Detail = @{},
+
+        [hashtable]$Severity = @{},
+
+        [hashtable]$DueDays = (Get-WheelhouseDueDayTable)
+    )
+
+    if (-not $PSCmdlet.ShouldProcess("$($Record.name)==$($Record.version)", 'Update findings')) { return }
+    $now = (Get-Date).ToUniversalTime()
+    $nowText = $now.ToString('o')
+    $current = @{}
+    foreach ($item in $Id) { if ($item) { $current[$item] = $true } }
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $known = @{}
+    foreach ($finding in @($Record.findings)) {
+        if ($null -eq $finding) { continue }
+        $findings.Add($finding)
+        $known[$finding.id] = $finding
+    }
+    $wheelhousePath = $Catalog.WheelhousePath
+    $log = {
+        param($Action, $Text)
+        Write-WheelhouseEvent -WheelhousePath $wheelhousePath -Action $Action -Package $Record.name -Version $Record.version -Detail $Text
+    }
+
+    foreach ($item in @($current.Keys | Sort-Object)) {
+        $finding = $known[$item]
+        $isNew = -not $finding
+        if ($isNew) {
+            $finding = ConvertTo-CatalogFinding -InputObject ([PSCustomObject]@{ id = $item; first_seen = $nowText })
+            $findings.Add($finding)
+        }
+        elseif ($finding.resolved_utc) {
+            # Reported again: open again, and alerted again as new.
+            $finding.resolved_utc = ''
+            $finding.notified = ''
+            $finding.notified_utc = ''
+            & $log 'FindingReopened' "$item is reported again"
+        }
+        if ($Detail.ContainsKey($item)) {
+            $info = $Detail[$item]
+            if (@($info.aliases).Count -gt 0) { $finding.aliases = @($info.aliases) }
+            if ($info.summary) { $finding.summary = [string]$info.summary }
+            $finding.fix_versions = @($info.fix_versions)
+        }
+        $previousSeverity = $finding.severity
+        if ($Severity.ContainsKey($item)) {
+            $looked = $Severity[$item]
+            $failed = $looked.Severity -eq 'Unknown' -and $looked.Error
+            if (-not ($failed -and $finding.severity -ne 'Unknown')) {
+                $finding.severity = [string]$looked.Severity
+                $finding.score = $looked.Score
+                $finding.severity_source = [string]$looked.Source
+            }
+        }
+        $firstSeen = ConvertTo-OptionalUtcDateTime -Value $finding.first_seen
+        if (-not $firstSeen) { $firstSeen = $now; $finding.first_seen = $nowText }
+        $days = if ($DueDays.ContainsKey($finding.severity)) { [int]$DueDays[$finding.severity] } else { [int]$DueDays['High'] }
+        $finding.due = $firstSeen.AddDays($days).ToString('o')
+        if ($isNew) {
+            & $log 'FindingNew' "$item ($($finding.severity)), due $($finding.due.Substring(0, 10))"
+        }
+        elseif ($previousSeverity -ne $finding.severity) {
+            & $log 'SeverityChanged' "${item}: $previousSeverity -> $($finding.severity), due $($finding.due.Substring(0, 10))"
+        }
+    }
+
+    foreach ($finding in $findings) {
+        if ($current.ContainsKey($finding.id) -or $finding.resolved_utc) { continue }
+        $finding.resolved_utc = $nowText
+        & $log 'FindingResolved' "$($finding.id) is no longer reported"
+    }
+    $Record.findings = @($findings | Sort-Object id)
+}
+
+function Set-CatalogFindingWaiver {
+    # Applies the waivers (Read-WheelhouseWaiver) to every open finding: an unexpired
+    # waiver for the same version and advisory is copied onto the finding; a waiver that
+    # expired or was removed is taken off. Both changes go into the history.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        $Catalog,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Waiver
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Catalog.Path, 'Apply waivers')) { return }
+    $now = (Get-Date).ToUniversalTime()
+    foreach ($record in @($Catalog.Records.Values)) {
+        foreach ($finding in @($record.findings)) {
+            if ($null -eq $finding -or $finding.resolved_utc) { continue }
+            $match = Get-WaiverMatch -Name $record.name -Version $record.version -Id $finding.id -Waiver $Waiver -NowUtc $now
+            $had = $finding.waiver
+            if ($match) {
+                $same = $had -and $had.expires_utc -eq $match.expires_utc -and $had.reason -eq $match.reason
+                if (-not $same) {
+                    $finding.waiver = [ordered]@{ reason = [string]$match.reason; by = [string]$match.added_by; expires_utc = [string]$match.expires_utc }
+                    Write-WheelhouseEvent -WheelhousePath $Catalog.WheelhousePath -Action 'Waived' -Package $record.name -Version $record.version -Detail "$($finding.id) accepted by $($match.added_by) until $($match.expires_utc.Substring(0, 10)): $($match.reason)"
+                }
+            }
+            elseif ($had) {
+                $finding.waiver = $null
+                $expires = ConvertTo-OptionalUtcDateTime -Value $had.expires_utc
+                $why = if ($expires -and $expires -le $now) { 'expired' } else { 'removed' }
+                Write-WheelhouseEvent -WheelhousePath $Catalog.WheelhousePath -Action 'WaiverEnded' -Package $record.name -Version $record.version -Detail "$($finding.id): waiver $why"
+            }
+        }
+    }
+}
+
+function Get-CatalogFindingStatus {
+    # Resolved, Waived, Overdue (past its due date) or Open.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        $Finding,
+
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
+
+    if ($Finding.resolved_utc) { return 'Resolved' }
+    if ($Finding.waiver) { return 'Waived' }
+    $due = ConvertTo-OptionalUtcDateTime -Value $Finding.due
+    if ($due -and $due -le $NowUtc) { return 'Overdue' }
+    return 'Open'
+}
+
+function Get-CatalogFindingAlert {
+    # Every finding of a published version, with what the alert should say about it.
+    # Alerts are stateful: each finding's "notified" holds the level last alerted, so
+    #   AlertReason New           - open, never alerted
+    #               Overdue       - its due date passed since the last alert
+    #               Reminder      - still overdue, last alerted -ReminderDays or more ago
+    #               WaiverExpired - open again after a waiver ended
+    #               Resolved      - no longer reported (alerted once, then dropped)
+    #               $null         - nothing new to say (still open, or waived)
+    # Returns objects shaped like Get-VulnerabilityFinding's (for the alert) plus Key,
+    # Severity, Score, FirstSeen, Due, Status, Level, Notified, AlertReason and Waiver.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Catalog,
+
+        [ValidateRange(1, 3650)]
+        [int]$ReminderDays = 7,
+
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
+
+    foreach ($key in @($Catalog.Records.Keys | Sort-Object)) {
+        $record = $Catalog.Records[$key]
+        if ($record.state -ne 'Published') { continue }
+        $serviceMap = Get-CatalogServiceMap -Record $record
+        foreach ($finding in @($record.findings)) {
+            if ($null -eq $finding) { continue }
+            $services = [System.Collections.Generic.List[string]]::new()
+            foreach ($service in $serviceMap.Keys) {
+                if (@($serviceMap[$service].vulnerabilities) -contains $finding.id) { $services.Add($(if ($service -eq 'osv') { 'OSV' } else { 'PyPI' })) }
+            }
+            $status = Get-CatalogFindingStatus -Finding $finding -NowUtc $NowUtc
+            $level = if ($status -eq 'Open') { 'New' } else { $status }
+            $notifiedUtc = ConvertTo-OptionalUtcDateTime -Value $finding.notified_utc
+            $reason = $null
+            switch ($status) {
+                'Resolved' { if ($finding.notified -and $finding.notified -ne 'Resolved') { $reason = 'Resolved' } }
+                'Overdue' {
+                    if ($finding.notified -ne 'Overdue') { $reason = 'Overdue' }
+                    elseif (-not $notifiedUtc -or ($NowUtc - $notifiedUtc).TotalDays -ge $ReminderDays) { $reason = 'Reminder' }
+                }
+                'Open' {
+                    if (-not $finding.notified) { $reason = 'New' }
+                    elseif ($finding.notified -eq 'Waived') { $reason = 'WaiverExpired' }
+                }
+            }
+            [PSCustomObject]@{
+                Key            = $key
+                Package        = $record.name
+                NormalizedName = $record.name
+                Version        = $record.version
+                VulnId         = $finding.id
+                Aliases        = @($finding.aliases) -join ', '
+                Description    = $finding.summary
+                FixVersions    = @($finding.fix_versions) -join ', '
+                Services       = $services
+                GroupFiles     = [System.Collections.Generic.List[string]]::new([string[]]@($record.groups))
+                Deployed       = $true
+                Severity       = $finding.severity
+                Score          = $finding.score
+                FirstSeen      = $finding.first_seen
+                Due            = $finding.due
+                Status         = $status
+                Level          = $level
+                Notified       = $finding.notified
+                AlertReason    = $reason
+                Waiver         = $finding.waiver
+            }
+        }
+    }
+}
+
+function Set-CatalogFindingNotified {
+    # Records that these findings (Get-CatalogFindingAlert output) were alerted - call it
+    # only after the alert was delivered, so a failed delivery is retried by the next run.
+    # A waived finding is marked silently. Resolved findings are dropped once alerted
+    # (or never alerted, or their version is no longer published).
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        $Catalog,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Finding,
+
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Catalog.Path, 'Record alerted findings')) { return }
+    $now = $NowUtc.ToString('o')
+    foreach ($item in $Finding) {
+        if ($null -eq $item -or -not ($item.AlertReason -or ($item.Level -eq 'Waived' -and $item.Notified -ne 'Waived'))) { continue }
+        $record = $Catalog.Records[$item.Key]
+        if (-not $record) { continue }
+        # Not $finding: that is the -Finding parameter (names are case-insensitive).
+        $target = @($record.findings) | Where-Object { $_.id -eq $item.VulnId } | Select-Object -First 1
+        if (-not $target) { continue }
+        $target.notified = $item.Level
+        $target.notified_utc = $now
+    }
+    foreach ($record in @($Catalog.Records.Values)) {
+        $kept = @($record.findings | Where-Object { $_ -and -not ($_.resolved_utc -and ($_.notified -in '', 'Resolved' -or $record.state -ne 'Published')) })
+        if ($kept.Count -ne @($record.findings).Count) { $record.findings = $kept }
+    }
+}
+
+function Get-CatalogUnverifiedRecord {
+    # Published versions whose last completed audit is older than -FreshnessDays (or that
+    # were never audited although published that long ago): their status is no longer
+    # known to be current.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Catalog,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 3650)]
+        [int]$FreshnessDays,
+
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
+
+    $limit = $NowUtc.AddDays(-$FreshnessDays)
+    foreach ($record in @($Catalog.Records.Values)) {
+        if ($record.state -ne 'Published') { continue }
+        $lastRun = if ($record.checks.audit) { ConvertTo-OptionalUtcDateTime -Value $record.checks.audit.last_run } else { $null }
+        if ($lastRun -and $lastRun -ge $limit) { continue }
+        $published = ConvertTo-OptionalUtcDateTime -Value $record.published_utc
+        if (-not $lastRun -and $published -and $published -ge $limit) { continue }
+        $record
+    }
+}
+
+function Get-CatalogMaliciousRecord {
+    # Published versions with an open (not waived, not resolved) malicious-package
+    # advisory (OSV MAL-*): { Record; Ids }.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Catalog
+    )
+
+    foreach ($record in @($Catalog.Records.Values)) {
+        if ($record.state -ne 'Published') { continue }
+        $ids = @($record.findings | Where-Object { $_ -and (Test-MaliciousAdvisoryId -Id $_.id) -and -not $_.resolved_utc -and -not $_.waiver } | ForEach-Object { $_.id })
+        if ($ids.Count -gt 0) { [PSCustomObject]@{ Record = $record; Ids = $ids } }
     }
 }
 

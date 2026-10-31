@@ -105,6 +105,7 @@ is the repo root; tests pass explicit paths (`-ManagerRoot`, `-StagingRoot`, `-S
 |---|---|---|---|
 | `config\settings.psd1` | Setup.ps1, `Set-WheelhouseSetting` (UI) | psd1, keys sorted, written atomically | Warning, defaults are used (`Get-WheelhouseSetting`) |
 | `config\denylist.json` | `Add-/Remove-WheelhouseDenylistEntry` | JSON array (section 11) | **Throws** - never read as empty |
+| `config\waivers.json` | `Add-/Remove-WheelhouseWaiver` (UI, under the write lock) | JSON array (section 11) | **Throws** - never read as empty |
 | `Input\requirements.in` | User, `Add-RequirementInLine` (UI) | pip requirements, unpinned allowed | uv fails |
 | `Input\requirements.txt` | Update-Requirement.ps1 (move of the candidate file) | uv output, exact pins | Unsupported lines are skipped with a warning |
 | `Input\requirements.candidate.txt` / `.rejected.txt` / `.constraints.tmp` | Update-Requirement.ps1 | transient / last rejected result / denylist as `!=` constraints | - |
@@ -124,7 +125,9 @@ is the repo root; tests pass explicit paths (`-ManagerRoot`, `-StagingRoot`, `-S
 | `.wheelhouse.lock` | `Enter-WheelhouseLock -Kind write` | Write lock: exclusive, delete-on-close; content `pid=... user=... started=...`. Held only while files change. |
 | `.wheelhouse-sync.lock` | `Enter-WheelhouseLock -Kind sync` | Held for a whole `Invoke-WheelhouseSync` run - one update at a time. |
 | `_quarantine\quarantine.json`, `_quarantine\<id>\*.whl` | Remove (`-Quarantine`) / Restore | Damaged record file -> **throws** |
+| `_untracked\<yyyyMMdd_HHmmss>\*.whl` | `Move-UntrackedWheelFile` (`AutoQuarantine`) | Wheels found in the folder but not in the manifest, moved out of the index. Never read back by the tool. |
 | `reports\` | Every run | Retention by `Remove-ExpiredReport` (`Log_*.txt`, `Report_*.json`, `Alert_*.html`) |
+| `reports\osv-cache.json` | `Get-VulnerabilitySeverity` | Advisory ID -> severity, refreshed after 7 days. Not removed by retention. Damaged -> rebuilt with a warning (it is only a cache). |
 
 ---
 
@@ -211,7 +214,26 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
 22. **Never assign to a script variable named like a validated parameter.** Variable names are
     case-insensitive and the parameter's `Validate*` attribute rejects the value; at script level
     that error does not stop the script (this silently disabled automatic quarantine once). A test
-    checks every script.
+    checks every script. Inside functions the same clash with a typed parameter (`[object[]]$Finding`
+    vs. a local `$finding`) silently wraps the value in an array - name locals differently.
+23. **A vulnerability is a tracked finding with a deadline.** `Update-CatalogAuditResult` keeps one
+    finding per advisory on the record (`Update-CatalogRecordFinding`): `first_seen` never moves, the
+    due date is `first_seen` + `DueDays<Severity>`, a failed severity lookup never replaces a known
+    severity, and an unknown severity counts as High. Severity comes from OSV
+    (`Get-VulnerabilitySeverity`, only the advisory ID is sent) before the write lock is taken.
+24. **Alerts are stateful.** Each finding records the level last alerted (`notified`). The weekly
+    check alerts a finding when it is new, becomes overdue (again every `OverdueReminderDays`), loses
+    its waiver, or is resolved - and marks it only after the alert was delivered
+    (`Set-CatalogFindingNotified`), so a failed delivery is retried. Notices and failed checks are
+    alerted on every run.
+25. **A waiver accepts one advisory for one exact version until a date** (at most `WaiverMaxDays`).
+    There is no blanket waiver. Waived findings are not alerted and do not make the exit code 1; an
+    expired or removed waiver makes the finding alertable again.
+26. **Automatic actions quarantine, never delete, and are always alerted.** Under `AutoQuarantine`:
+    missing/changed wheels (invariant 21), published versions with an OSV malicious-package advisory
+    (`MAL-*`, `Resolve-MaliciousPackage`; a waived one is left alone) and wheels in the folder that
+    the manifest does not know (`Move-UntrackedWheelFile`, moved to `_untracked\`; never on
+    first-time setup, which adopts them).
 
 ---
 
@@ -261,7 +283,7 @@ flowchart TD
 ## 6. Module internals
 
 **Loading.** `WheelhouseManager.psm1` sets `$script:ManagerRoot` and dot-sources `Common`,
-`Settings`, `Requirements`, `Manifest`, `Catalog`, `Journal`, `Audit`, `Intake`, `Sync`, `Alert`,
+`Settings`, `Requirements`, `Manifest`, `Catalog`, `Journal`, `Audit`, `Vulnerability`, `Intake`, `Sync`, `Alert`,
 `Run`, `Denylist`, `Package`, `Scan`, `Ui` (order is for readability; calls resolve at run time).
 `Ui.ps1` builds `$script:UiRoutes` at load time. The psd1's
 `FunctionsToExport` is the public surface; CI fails if a listed function is missing.
@@ -275,6 +297,7 @@ flowchart TD
 | `CatalogSchemaVersion` | Catalog | Written into `catalog.json`; a newer one is refused |
 | `GroupFilePattern` (`^requirements-(\d+)\.txt$`), `LegacyGroupFileName` | Requirements | What counts as a group file |
 | `AuditReportPattern` | Audit | The single definition of audit report names (writer and readers) |
+| `SeverityLevels` (`Low` .. `Critical`), `VulnerabilityIdPattern` | Vulnerability | Severity order; what an advisory ID may look like (waivers, OSV lookups) |
 | `QuarantineFolderName` (`_quarantine`), `PackageSpecPattern` | Package | Quarantine location; what `requirements.in` lines the UI may add |
 | `UiWebRoot`, `UiStaticFiles`, `UiMimeTypes` | Ui | Static file whitelist |
 | `UiJobs`, `UiJobCounter`, `UiMaxJobHistory` (30), `UiShutdown` | Ui | In-memory job list and server state (one UI process) |
@@ -327,7 +350,8 @@ Exit: 0 written; 1 uv or the pip check rejected the result; 2 missing input / py
 Parameters: `WheelhousePath`, `LocalRequirementsPath` (`""` = no merge), `PythonVersion`,
 `Platform`, `MinimumPackageAgeDays`, `VulnerabilityServices`, `ExpeditePackage` (`name==ver`,
 array or comma string, parsed by `ConvertTo-WheelhousePin`), `ExpediteReason` (required with it).
-Also resolves `ReportRetentionMonths`, `RequireDefenderScanAtIntake`. The script only frames the
+Also resolves `ReportRetentionMonths`, `RequireDefenderScanAtIntake`, `DueDays*`,
+`AuditFreshnessDays`. The script only frames the
 run (transcript, `Confirm-PythonAndTooling`, exit code); `Invoke-WheelhouseSync` does the work -
 sequence in [9.2](#92-the-update-run-invoke-wheelhousesync). Output: AuditResults then Notices. Exit: 0; 1
 rejection / vulnerable deployed audit / wheel taken out because it was missing or changed on the share;
@@ -337,17 +361,19 @@ busy. `-AutoQuarantine On|Off` overrides the setting for the run.
 ### 7.5 `Test-Wheelhouse.ps1` (Scheduled Task)
 Parameters: `WheelhousePath`, `VulnerabilityServices`, `AutoQuarantine` (On/Off), `SmtpServer`,
 `MailTo`, `MailFrom` (renamed to `To`/`From` for the alert). Also resolves `PythonVersion`,
-`Platform`, `ReportRetentionMonths`, `AutoQuarantine` (setting). It changes the wheelhouse only to
-take out wheels missing or changed on the share (write lock, `AutoQuarantine` on); otherwise it
-writes reports, catalog and history only. No administrator rights needed. Sequence in [9.3](#93-the-scheduled-re-check-test-wheelhouseps1). Exit: 0; 1 findings;
-2 aborted, a check incomplete, the alert failed, or the results could not be recorded in the catalog.
-Records audits and PyPI results with `Update-WheelhouseCatalog` (write lock, waits up to
-300 s).
+`Platform`, `ReportRetentionMonths`, `AutoQuarantine` (setting), `DueDays*`, `AuditFreshnessDays`,
+`OverdueReminderDays`. Under `AutoQuarantine` it changes the wheelhouse for the automatic actions of
+invariant 26 (write lock); otherwise it writes reports, catalog and history only. No administrator
+rights needed. Sequence in [9.3](#93-the-scheduled-re-check-test-wheelhouseps1). Exit: 0 (also when
+every open finding is waived); 1 open findings or notices; 2 aborted, a check incomplete, the alert
+failed, or the results could not be recorded in the catalog. Records audits, severities, PyPI results
+and its heartbeat (`ScheduledCheckUtc`) with `Update-WheelhouseCatalog` (write lock, waits up to 300 s).
 
 ### 7.6 `Test-WheelhousePackage.ps1`
 `-Package` pins (validated by regex, must be in the manifest) -> `Invoke-PackageAudit -Stage
 Manual` (report group `selection`); none -> `Invoke-GroupAudit -Stage Manual` per group. Emits
-AuditResults, no alert, records the results in the catalog. Exit 1 vulnerable, 2 audit error,
+AuditResults, no alert, records the results (with severities, due dates and waivers) in the
+catalog. Exit 1 vulnerable, 2 audit error,
 abort, or results not recorded.
 
 ### 7.7 `Invoke-WheelhouseScan.ps1`
@@ -359,9 +385,10 @@ the catalog. Exit 1 `Threat`, 2 `Error`, a wheel not scanned (`NotScanned`), abo
 recorded.
 
 ### 7.8 `Send-VulnerabilityAlert.ps1`
-`-ReportPaths`, `-AuditErrors`, `-Notices` (at least one), `-WheelhousePath`, `-SmtpServer`,
-`-To`, `-From`, `-OutputHtmlPath`. `Get-VulnerabilityFinding` + `ConvertTo-VulnerabilityAlertHtml`;
-subject by content (vulnerabilities / notices / errors only). SMTP set -> `Send-MailMessage`,
+`-ReportPaths`, `-Findings` (tracked findings from `Get-CatalogFindingAlert`), `-AuditErrors`,
+`-Notices` (at least one), `-WheelhousePath`, `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath`.
+`Get-VulnerabilityFinding` + `-Findings` -> `ConvertTo-VulnerabilityAlertHtml`; subject by content
+(open findings with the overdue count / resolved only / notices / errors only). SMTP set -> `Send-MailMessage`,
 else HTML file. Exit 0 sent/saved/nothing to report, 2 no input or delivery failed. Invoked
 in-process only (notices are objects).
 
@@ -391,6 +418,7 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Open-WheelhouseWrite` | write lock + `Repair-WheelhouseJournal`; releases the lock if the repair fails | `FileStream` | every writer |
 | `Get-WheelhouseExitCode` | `-Outcome Ok/Attention/Error/Busy` -> 0/1/2/3; `-ErrorRecord` -> 3 if lock busy else 2 | int | every job script |
 | `ConvertTo-UtcDateTime` | JSON date (text on 5.1, `[datetime]` on 7) -> UTC `[datetime]` | datetime | PyPI parsing, intake |
+| `ConvertTo-OptionalUtcDateTime` | the same for values that may be missing: `$null` for empty or unreadable input | datetime / `$null` | catalog findings, waivers, OSV cache |
 | `ConvertTo-WheelhouseBoolean` | setting (`[bool]`) or command line (`On`/`Off`, `True`, `1`, `Yes`) -> `[bool]` | bool | scripts (`-AutoQuarantine`) |
 
 ### 8.2 `Settings.ps1`
@@ -468,8 +496,8 @@ Columns: purpose | returns / side effects | callers. All are exported.
 |---|---|---|---|
 | `New-WheelhouseNotice` | `Wheelhouse.Notice` with a default `Action` per `Kind` | object | worker, scheduled check, `Get-DeployedPackageNotice` |
 | `Get-VulnerabilityFinding` | one finding per `name|version|vulnId` across reports; `Deployed` = seen in a non-candidate report; unreadable reports -> `Errors` | `@{ Findings; Errors }` | alert script |
-| `ConvertTo-VulnerabilityAlertHtml` | sections: notices, findings with recommended actions, failed audits/checks | string | alert script |
-| `Get-VulnerabilityAlertParameter` | AuditResults + `-Notice` + `-CheckError` -> alert parameters; `$null` if nothing to report | hashtable / `$null` | pipeline, scheduled check |
+| `ConvertTo-VulnerabilityAlertHtml` | sections: notices, findings with recommended actions (tracked findings add Severity, Fix by and Status columns, most urgent first), resolved findings, failed audits/checks | string | alert script |
+| `Get-VulnerabilityAlertParameter` | AuditResults + `-Notice` + `-CheckError` (+ `-Finding`: tracked findings replace the Vulnerable reports; alert only if one has an `AlertReason`, then list every open one) -> alert parameters; `$null` if nothing to report | hashtable / `$null` | pipeline, scheduled check |
 
 ### 8.8 `Run.ps1`
 
@@ -498,12 +526,15 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Get-WheelhouseQuarantinePath` | `<wh>\_quarantine` | quarantine functions |
 | `Get-PackageAuditStatus` | latest audit per pin from report files (newest first, <= 300 files, stops when every pin was seen by every `-Services`); default `Unknown` | inventory |
 | `Get-PackageScanStatus` | latest Defender result per file from `Report_Scan_*` (<= 50, `Error` reports skipped; covered = file or wheelhouse folder scanned) | inventory |
-| `Get-WheelhousePackage` | inventory rows (manifest x groups x catalog checks x denylist; report parsing only when no catalog exists yet) + groups + untracked | UI `GET /api/packages` |
+| `ConvertTo-WheelhouseUiFinding` | a record's unresolved findings for the UI (`id`, `severity`, `score`, `due`, `status` Open/Overdue/Waived, `waiver`, `fix_versions`) | inventory, UI history |
+| `Get-WheelhousePackage` | inventory rows (manifest x groups x catalog checks and findings x denylist; report parsing only when no catalog exists yet) + groups + untracked + `ScheduledCheckUtc` | UI `GET /api/packages` |
 | `Invoke-PackageAudit` | audit chosen pins via a temporary `selection.txt` | Test-WheelhousePackage |
 | `Remove-RequirementFromGroupFile` | remove one pin and its `--hash` continuation lines, atomically | remove |
 | `Read-QuarantineRecord` / `Save-QuarantineRecord` / `Get-QuarantinedPackage` | `quarantine.json` | remove, restore, UI |
 | `Remove-WheelhousePackage` | section 9.5 (write lock, journal, undo, catalog + history; "taken out" instead of "deleted" when the wheels were already gone); `-Quarantine`, `-Reason`, `-NoDenylist`, `-DenylistPath`, `-LockHeld` | UI, `Resolve-WheelhouseIntegrityProblem` |
 | `Resolve-WheelhouseIntegrityProblem` | per version: with `-AutoQuarantine` take out a missing one / quarantine a modified one (both denylisted); without it change nothing; call under the write lock | `Wheelhouse.Notice` (`FileMissing`/`FileModified`) | `Invoke-WheelhouseSync`, scheduled check |
+| `Move-UntrackedWheelFile` | with `-AutoQuarantine` move wheels not in the manifest to `_untracked\<ts>\` (history `UntrackedMoved`); without it report only; nothing on an empty manifest; one `Untracked` notice; call under the write lock | `Invoke-WheelhouseSync`, scheduled check |
+| `Resolve-MaliciousPackage` | published versions with an open, unwaived `MAL-*` finding: with `-AutoQuarantine` quarantine (denylisted); one `Malicious` notice per version; call under the write lock | `Invoke-WheelhouseSync`, scheduled check |
 | `Restore-WheelhousePackage` | section 9.5 (verify, journal, `Complete-WheelhouseRestoreJournal`, catalog + history); `-KeepDenylist` | UI |
 | `Test-PackageSpec` | allowed `requirements.in` line (name, extras, version operators; <= 200 chars) | `Add-RequirementInLine` |
 | `Add-RequirementInLine` | append valid, new, non-denylisted specs | UI add |
@@ -538,8 +569,16 @@ request), `Assert-WheelhouseUiConfigured`, `Get-UiBodyValue`, `Resolve-UiPackage
 | `Write-WheelhouseEvent` / `Read-WheelhouseEvent` | append one history line (failure only warns) / newest first, filter by package and version, skip bad lines | writers / UI history |
 | `Set-CatalogRecordState` | change state, `state_since`, reason; history entry unless `-NoEvent` | sync, `Set-WheelhouseCatalogState` |
 | `Sync-WheelhouseCatalog` | reconcile with manifest, group files, quarantine; a new catalog imports the latest reports and quarantine records | every catalog update |
-| `Get-CatalogServiceMap` | a record's per-service audit results as an ordered hashtable | `Update-CatalogAuditResult` |
-| `Update-CatalogAuditResult` / `Update-CatalogScanResult` / `Update-CatalogPyPIResult` | record check results; history entry on a status change; failed checks never refresh a status | sync run, checks |
+| `Get-CatalogServiceMap` | a record's per-service audit results as an ordered hashtable | `Update-CatalogAuditResult`, `Get-CatalogFindingAlert` |
+| `Update-CatalogAuditResult` / `Update-CatalogScanResult` / `Update-CatalogPyPIResult` | record check results; history entry on a status change; failed checks never refresh a status. The audit one also takes `-Severity`, `-DueDays`, `-Waiver` and maintains the findings | sync run, checks |
+| `ConvertTo-CatalogFinding` | normalize one finding (every property, ISO timestamps) | records, findings |
+| `Update-CatalogRecordFinding` | invariant 23: add / update / resolve / reopen findings; history `FindingNew`, `SeverityChanged`, `FindingResolved`, `FindingReopened` | `Update-CatalogAuditResult` |
+| `Set-CatalogFindingWaiver` | copy unexpired waivers onto open findings, take ended ones off; history `Waived` / `WaiverEnded` | audit recording, UI waiver routes |
+| `Get-CatalogFindingStatus` | `Resolved` / `Waived` / `Overdue` / `Open` | alerts, UI |
+| `Get-CatalogFindingAlert` | every finding of a published version with `Status`, `Level` and `AlertReason` (`New`, `Overdue`, `Reminder`, `WaiverExpired`, `Resolved` or `$null`), shaped for the alert; `-NowUtc`, `-ReminderDays` | scheduled check |
+| `Set-CatalogFindingNotified` | after delivery: record the alerted level, drop alerted resolved findings | scheduled check |
+| `Get-CatalogUnverifiedRecord` | published versions without a completed audit for `-FreshnessDays` (never-audited ones once published that long) | scheduled check |
+| `Get-CatalogMaliciousRecord` | published versions with an open, unwaived `MAL-*` finding: `{Record; Ids}` | `Resolve-MaliciousPackage`, scheduled check |
 | `Update-WheelhouseCatalog` | write lock (unless `-LockHeld`) + read + sync + `-Update { param($catalog) }` + save | scripts, journal repair, sync run |
 | `Set-WheelhouseCatalogState` | record operation results (`{Name; Version; State; Action; Detail}`) in history and catalog; failure only warns | publish, remove, restore |
 
@@ -559,6 +598,23 @@ request), `Assert-WheelhouseUiConfigured`, `Get-UiBodyValue`, `Resolve-UiPackage
 | Function | Purpose | Callers |
 |---|---|---|
 | `Invoke-WheelhouseSync` | the update run (section 9.2); returns `{Outcome Ok/Attention/Error; AuditResults; Notices; Rejected; Published}`; throws when it cannot start | Update-Wheelhouse.ps1 |
+
+### 8.16 `Vulnerability.ps1`
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Test-WheelhouseVulnerabilityId` / `Test-MaliciousAdvisoryId` | an advisory ID (`PREFIX-...`, <= 100 chars) / an OSV malicious-package ID (`MAL-*`) | waivers, lookups, catalog |
+| `Get-SeverityRank` | Low 1 .. Critical 4; Unknown ranks as High | sorting |
+| `ConvertTo-CvssV3BaseScore` / `ConvertTo-SeverityFromScore` | CVSS 3.0/3.1 base score from a vector (`$null` for v4 or incomplete vectors) / CVSS rating bands | `Get-OsvRecordSeverity` |
+| `Get-OsvRecordSeverity` | MAL -> Critical; else a CVSS 3 vector; else `database_specific`/`ecosystem_specific.severity` (`MODERATE` = Medium); `$null` if none | `Get-VulnerabilitySeverity` |
+| `Get-OsvVulnerability` | `GET https://api.osv.dev/v1/vulns/<id>` (TLS 1.2 on 5.1, 30 s timeout; mock seam) | `Get-VulnerabilitySeverity` |
+| `Get-WheelhouseOsvCachePath` | `<wh>\reports\osv-cache.json` | `Get-AuditResultSeverity` |
+| `Get-VulnerabilitySeverity` | per ID: fresh cache entry, else OSV (the ID, then up to three aliases, GHSA first; 404 tries the next); first network failure -> no more lookups this call, a stale cache entry or `Unknown` with `Error` | `@{ id = {Severity; Score; Source; Error} }` |
+| `Get-AuditAdvisory` / `Get-AuditResultSeverity` | advisory IDs with aliases from the Vulnerable reports / the two combined with the wheelhouse cache (call before taking the write lock) | sync run, checks |
+| `Get-WheelhouseDueDayTable` | `DueDays*` from resolved settings (defaults filled in), `Unknown` = High | scripts, catalog defaults |
+| `Get-WheelhouseWaiverPath` / `Read-WheelhouseWaiver` | `<root>\config\waivers.json` / all waivers incl. expired, normalized; damaged -> throws | scripts, UI |
+| `Get-WaiverMatch` | the unexpired waiver for `name==version` + ID, or `$null` | `Set-CatalogFindingWaiver` |
+| `Add-WheelhouseWaiver` / `Remove-WheelhouseWaiver` | validate (name, exact version, ID, reason, `-Days` <= `-MaxDays`), replace the same key / remove it | UI |
 
 ---
 
@@ -603,7 +659,9 @@ Enter-WheelhouseLock -Kind sync                          (whole run; busy -> exi
 A [write lock]  Read-WheelhouseDenylist; Read-WheelhouseManifest; isBootstrap = (count == 0)
                 Assert-WheelhouseIntegrity -AllowChangedFiles:$AutoQuarantine  (off: missing/changed -> throw)
                     Missing/Modified -> Resolve-WheelhouseIntegrityProblem -AutoQuarantine -> FileMissing/FileModified notices
-                Update-WheelhouseCatalog -LockHeld (reconcile / create)
+                Move-UntrackedWheelFile -AutoQuarantine:$AutoQuarantine -> Untracked notice
+                Update-WheelhouseCatalog -LockHeld (reconcile / create); warn if ScheduledCheckUtc
+                    is missing or older than AuditFreshnessDays; Read-WheelhouseWaiver
                 Get-WheelhouseGroupFile + Read-RequirementFile per group (snapshot)
 B [no lock]     Read-RequirementFile(local); Get-RequirementMergePlan -> additions per group
 C per group (existing first, then new by number):
@@ -614,7 +672,10 @@ C per group (existing first, then new by number):
                 if the group existed and lists pins: Invoke-GroupAudit -Stage Deployed
                 warn about unused -ExpeditePackage; write Report_Rejected_*
 D [write lock]  if isBootstrap and something published: Merge-WheelhouseManifest -PreRunFiles @()
-E [write lock]  catalog: Sync + Update-CatalogAuditResult(all audits)    (no scan of the share)
+E [no lock]     Get-AuditResultSeverity(all audits)                      (OSV, cached)
+  [write lock]  catalog: Sync + Update-CatalogAuditResult(all audits, Severity, DueDays, Waiver)
+                Resolve-MaliciousPackage -AutoQuarantine:$AutoQuarantine -> Malicious notices
+                (no scan of the share)
 Outcome: incomplete -> Error, any failure -> Attention, else Ok
 ```
 
@@ -628,22 +689,33 @@ if manifest not empty: Assert-WheelhouseIntegrity -AllowChangedFiles
     Missing/Modified -> AutoQuarantine on:  Open-WheelhouseWrite (300 s) + Resolve-WheelhouseIntegrityProblem -AutoQuarantine
                         AutoQuarantine off: Resolve-WheelhouseIntegrityProblem (report only)
     -> FileMissing / FileModified notices; published = manifest minus those
+    Move-UntrackedWheelFile (AutoQuarantine on: under the write lock, moved) -> Untracked notice
 Get-WheelhouseGroupFile (always - also with an empty manifest); Get-UndownloadedPin -> warnings
 Get-DeployedPackageNotice(published, denylist) -> Denylisted / Yanked notices, PyPI errors
 Invoke-GroupAudit -Stage Scheduled per group
-Update-WheelhouseCatalog { Update-CatalogAuditResult; Update-CatalogPyPIResult(Checked) }
-    failure -> CheckError (the UI would otherwise show stale results as current)
-Get-VulnerabilityAlertParameter(AuditResults, Notice, CheckError) -> & Send-VulnerabilityAlert.ps1
-exit: incomplete or alert failed -> 2; findings -> 1; else 0
+Get-AuditResultSeverity                                   (no lock; OSV, cached)
+Update-WheelhouseCatalog { Update-CatalogAuditResult(Severity, DueDays, Waiver);
+                           Update-CatalogPyPIResult(Checked); ScheduledCheckUtc = now }
+    failure -> CheckError (the UI would otherwise show stale results as current); the rest of
+    this block is skipped and the Vulnerable reports are alerted as before
+Get-CatalogMaliciousRecord -> Resolve-MaliciousPackage (AutoQuarantine on: write lock) -> Malicious notices
+Get-CatalogUnverifiedRecord(AuditFreshnessDays) -> Unverified notices
+Get-CatalogFindingAlert(OverdueReminderDays)
+Get-VulnerabilityAlertParameter(AuditResults, Notice, CheckError, Finding) -> & Send-VulnerabilityAlert.ps1
+delivered (or nothing to send) -> Update-WheelhouseCatalog { Set-CatalogFindingNotified }
+exit: incomplete or alert failed -> 2; open (unwaived) findings or notices -> 1; else 0
 ```
 
-It changes the wheelhouse only to take out wheels missing or changed on the share (with
-`AutoQuarantine`); every other finding is reported and acting on it is an administrator decision.
+It changes the wheelhouse only for the automatic actions of invariant 26 (with `AutoQuarantine`);
+every other finding is reported and acting on it is an administrator decision.
 
 ### 9.4 Alerting
 
-`Get-VulnerabilityAlertParameter` maps: `Vulnerable` -> `ReportPaths`; `Error` +
-`CheckError` -> `AuditErrors` (`"<group> / <SERVICE>: <message>"`); notices -> `Notices`.
+`Get-VulnerabilityAlertParameter` maps: `Vulnerable` -> `ReportPaths` (or, with `-Finding`, the
+tracked findings -> `Findings`, only when at least one has an `AlertReason`); `Error` +
+`CheckError` -> `AuditErrors` (`"<group> / <SERVICE>: <message>"`); notices -> `Notices`. The
+update pipeline still alerts from the reports (every Vulnerable deployed audit); only the weekly
+check is stateful.
 `Send-VulnerabilityAlert.ps1` -> `Get-VulnerabilityFinding` (group from the report name,
 `-candidates` suffix => blocked before download) -> HTML: notices table, findings table (deployed:
 line to remove + exact wheel files from the manifest; blocked: change `requirements.in`), errors
@@ -697,7 +769,12 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 - Reconciled by every catalog write: state, files and groups follow manifest, group files and
   quarantine; differences produce `Reconciled` or `Discovered` events.
 - Operations record their own changes with a reason (`Published`, `Quarantined`, `Deleted`,
-  `Restored`, `Recovered`); checks record `AuditChanged`, `ScanChanged`, `PyPIChanged`.
+  `Restored`, `Recovered`, `UntrackedMoved`); checks record `AuditChanged`, `ScanChanged`,
+  `PyPIChanged`; findings record `FindingNew`, `SeverityChanged`, `FindingResolved`,
+  `FindingReopened`, `Waived`, `WaiverEnded`.
+- Finding lifecycle: new (first_seen, due) -> alerted (`notified` New) -> overdue (alerted, then
+  reminders) -> waived (silent) -> waiver ended (alerted) -> resolved (alerted once, then dropped).
+  The document-level `scheduled_check_utc` is the weekly check's heartbeat.
 - The UI reads status from the catalog (`Get-WheelhousePackage`) and history from `events.jsonl`
   (`GET /api/packages/<name>/<version>/history`).
 
@@ -725,8 +802,10 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 | Route | Body | Action | Status |
 |---|---|---|---|
 | `GET /api/state` | - | path, configured, reachable, defender, is_admin, python/platform, running job | 200 |
-| `GET /api/packages` | - | `Get-WheelhousePackage` (denylist, configured services) | 200 |
-| `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
+| `GET /api/packages` | - | `Get-WheelhousePackage` (denylist, configured services) + `last_check_utc`, `check_overdue` (no completed weekly check within `AuditFreshnessDays`), `audit_freshness_days` | 200 |
+| `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks, findings) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
+| `GET /api/waivers` | - | every waiver with `expired`, and `max_days` | 200 |
+| `POST /api/waivers/add`, `POST /api/waivers/remove` | `{name, version, id, reason, days}` / `{name, version, id}` | `Add-/Remove-WheelhouseWaiver` + `Set-CatalogFindingWaiver` inside `Update-WheelhouseCatalog -TimeoutSeconds 0` (history at once) | 200 / 400 / 404 / 409 |
 | `POST /api/packages/audit` | `{all}` or `{packages:[{name,version}]}` (<= 500) | job `Test-WheelhousePackage.ps1 [-Package ...]` | 202 |
 | `POST /api/packages/scan` | `{all}` or `{files:[...]}` | job `Invoke-WheelhouseScan.ps1 [-File ...]` | 202 |
 | `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
@@ -745,14 +824,17 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 One IIFE, ES5, no dependencies. `api()` adds the token header and JSON content type; `h()`
 builds DOM nodes (never `innerHTML` with data); `confirmDialog` / `infoDialog` use the page's one
 `<dialog>`. Tabs: Packages (`loadPackages`, `renderPackages`, `runAudit`, `runScan`,
-`removeSelected`, `showHistory` - the per-row History dialog), Add (`renderAdd`, `loadRequirements`, `loadRejected`),
-Quarantine (`loadQuarantine`), Denylist (`loadDenylist`), Settings (`loadSettings`, a form
+`removeSelected`, `showHistory` - the per-row History dialog with the findings table and
+`acceptRisk`), Add (`renderAdd`, `loadRequirements`, `loadRejected`),
+Quarantine (`loadQuarantine`), Denylist (`loadDenylist`, then `loadWaivers`), Settings (`loadSettings`, a form
 generated from the schema), Jobs (`loadJobs`, `watchJob`, `pollJob` every 1.5 s, `jobKind`/
 `jobLabel` for Succeeded/Running/Attention/Failed/Cancelled). The CSP forbids inline scripts and
 external resources - keep everything in these three files. Node is not required; to syntax-check
-`app.js` without a browser, parse it with an ES5 parser (e.g. Python `esprima` in a throw-away
-folder) - Windows' JScript cannot, because the code uses ES5 reserved-word properties (`.catch`,
-`class:`).
+`app.js` without a browser, parse it with any modern JavaScript engine (`new Function(source)` in
+Deno or a browser console) or an ES5 parser (e.g. Python `esprima` in a throw-away folder) -
+Windows' JScript cannot, because the code uses ES5 reserved-word properties (`.catch`, `class:`).
+The package table shows the worst open severity and the fix-by date (or `overdue`), filters
+`overdue` and `waived`, and a banner when `check_overdue` is set. `fmtDay` formats dates only.
 
 ---
 
@@ -769,7 +851,18 @@ folder) - Windows' JScript cannot, because the code uses ES5 reserved-word prope
 (`Passed`/`Vulnerable`/`Error`), `ExitCode`, `ReportPath`, `Message`.
 
 **`Wheelhouse.Notice`**: `Kind` (`Denylisted`, `Yanked`, `FileMissing`, `FileModified`,
-`IntakeBlocked`), `Package`, `Version`, `Files[]`, `Message`, `Action`.
+`IntakeBlocked`, `Malicious`, `Unverified`, `Untracked`), `Package`, `Version`, `Files[]`,
+`Message`, `Action`.
+
+**Tracked finding for the alert** (`Get-CatalogFindingAlert`): the `Get-VulnerabilityFinding` shape
+(`Package`, `NormalizedName`, `Version`, `VulnId`, `Aliases`, `Description`, `FixVersions`,
+`Services`, `GroupFiles`, `Deployed`) plus `Key`, `Severity`, `Score`, `FirstSeen`, `Due`, `Status`,
+`Level`, `Notified`, `AlertReason`, `Waiver`.
+
+**Waiver** (`config\waivers.json`): `name`, `version` (exact), `id` (advisory), `reason`,
+`added_utc`, `added_by`, `expires_utc`.
+
+**OSV cache** (`reports\osv-cache.json`): `{ "<id>": { severity; score; source; fetched_utc } }`.
 
 **`Wheelhouse.ScanResult`**: `Status` (`Clean`/`Threat`/`Error`), `Message`, `ScanTime`,
 `ScannedPaths[]`, `Threats[{Resource; ThreatName; ThreatId; ActionSuccess}]`, `ReportPath`;
@@ -791,9 +884,12 @@ UploadTimeUtc; Yanked; YankedReason}]`, `FirstUploadUtc`, `Yanked`, `YankedReaso
 **Quarantine record**: `id`, `name`, `version`, `files[<manifest entries>]`, `groups[<file names>]`,
 `reason`, `quarantined_utc`, `quarantined_by`, `denylisted`.
 
-**Catalog** (`catalog.json`): `{ schema: 1; updated_utc; packages: [record] }`. Record: `name`,
-`version`, `state` (`Published`/`Quarantined`/`Removed`), `state_since`, `state_reason`,
-`groups[]` (group file names), `files[]`, `published_utc`, `checks`:
+**Catalog** (`catalog.json`): `{ schema: 1; updated_utc; scheduled_check_utc; packages: [record] }`.
+Record: `name`, `version`, `state` (`Published`/`Quarantined`/`Removed`), `state_since`, `state_reason`,
+`groups[]` (group file names), `files[]`, `published_utc`, `findings[]` (`id`, `aliases[]`, `summary`,
+`fix_versions[]`, `severity` Critical|High|Medium|Low|Unknown, `score`, `severity_source`,
+`first_seen`, `due`, `resolved_utc`, `waiver {reason; by; expires_utc}`|null, `notified`
+New|Overdue|Waived|Resolved|'', `notified_utc`), `checks`:
 `audit {status Passed|Vulnerable|Unknown; last_run; last_ok; vulnerabilities[]; services {<service>:
 {status; last_run; vulnerabilities[]; last_error; error}}}`, `scan {status Clean|Threat; last_run;
 threat_files[]}`, `pypi {status Ok|Yanked; last_run; reason}`. Timestamps are ISO 8601 UTC strings.
@@ -877,6 +973,11 @@ Conventions:
   `Repair-WheelhouseJournal` / `Open-WheelhouseWrite`.
 - Never pipe a `-NoEnumerate` reader straight into `ForEach-Object` in a test; assign it first or
   use member access (`(Read-WheelhouseManifest -WheelhousePath $wh).name`).
+- **OSV is never reached from the tests**: the Describe-level `BeforeAll` mocks
+  `Get-OsvVulnerability` to throw (offline: severities become Unknown). The severity tests mock it
+  with `$global:WhmOsvRecords` / `WhmOsvOffline` and record calls in `WhmOsvCalls`. Finding tests
+  drive time with `-NowUtc` on `Get-CatalogFindingAlert` / `Set-CatalogFindingNotified` and record
+  audits with `Write-TestFindingAudit` (a report listing advisory IDs for `attrs==23.1.0`).
 - Defender is faked through `Test-WheelhouseDefenderAvailable`, `Invoke-MpScan`,
   `Get-WheelhouseThreatDetection` (or `Invoke-WheelhouseDefenderScan` as a whole); a wheel removed
   or changed by the file server's antivirus is simulated by deleting or overwriting it; PyPI through
@@ -909,9 +1010,9 @@ venv first on `PATH` so `Confirm-PythonAndTooling` does not change the system Py
 Throw, don't exit. Return `-NoEnumerate` only if callers need an always-array result, and then
 list it in section 13.
 
-**A new setting.** Add the default to `Get-WheelhouseDefaultSetting`; if the UI may edit it, add it
-to `Get-WheelhouseSettingSchema` (type, label, help) and to the name list in
-`Get-WheelhouseUiContext`; add a branch to `ConvertTo-WheelhouseSettingValue` for a new type and to
+**A new setting.** Add the default to `Get-WheelhouseDefaultSetting` (the UI context resolves every
+key listed there); if the UI may edit it, add it to `Get-WheelhouseSettingSchema` (type, label,
+help); add a branch to `ConvertTo-WheelhouseSettingValue` for a new type and to
 `loadSettings` in `app.js`; resolve it in the script with `Resolve-WheelhouseParameter`; document
 it in the README's settings table.
 
@@ -962,7 +1063,10 @@ Which code runs for each user scenario (user steps are in the README):
 | Package history | `GET /api/packages/<name>/<version>/history` -> `Read-WheelhouseCatalog`, `Read-WheelhouseEvent` |
 | Publish + alert | `Invoke-WheelhousePipeline.ps1` -> worker -> `Get-VulnerabilityAlertParameter` -> alert script |
 | Urgent fix | worker `-ExpeditePackage` -> intake `-Expedite` -> `Test-PackageAge -Expedite` + file cooldown skip |
-| Weekly check | `Test-Wheelhouse.ps1` -> 9.3 -> `Get-DeployedPackageNotice`, `Invoke-GroupAudit` -> alert |
+| Weekly check | `Test-Wheelhouse.ps1` -> 9.3 -> `Get-DeployedPackageNotice`, `Invoke-GroupAudit`, `Get-AuditResultSeverity`, `Get-CatalogFindingAlert` -> alert -> `Set-CatalogFindingNotified` |
+| Accept a risk | History dialog -> `POST /api/waivers/add` -> `Add-WheelhouseWaiver` + `Set-CatalogFindingWaiver`; waivers listed on the Denylist tab (`GET /api/waivers`) |
+| Malicious package advisory | check or update: `Get-CatalogMaliciousRecord` -> `Resolve-MaliciousPackage` -> `Remove-WheelhousePackage -Quarantine -LockHeld` |
+| Wheel copied in by hand | check or update: `Move-UntrackedWheelFile` -> `_untracked\<ts>\` |
 | File server antivirus removed/changed a wheel | check or update: `Assert-WheelhouseIntegrity -AllowChangedFiles` -> `Resolve-WheelhouseIntegrityProblem` -> `Remove-WheelhousePackage -LockHeld` |
 | Audit / scan from the UI | `POST /api/packages/audit` or `/scan` -> job -> `Test-WheelhousePackage.ps1` / `Invoke-WheelhouseScan.ps1` |
 | Add from the UI | `POST /api/packages/add` -> `Add-RequirementInLine` -> job `Update-Requirement.ps1`; then `GET /api/requirements` -> `POST /api/wheelhouse/update` |
@@ -974,12 +1078,13 @@ Which code runs for each user scenario (user steps are in the README):
 
 ## 17. Known gaps and glossary
 
-Known gaps (tracked in `REFACTOR_PLAN.md`): the catalog knows `Published`/`Quarantined`/`Removed`
-only - no `Flagged`, `Waived`, `Unverified` or `Pending` states, severity, deadlines or waivers yet;
-untracked wheels are only warned about; alerts are not de-duplicated between runs; integrity
-re-hashes every file every run (and does so under the write lock); `Send-MailMessage` has no authentication; expedite does
-not reach the resolver (`Update-Requirement.ps1` still needs `-MinimumPackageAgeDays 0` for a
-too-new fix).
+Known gaps (tracked in `REFACTOR_PLAN.md`): the catalog states are `Published`/`Quarantined`/`Removed`
+- flagged, waived, overdue and unverified are derived from the findings and audit times rather
+than stored states, and there is no `Pending` (cooldown) state; CVSS 4-only advisories without a
+database rating count as Unknown (= High); the update pipeline's alert is not stateful (only the
+weekly check is); no `advisories.json` for clients yet; integrity re-hashes every file every run (and
+does so under the write lock); `Send-MailMessage` has no authentication; expedite does not reach the
+resolver (`Update-Requirement.ps1` still needs `-MinimumPackageAgeDays 0` for a too-new fix).
 
 | Term | Meaning |
 |---|---|
@@ -989,6 +1094,9 @@ too-new fix).
 | Intake | `Invoke-CandidateIntake`: the checks a candidate passes before publishing |
 | Published | the wheel is in the wheelhouse and the manifest |
 | Notice | `Wheelhouse.Notice`: a non-audit finding for the alert |
+| Finding | one advisory reported for one published version, with severity, due date, waiver and alert state (catalog) |
+| Waiver | an accepted risk for one advisory and one version, until a date (`config\waivers.json`) |
+| Unverified | a published version without a completed audit for `AuditFreshnessDays` |
 | Catalog | `catalog.json`: per-version state and latest check results |
 | Journal | `.journal\*.json`: the intent of a multi-step change, finished after a crash |
 | Write lock / sync lock | `.wheelhouse.lock` (short, every writer) / `.wheelhouse-sync.lock` (one update run at a time) |

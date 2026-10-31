@@ -36,9 +36,7 @@ function Get-WheelhouseUiContext {
 
     $settingsPath = Get-WheelhouseSettingsPath -ManagerRoot $ManagerRoot
     $settings = Get-WheelhouseSetting -SettingsPath $settingsPath
-    $names = @('WheelhousePath', 'RequirementsInPath', 'LocalRequirementsPath', 'PythonVersion', 'Platform',
-        'MinimumPackageAgeDays', 'VulnerabilityServices', 'ReportRetentionMonths', 'SmtpServer', 'MailTo', 'MailFrom',
-        'RequireDefenderScanAtIntake', 'AutoQuarantine')
+    $names = @((Get-WheelhouseDefaultSetting -ManagerRoot $ManagerRoot).Keys)
     $effective = Resolve-WheelhouseParameter -BoundParameters @{} -Name $names -Settings $settings
 
     $wheelhousePath = [string]$effective.WheelhousePath
@@ -47,6 +45,7 @@ function Get-WheelhouseUiContext {
         JobsPath       = (Join-Path $ManagerRoot 'Jobs')
         SettingsPath   = $settingsPath
         DenylistPath   = (Get-WheelhouseDenylistPath -ManagerRoot $ManagerRoot)
+        WaiverPath     = (Get-WheelhouseWaiverPath -ManagerRoot $ManagerRoot)
         Settings       = $effective
         WheelhousePath = $wheelhousePath
         ReportsFolder  = $(if ($wheelhousePath) { Join-Path $wheelhousePath 'reports' } else { '' })
@@ -475,7 +474,17 @@ function Get-WheelhouseUiRoute {
                     Services       = [string[]]@($Context.Settings.VulnerabilityServices)
                 }
                 $inventory = Get-WheelhousePackage @inventoryParams
-                return @{ Status = 200; Body = @{ packages = @($inventory.Packages); groups = @($inventory.Groups); untracked = @($inventory.Untracked) } }
+                $lastCheck = ConvertTo-OptionalUtcDateTime -Value $inventory.ScheduledCheckUtc
+                $freshness = [int]$Context.Settings.AuditFreshnessDays
+                return @{ Status = 200; Body = @{
+                        packages             = @($inventory.Packages)
+                        groups               = @($inventory.Groups)
+                        untracked            = @($inventory.Untracked)
+                        last_check_utc       = [string]$inventory.ScheduledCheckUtc
+                        check_overdue        = [bool](@($inventory.Packages).Count -gt 0 -and (-not $lastCheck -or ((Get-Date).ToUniversalTime() - $lastCheck).TotalDays -gt $freshness))
+                        audit_freshness_days = $freshness
+                    }
+                }
             }
         }
 
@@ -503,6 +512,7 @@ function Get-WheelhouseUiRoute {
                         files         = @($record.files)
                         published_utc = $record.published_utc
                         checks        = $record.checks
+                        findings      = @(ConvertTo-WheelhouseUiFinding -Record $record)
                     }
                 }
                 return @{ Status = 200; Body = @{ name = $name; version = $version; record = $state; events = $events } }
@@ -727,6 +737,74 @@ function Get-WheelhouseUiRoute {
                 param($Context, $Body, $Match)
                 $removed = Remove-WheelhouseDenylistEntry -Name ([string](Get-UiBodyValue -Body $Body -Name 'name')) -Version ([string](Get-UiBodyValue -Body $Body -Name 'version')) -Path $Context.DenylistPath
                 if (-not $removed) { throw [System.Collections.Generic.KeyNotFoundException]::new('No such denylist entry.') }
+                return @{ Status = 200; Body = @{ removed = $true } }
+            }
+        }
+
+        @{
+            Method  = 'GET'
+            Pattern = '^/api/waivers$'
+            Handler = {
+                param($Context, $Body, $Match)
+                $now = (Get-Date).ToUniversalTime()
+                $items = foreach ($entry in (@(Read-WheelhouseWaiver -Path $Context.WaiverPath) | Sort-Object name, version, id)) {
+                    $expires = ConvertTo-OptionalUtcDateTime -Value $entry.expires_utc
+                    @{ name = $entry.name; version = $entry.version; id = $entry.id; reason = $entry.reason; added_utc = $entry.added_utc; added_by = $entry.added_by; expires_utc = $entry.expires_utc; expired = [bool](-not $expires -or $expires -le $now) }
+                }
+                return @{ Status = 200; Body = @{ items = @($items); max_days = [int]$Context.Settings.WaiverMaxDays } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/waivers/add$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $days = 0
+                if (-not [int]::TryParse([string](Get-UiBodyValue -Body $Body -Name 'days'), [ref]$days) -or $days -lt 1) {
+                    throw [System.ArgumentException]::new('Enter for how many days the risk is accepted.')
+                }
+                $waiverParams = @{
+                    Name    = [string](Get-UiBodyValue -Body $Body -Name 'name')
+                    Version = [string](Get-UiBodyValue -Body $Body -Name 'version')
+                    Id      = [string](Get-UiBodyValue -Body $Body -Name 'id')
+                    Reason  = [string](Get-UiBodyValue -Body $Body -Name 'reason')
+                    Days    = $days
+                    MaxDays = [int]$Context.Settings.WaiverMaxDays
+                    Path    = $Context.WaiverPath
+                }
+                # Under the write lock, so the catalog (and its history) shows the waiver at once.
+                # A closure gets its own scope: results come back through this table.
+                $outcome = @{}
+                $waiverPath = $Context.WaiverPath
+                Update-WheelhouseCatalog -WheelhousePath $Context.WheelhousePath -TimeoutSeconds 0 -DenylistPath $Context.DenylistPath -Update ({
+                        param($catalog)
+                        $outcome.Entry = Add-WheelhouseWaiver @waiverParams
+                        Set-CatalogFindingWaiver -Catalog $catalog -Waiver @(Read-WheelhouseWaiver -Path $waiverPath)
+                    }.GetNewClosure())
+                $entry = $outcome.Entry
+                return @{ Status = 200; Body = @{ name = $entry.name; version = $entry.version; id = $entry.id; expires_utc = $entry.expires_utc } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/waivers/remove$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $name = [string](Get-UiBodyValue -Body $Body -Name 'name')
+                $version = [string](Get-UiBodyValue -Body $Body -Name 'version')
+                $id = [string](Get-UiBodyValue -Body $Body -Name 'id')
+                $waiverPath = $Context.WaiverPath
+                $outcome = @{ Removed = $false }
+                Update-WheelhouseCatalog -WheelhousePath $Context.WheelhousePath -TimeoutSeconds 0 -DenylistPath $Context.DenylistPath -Update ({
+                        param($catalog)
+                        $outcome.Removed = Remove-WheelhouseWaiver -Name $name -Version $version -Id $id -Path $waiverPath
+                        Set-CatalogFindingWaiver -Catalog $catalog -Waiver @(Read-WheelhouseWaiver -Path $waiverPath)
+                    }.GetNewClosure())
+                if (-not $outcome.Removed) { throw [System.Collections.Generic.KeyNotFoundException]::new('No such waiver.') }
                 return @{ Status = 200; Body = @{ removed = $true } }
             }
         }

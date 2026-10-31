@@ -33,9 +33,10 @@ CI (`.github/workflows/powershell-tests.yml`) runs on `windows-latest` under **b
 - `Settings`;
 - `Requirements`;
 - `Manifest`;
-- `Catalog`: `<wheelhouse>\catalog.json` (per-version state + latest audit/scan/PyPI results) and `events.jsonl` (history);
+- `Catalog`: `<wheelhouse>\catalog.json` (per-version state, latest audit/scan/PyPI results, vulnerability findings with severity, due date, waiver and alert state; the weekly check's heartbeat) and `events.jsonl` (history);
 - `Journal`: `<wheelhouse>\.journal\` crash safety for publish/remove/restore;
 - `Audit`;
+- `Vulnerability`: severity from OSV (`Get-VulnerabilitySeverity`, cached in `<wheelhouse>\reports\osv-cache.json`), CVSS 3 scoring, due days (`Get-WheelhouseDueDayTable`), waivers (`config\waivers.json`);
 - `Intake`: `Invoke-CandidateIntake` (checks, no lock) and `Publish-CandidateIntake` (write lock);
 - `Sync`: `Invoke-WheelhouseSync`, the whole update run;
 - `Alert`;
@@ -58,15 +59,15 @@ Functions `throw`; only scripts `exit`.
 Script roles:
 - `Update-Requirement.ps1`: `uv pip compile` turns `Input\requirements.in` into a candidate file. It is then checked with a `pip install --dry-run` against the target Python version and platform (`Test-RequirementWheelAvailability`), and only then becomes `Input\requirements.txt`. uv on its own accepts sdist-only packages and ignores the upper `Requires-Python` bound, which is why the pip check exists.
 - `Update-Wheelhouse.ps1` frames the run (transcript, tooling check, exit code); `Invoke-WheelhouseSync` does the work:
-  1. under the write lock: journal repair, integrity check against `manifest.json`, take out wheels removed/changed on the share (`Resolve-WheelhouseIntegrityProblem`, `AutoQuarantine`), catalog reconcile, group snapshot;
+  1. under the write lock: journal repair, integrity check against `manifest.json`, take out wheels removed/changed on the share (`Resolve-WheelhouseIntegrityProblem`, `AutoQuarantine`), move untracked wheels to `_untracked\` (`Move-UntrackedWheelFile`), catalog reconcile, heartbeat warning, group snapshot;
   2. an in-memory merge plan of `Input\requirements.txt` into the `requirements-N.txt` groups;
   3. per group, `Invoke-CandidateIntake` (no lock): denylist → audit → PyPI release data (yanked, cooldown `MinimumPackageAgeDays`, `-ExpeditePackage` skips it per pin) → download into `<manager root>\staging\` → sha256/yanked/upload-date check of each file against PyPI → Defender scan of the staged files; then `Publish-CandidateIntake` (write lock): denylist re-check → journal → `Publish-StagedWheel` (`.partial` copy, then rename) → manifest, then pins → catalog + history;
   4. an audit-only pass over existing groups;
-  5. all audit results into the catalog (write lock). The share is never virus-scanned by this tool - the file server's antivirus does that; new wheels are scanned at intake, on-demand scans use hash-checked local copies (`Invoke-WheelhouseCopyScan`).
+  5. severities looked up on OSV (no lock), then all audit results into the catalog with severities, due dates and waivers, and `Resolve-MaliciousPackage` (`MAL-*`, `AutoQuarantine`) (write lock). The share is never virus-scanned by this tool - the file server's antivirus does that; new wheels are scanned at intake, on-demand scans use hash-checked local copies (`Invoke-WheelhouseCopyScan`).
 
   It emits `Wheelhouse.AuditResult` and `Wheelhouse.Notice` objects and **sends no alerts**.
 - `Invoke-WheelhousePipeline.ps1` (repo root, the orchestrator) runs `Update-Wheelhouse.ps1`, keeps its `Wheelhouse.AuditResult` and `Wheelhouse.Notice` output, and calls `Send-VulnerabilityAlert.ps1` once for any `Vulnerable`/`Error` result or notice.
-- `Test-Wheelhouse.ps1` is what the Scheduled Task runs. It re-checks what is already published (integrity, denylist and PyPI yanked flag via `Get-DeployedPackageNotice`, audits, wheels missing/changed on the share), records the results in the catalog (`Update-WheelhouseCatalog`) and alerts: no merge, no download, no change to wheels, manifest or group files.
+- `Test-Wheelhouse.ps1` is what the Scheduled Task runs. It re-checks what is already published (integrity, denylist and PyPI yanked flag via `Get-DeployedPackageNotice`, audits, wheels missing/changed on the share, untracked wheels, malicious-package advisories, versions without a recent audit = `Unverified`), records the results and its heartbeat in the catalog (`Update-WheelhouseCatalog`) and alerts **statefully**: `Get-CatalogFindingAlert` gives each finding an `AlertReason` (New / Overdue / Reminder / WaiverExpired / Resolved), the alert goes out only if one has a reason, and `Set-CatalogFindingNotified` records it after delivery. No merge, no download; wheels, manifest and group files change only for the `AutoQuarantine` actions.
 - `Test-WheelhousePackage.ps1` (audit the whole index or `-Package name==ver`, no alert) and `Invoke-WheelhouseScan.ps1` (Defender, whole folder or `-File`) back the UI's buttons.
 - `Start-WheelhouseUI.ps1` starts the local web UI (`Start-WheelhouseUiServer`, `localhost` only, session token in the URL). It is a third thin layer: it runs the scripts above as child processes and calls module functions for reads and for remove/quarantine/restore, settings and denylist edits.
 
@@ -76,7 +77,8 @@ Invariants to preserve:
 - **Nothing reaches the wheelhouse folder unchecked.** Downloads go to the staging folder (under the manager root, not `%TEMP%`: 8.3 short paths would not match Defender's detection paths) and are published only after every check. The manifest only gains the entries `Publish-CandidateIntake` returns as `Published` (verified against PyPI's sha256); the one exception is first-time setup, which adopts the wheels already there. New group numbers are max+1.
 - Audit status is `Passed`/`Vulnerable`/`Error`. A failed audit is never reported as clean.
 - **Wheels changed or removed on the share** (e.g. by the file server's antivirus): `Assert-WheelhouseIntegrity -AllowChangedFiles` returns Missing/Modified problems; `Resolve-WheelhouseIntegrityProblem -AutoQuarantine` takes a missing version out (pins + manifest, denylisted) and quarantines a modified one as evidence, emitting FileMissing/FileModified notices. With AutoQuarantine off the update stops, the scheduled check only reports. Unreadable/Malformed still fail closed.
-- **Never assign to a script variable named like a validated parameter** (names are case-insensitive; a `ValidateSet` parameter rejects the value). A test checks this.
+- **Findings, waivers, alerts.** One finding per advisory per version (`Update-CatalogRecordFinding`): `first_seen` never moves, due = first_seen + `DueDays<Severity>`, Unknown severity = High, a failed lookup never replaces a known severity. A waiver covers one advisory for one exact version until a date (<= `WaiverMaxDays`); waived findings are not alerted and do not cause exit code 1. Call OSV (`Get-AuditResultSeverity`) before taking the write lock. Under `AutoQuarantine` automatic actions only ever quarantine/take out/move, never delete, and always emit a notice (`FileMissing`, `FileModified`, `Malicious`, `Untracked`).
+- **Never assign to a script variable named like a validated parameter** (names are case-insensitive; a `ValidateSet` parameter rejects the value). A test checks this. In functions, a local named like a typed parameter (`$finding` vs `[object[]]$Finding`) is silently converted - name it differently.
 - **Exit codes** (`Get-WheelhouseExitCode`): 0 OK, 1 needs attention (findings, rejections), 2 error or a check could not be completed, 3 lock busy. UI jobs map 1 to the `Attention` status.
 - Module functions must never invoke `Jobs\*.ps1` scripts. A script run from inside a module function executes in module scope and breaks `$script:` variables. Instead, the module builds parameters (`Get-VulnerabilityAlertParameter`) and the calling script runs `Send-VulnerabilityAlert.ps1`.
 - Native commands (python, pip, uv) go through `Invoke-NativeCommand`. It merges stderr into stdout as text, because 5.1's `Start-Transcript` doesn't capture native stderr.
@@ -107,3 +109,4 @@ All tests live in `Tests/WheelhouseManager.Tests.ps1`.
 - A global `python` stub is added when python isn't installed, because Pester can only mock commands that exist.
 - UI job tests start real child PowerShell processes from throw-away scripts; API tests call `Invoke-WheelhouseUiApi` directly with a temp manager root (and mock `Start-WheelhouseUiJob`). Defender is faked through `Test-WheelhouseDefenderAvailable` / `Invoke-MpScan` / `Get-WheelhouseThreatDetection`.
 - Intake/sync tests use `New-TestRelease` and the shared mock bodies (`$script:intakeAgeMock`, `$script:intakeDownloadMock`, `$script:intakeScanMock`); `Invoke-TestIntake` runs check + publish. Pass `-StagingRoot` and `-DenylistPath` inside the test folder. Journal tests write a journal by hand and run the repair.
+- OSV is never called from tests: the Describe-level `BeforeAll` mocks `Get-OsvVulnerability` to throw; severity tests override it via `$global:WhmOsvRecords` / `WhmOsvOffline`. Finding tests pass `-NowUtc` to move time.

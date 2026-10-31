@@ -159,7 +159,7 @@ param(
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake, AutoQuarantine
+    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays
 
 $title = 'Wheelhouse maintenance script'
 $outcome = $null
@@ -195,6 +195,8 @@ try {
         RequireDefenderScan   = [bool]$cfg.RequireDefenderScanAtIntake
         # -AutoQuarantine On|Off wins over the setting (a bool).
         AutoQuarantine        = ConvertTo-WheelhouseBoolean $cfg.AutoQuarantine
+        DueDays               = Get-WheelhouseDueDayTable -Settings $cfg
+        AuditFreshnessDays    = [int]$cfg.AuditFreshnessDays
     }
     $result = Invoke-WheelhouseSync @syncParams
 

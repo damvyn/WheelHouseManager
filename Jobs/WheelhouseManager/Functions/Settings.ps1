@@ -27,6 +27,13 @@ function Get-WheelhouseDefaultSetting {
         MailFrom              = 'NoReply@company.com'
         RequireDefenderScanAtIntake  = $false
         AutoQuarantine               = $true
+        DueDaysCritical              = 3
+        DueDaysHigh                  = 7
+        DueDaysMedium                = 30
+        DueDaysLow                   = 90
+        WaiverMaxDays                = 90
+        AuditFreshnessDays           = 8
+        OverdueReminderDays          = 7
     }
 }
 
@@ -247,7 +254,14 @@ function Get-WheelhouseSettingSchema {
         @{ Key = 'MailTo'; Type = 'string'; Label = 'Alert recipient'; Help = 'Where vulnerability alerts go.' }
         @{ Key = 'MailFrom'; Type = 'string'; Label = 'Alert sender'; Help = 'From address of alert mails.' }
         @{ Key = 'RequireDefenderScanAtIntake'; Type = 'bool'; Label = 'Require a Defender scan at intake'; Help = 'On: a new package is rejected when its download cannot be scanned (for example, the run is not elevated). Off: it is published with a warning.' }
-        @{ Key = 'AutoQuarantine'; Type = 'bool'; Label = 'Take out changed or removed wheels automatically'; Help = 'On: a published wheel that disappeared from the share (e.g. removed by the file server''s antivirus) is taken out of the group files and denylisted; one whose content changed is quarantined. Off: it is only reported, and updates stop until someone acts. An alert is sent either way. Override per run with -AutoQuarantine On|Off.' }
+        @{ Key = 'AutoQuarantine'; Type = 'bool'; Label = 'Take out changed or removed wheels automatically'; Help = 'On: a published wheel that disappeared from the share (e.g. removed by the file server''s antivirus) is taken out of the group files and denylisted; one whose content changed is quarantined. Off: it is only reported, and updates stop until someone acts. An alert is sent either way. Override per run with -AutoQuarantine On|Off. The same switch quarantines a published version that OSV lists as a malicious package (MAL-*).' }
+        @{ Key = 'DueDaysCritical'; Type = 'int'; Label = 'Fix within (days): Critical'; Min = 1; Max = 365; Help = 'How long a Critical vulnerability may stay open before it is overdue and escalated.' }
+        @{ Key = 'DueDaysHigh'; Type = 'int'; Label = 'Fix within (days): High'; Min = 1; Max = 365; Help = 'Also used when OSV publishes no severity for an advisory.' }
+        @{ Key = 'DueDaysMedium'; Type = 'int'; Label = 'Fix within (days): Medium'; Min = 1; Max = 365; Help = 'How long a Medium vulnerability may stay open.' }
+        @{ Key = 'DueDaysLow'; Type = 'int'; Label = 'Fix within (days): Low'; Min = 1; Max = 365; Help = 'How long a Low vulnerability may stay open.' }
+        @{ Key = 'WaiverMaxDays'; Type = 'int'; Label = 'Longest waiver (days)'; Min = 1; Max = 365; Help = 'An accepted risk must be reviewed again after at most this many days.' }
+        @{ Key = 'AuditFreshnessDays'; Type = 'int'; Label = 'Audit freshness (days)'; Min = 1; Max = 365; Help = 'A published version without a completed audit for this long is Unverified and alerted; the UI warns when the scheduled check has not run for this long.' }
+        @{ Key = 'OverdueReminderDays'; Type = 'int'; Label = 'Overdue reminder (days)'; Min = 1; Max = 365; Help = 'An overdue vulnerability is alerted again after this many days. New, overdue and resolved findings are alerted once.' }
     )
     foreach ($item in $schema) { [PSCustomObject]$item }
 }

@@ -13,7 +13,7 @@ function New-WheelhouseNotice {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Denylisted', 'Yanked', 'FileMissing', 'FileModified', 'IntakeBlocked')]
+        [ValidateSet('Denylisted', 'Yanked', 'FileMissing', 'FileModified', 'IntakeBlocked', 'Malicious', 'Unverified', 'Untracked')]
         [string]$Kind,
 
         [AllowEmptyString()]
@@ -39,6 +39,9 @@ function New-WheelhouseNotice {
             'FileMissing' { "Check the file server's antivirus log and quarantine for this file, then quarantine or delete the version (UI: Packages tab)." }
             'FileModified' { 'Quarantine the version now (UI: Packages tab) and find out who or what changed the file.' }
             'IntakeBlocked' { 'Nothing was published. Find out why the download differed or was detected before trying this version again.' }
+            'Malicious' { 'Quarantine the version now (UI: Packages tab) and find out which clients installed it.' }
+            'Untracked' { 'Remove the files from the wheelhouse folder and publish the packages you need through Update-Wheelhouse.ps1.' }
+            'Unverified' { 'Find out why the audits fail (network, proxy, pip-audit) - see the run log in the reports folder. Until an audit completes, new vulnerabilities in this version go unnoticed.' }
         }
     }
     return [PSCustomObject]@{
@@ -171,9 +174,24 @@ function ConvertTo-VulnerabilityAlertHtml {
 "@)
     }
 
+    # Findings from the catalog (Get-CatalogFindingAlert) carry a severity, a due date and
+    # why they are alerted; resolved ones get a short section of their own.
+    $resolved = @($Findings | Where-Object { $_.PSObject.Properties['AlertReason'] -and $_.AlertReason -eq 'Resolved' })
+    $Findings = @($Findings | Where-Object { -not ($_.PSObject.Properties['AlertReason'] -and $_.AlertReason -eq 'Resolved') })
+    $tracked = [bool]($Findings | Where-Object { $_.PSObject.Properties['Severity'] })
+    if ($tracked) {
+        $order = @{ Overdue = 0; Reminder = 0; WaiverExpired = 1; New = 2 }
+        $Findings = @($Findings | Sort-Object @{ Expression = { if ($_.AlertReason -and $order.ContainsKey([string]$_.AlertReason)) { $order[[string]$_.AlertReason] } else { 3 } } }, @{ Expression = { Get-SeverityRank -Severity $_.Severity }; Descending = $true }, Package, VulnId)
+    }
+
     if ($Findings.Count -gt 0) {
         $affectedPackages = ($Findings | Select-Object -ExpandProperty Package -Unique) -join ', '
         [void]$sections.AppendLine("<p><b>$($Findings.Count)</b> vulnerability finding(s) affecting package(s): <b>$(ConvertTo-HtmlSafe $affectedPackages)</b></p>")
+        if ($tracked) {
+            $overdue = @($Findings | Where-Object { $_.Status -eq 'Overdue' }).Count
+            $fresh = @($Findings | Where-Object { $_.AlertReason -in 'New', 'WaiverExpired' }).Count
+            [void]$sections.AppendLine("<p>New: <b>$fresh</b>, overdue: <b>$overdue</b>. Findings already alerted and not yet due are listed again for completeness. A finding you have decided to accept can be waived until a date (UI: package History).</p>")
+        }
 
         $rows = [System.Text.StringBuilder]::new()
         foreach ($finding in $Findings) {
@@ -204,8 +222,21 @@ function ConvertTo-VulnerabilityAlertHtml {
                 $recommendation += "Change or remove it in requirements.in and re-run Update-Requirement.ps1$fixNote"
             }
 
+            $trackedCells = ''
+            if ($tracked) {
+                $due = if ($finding.Due) { ([string]$finding.Due).Substring(0, 10) } else { '' }
+                $state = switch ([string]$finding.AlertReason) {
+                    'New' { 'NEW' }
+                    'Overdue' { 'OVERDUE' }
+                    'Reminder' { 'OVERDUE (reminder)' }
+                    'WaiverExpired' { 'waiver ended' }
+                    default { $(if ($finding.Status -eq 'Overdue') { 'overdue' } else { 'open' }) }
+                }
+                $score = if ($null -ne $finding.Score) { " ($($finding.Score))" } else { '' }
+                $trackedCells = "`n  <td>$(ConvertTo-HtmlSafe "$($finding.Severity)$score")</td>`n  <td>$(ConvertTo-HtmlSafe $due)</td>`n  <td>$(ConvertTo-HtmlSafe $state)</td>"
+            }
             [void]$rows.AppendLine(@"
-<tr>
+<tr>$trackedCells
   <td>$(ConvertTo-HtmlSafe $finding.Package)</td>
   <td>$(ConvertTo-HtmlSafe $finding.Version)</td>
   <td>$(ConvertTo-HtmlSafe $finding.VulnId)</td>
@@ -217,9 +248,10 @@ function ConvertTo-VulnerabilityAlertHtml {
 "@)
         }
 
+        $trackedHeaders = if ($tracked) { "`n    <th>Severity</th>`n    <th>Fix by</th>`n    <th>Status</th>" } else { '' }
         [void]$sections.AppendLine(@"
 <table>
-  <tr>
+  <tr>$trackedHeaders
     <th>Package</th>
     <th>Version</th>
     <th>Vulnerability ID</th>
@@ -230,6 +262,16 @@ function ConvertTo-VulnerabilityAlertHtml {
   </tr>
   $($rows.ToString())
 </table>
+"@)
+    }
+
+    if ($resolved.Count -gt 0) {
+        $items = ($resolved | ForEach-Object { "<li>$(ConvertTo-HtmlSafe "$($_.Package)==$($_.Version)"): $(ConvertTo-HtmlSafe $_.VulnId) is no longer reported</li>" }) -join "`n"
+        [void]$sections.AppendLine(@"
+<h3>Resolved since the last alert ($($resolved.Count))</h3>
+<ul>
+$items
+</ul>
 "@)
     }
 
@@ -292,6 +334,12 @@ function Get-VulnerabilityAlertParameter {
         [AllowEmptyCollection()]
         [string[]]$CheckError = @(),
 
+        # Tracked findings (Get-CatalogFindingAlert). When given, they replace the
+        # Vulnerable audit reports: an alert is due only for findings with an AlertReason,
+        # and then lists every open finding.
+        [AllowEmptyCollection()]
+        [object[]]$Finding,
+
         # Extra parameters passed through to the alert script (SmtpServer, To, ...).
         [hashtable]$AlertParameters = @{}
     )
@@ -300,17 +348,28 @@ function Get-VulnerabilityAlertParameter {
     $failed = @($AuditResult | Where-Object { $_.Status -eq 'Error' })
     $notices = @($Notice | Where-Object { $_ })
     $checkErrors = @($CheckError | Where-Object { $_ })
+    $useFindings = $PSBoundParameters.ContainsKey('Finding')
+    $alertFindings = @()
+    if ($useFindings) {
+        $vulnerable = @()
+        if (@($Finding | Where-Object { $_ -and $_.AlertReason }).Count -gt 0) {
+            $alertFindings = @($Finding | Where-Object { $_ -and ($_.AlertReason -or $_.Status -in 'Open', 'Overdue') })
+        }
+    }
 
-    if ($vulnerable.Count -eq 0 -and $failed.Count -eq 0 -and $notices.Count -eq 0 -and $checkErrors.Count -eq 0) {
-        Write-Log 'All audits and checks passed - no alert needed.' 'OK'
+    if ($vulnerable.Count -eq 0 -and $alertFindings.Count -eq 0 -and $failed.Count -eq 0 -and $notices.Count -eq 0 -and $checkErrors.Count -eq 0) {
+        Write-Log 'All audits and checks passed, or every finding was already alerted - no alert needed.' 'OK'
         return $null
     }
 
-    Write-Log "$($vulnerable.Count) audit(s) found vulnerabilities, $($failed.Count + $checkErrors.Count) audit(s)/check(s) could not be completed, $($notices.Count) package notice(s). Triggering alert..." 'ERROR'
+    Write-Log "$($vulnerable.Count + $alertFindings.Count) vulnerability result(s)/finding(s), $($failed.Count + $checkErrors.Count) audit(s)/check(s) could not be completed, $($notices.Count) package notice(s). Triggering alert..." 'ERROR'
 
     $alertParams = @{} + $AlertParameters
     if ($vulnerable.Count -gt 0) {
         $alertParams['ReportPaths'] = [string[]]@($vulnerable | ForEach-Object { $_.ReportPath })
+    }
+    if ($alertFindings.Count -gt 0) {
+        $alertParams['Findings'] = $alertFindings
     }
     $errors = @($failed | ForEach-Object { "$($_.Group) / $($_.Service.ToUpperInvariant()): $($_.Message)" }) + $checkErrors
     if ($errors.Count -gt 0) {

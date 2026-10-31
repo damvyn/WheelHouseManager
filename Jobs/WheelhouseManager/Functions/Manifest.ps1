@@ -219,7 +219,7 @@ function Assert-WheelhouseIntegrity {
         foreach ($name in $untracked) {
             Write-Log "  - $name" 'WARN'
         }
-        Write-Log 'These are never added to the manifest automatically. Remove them and let Update-Wheelhouse.ps1 download them again if they are needed.' 'WARN'
+        Write-Log 'They are never added to the manifest automatically. With AutoQuarantine on they are moved to the _untracked folder; publish the packages you need through Update-Wheelhouse.ps1.' 'WARN'
     }
 
     if ($AllowChangedFiles) { $problems }

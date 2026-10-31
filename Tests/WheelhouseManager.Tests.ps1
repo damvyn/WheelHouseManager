@@ -11,6 +11,8 @@ Describe 'WheelhouseManager' {
     BeforeAll {
         $modulePath = Join-Path (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Jobs') 'WheelhouseManager'
         Import-Module $modulePath -Force
+        # No test reaches the real OSV API; the severity tests mock it themselves.
+        Mock -ModuleName WheelhouseManager -CommandName Get-OsvVulnerability -MockWith { throw 'OSV is not reachable from the tests.' }
 
         function Get-TestFolder {
             $path = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
@@ -167,7 +169,8 @@ Describe 'WheelhouseManager' {
     AfterAll {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
         Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded, WhmIntakeCandidates, WhmScanDetections, WhmUiJobSteps,
-            WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI, WhmScannedPath -Scope Global -ErrorAction SilentlyContinue
+            WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI, WhmScannedPath,
+            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -1305,7 +1308,7 @@ Describe 'WheelhouseManager' {
             Update-CatalogAuditResult -Catalog $catalog -AuditResult @([PSCustomObject]@{ Service = 'osv'; Status = 'Vulnerable'; ReportPath = $bad; GroupFile = 'x' })
             $catalog.Records['attrs==23.1.0'].checks.audit.status | Should -Be 'Vulnerable'
             @($catalog.Records['attrs==23.1.0'].checks.audit.vulnerabilities) -join ',' | Should -Be 'GHSA-1'
-            (Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'attrs')[0].detail | Should -Match 'Passed -> Vulnerable: GHSA-1'
+            @(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'attrs' | Where-Object { $_.action -eq 'AuditChanged' })[0].detail | Should -Match 'Passed -> Vulnerable: GHSA-1'
 
             # An audit that could not run never turns a status into Passed.
             $groupFile = Join-Path $wheelhouse 'requirements-1.txt'
@@ -1370,6 +1373,293 @@ Describe 'WheelhouseManager' {
             Write-WheelhouseEvent -WheelhousePath $wheelhouse -Action 'Two' -Package 'b' -Version '1'
             (@(Read-WheelhouseEvent -WheelhousePath $wheelhouse) | ForEach-Object { $_.action }) -join ',' | Should -Be 'Two,One'
             (@(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'A') | ForEach-Object { $_.action }) -join ',' | Should -Be 'One'
+        }
+    }
+
+    Context 'Severity, findings and waivers' {
+        BeforeAll {
+            # A catalog for the test wheelhouse with audit results recorded from a report
+            # that lists the given advisory IDs for attrs==23.1.0.
+            function New-TestFindingCatalog {
+                param([string[]]$Id, [hashtable]$Severity = @{}, [object[]]$Waiver = @(), [string]$Wheelhouse)
+                if (-not $Wheelhouse) { $Wheelhouse = Get-TestWheelhouse }
+                Update-WheelhouseCatalog -WheelhousePath $Wheelhouse -DenylistPath (Join-Path $Wheelhouse 'deny.json')
+                $catalog = Read-WheelhouseCatalog -WheelhousePath $Wheelhouse
+                Write-TestFindingAudit -Catalog $catalog -Id $Id -Severity $Severity -Waiver $Waiver
+                return $catalog
+            }
+            function Write-TestFindingAudit {
+                param($Catalog, [string[]]$Id, [hashtable]$Severity = @{}, [object[]]$Waiver = @())
+                $vulns = @($Id | ForEach-Object { @{ id = $_; aliases = @("CVE-$_"); fix_versions = @('99.0'); description = "Problem $_" } })
+                $report = Join-Path (Get-TestFolder) 'report.json'
+                ConvertTo-Json -Depth 6 -InputObject @{ dependencies = @(@{ name = 'attrs'; version = '23.1.0'; vulns = $vulns }, @{ name = 'six'; version = '1.16.0'; vulns = @() }) } | Set-Content -Path $report
+                $status = if ($Id.Count -gt 0) { 'Vulnerable' } else { 'Passed' }
+                $results = @('osv', 'pypi' | ForEach-Object { [PSCustomObject]@{ Service = $_; Status = $status; ReportPath = $report; GroupFile = 'x' } })
+                Update-CatalogAuditResult -Catalog $Catalog -AuditResult $results -Severity $Severity -Waiver $Waiver
+            }
+            function Get-TestAlert {
+                param($Catalog, [datetime]$NowUtc = (Get-Date).ToUniversalTime())
+                @(Get-CatalogFindingAlert -Catalog $Catalog -ReminderDays 7 -NowUtc $NowUtc)
+            }
+        }
+
+        BeforeEach {
+            $global:WhmOsvCalls = [System.Collections.Generic.List[string]]::new()
+            $global:WhmOsvRecords = @{}
+            $global:WhmOsvOffline = $false
+            Mock -ModuleName WheelhouseManager -CommandName Get-OsvVulnerability -MockWith {
+                $global:WhmOsvCalls.Add($Id)
+                if ($global:WhmOsvOffline) { throw 'The remote name could not be resolved: api.osv.dev' }
+                if ($global:WhmOsvRecords.ContainsKey($Id)) { return $global:WhmOsvRecords[$Id] }
+                $exception = [System.Exception]::new('Not Found')
+                $exception | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = 404 })
+                throw $exception
+            }
+        }
+
+        It 'scores CVSS 3 vectors and maps scores to severities' {
+            ConvertTo-CvssV3BaseScore -Vector 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H' | Should -Be 9.8
+            ConvertTo-CvssV3BaseScore -Vector 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:L/A:N' | Should -Be 6.4
+            ConvertTo-CvssV3BaseScore -Vector 'CVSS:3.0/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H' | Should -Be 9.6
+            ConvertTo-CvssV3BaseScore -Vector 'CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N' | Should -Be 1.8
+            ConvertTo-CvssV3BaseScore -Vector 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N' | Should -Be 0
+            ConvertTo-CvssV3BaseScore -Vector 'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N' | Should -BeNullOrEmpty
+            ConvertTo-CvssV3BaseScore -Vector 'CVSS:3.1/AV:N/AC:L' | Should -BeNullOrEmpty
+            ConvertTo-SeverityFromScore -Score 9.0 | Should -Be 'Critical'
+            ConvertTo-SeverityFromScore -Score 7.5 | Should -Be 'High'
+            ConvertTo-SeverityFromScore -Score 4.0 | Should -Be 'Medium'
+            ConvertTo-SeverityFromScore -Score 3.9 | Should -Be 'Low'
+            (Get-SeverityRank -Severity 'Unknown') | Should -Be (Get-SeverityRank -Severity 'High')
+        }
+
+        It 'reads a severity from an OSV record' {
+            (Get-OsvRecordSeverity -Record ([PSCustomObject]@{ id = 'MAL-2024-1' })).Severity | Should -Be 'Critical'
+            $cvss = Get-OsvRecordSeverity -Record ([PSCustomObject]@{ id = 'GHSA-a'; severity = @([PSCustomObject]@{ type = 'CVSS_V3'; score = 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H' }) })
+            $cvss.Severity | Should -Be 'Critical'
+            $cvss.Score | Should -Be 9.8
+            (Get-OsvRecordSeverity -Record ([PSCustomObject]@{ id = 'GHSA-b'; database_specific = [PSCustomObject]@{ severity = 'MODERATE' } })).Severity | Should -Be 'Medium'
+            (Get-OsvRecordSeverity -Record ([PSCustomObject]@{ id = 'GHSA-c'; affected = @([PSCustomObject]@{ ecosystem_specific = [PSCustomObject]@{ severity = 'LOW' } }) })).Severity | Should -Be 'Low'
+            Get-OsvRecordSeverity -Record ([PSCustomObject]@{ id = 'PYSEC-1' }) | Should -BeNullOrEmpty
+        }
+
+        It 'follows aliases, caches answers and survives OSV being unreachable' {
+            $cache = Join-Path (Get-TestFolder) 'osv-cache.json'
+            $global:WhmOsvRecords['PYSEC-1'] = [PSCustomObject]@{ id = 'PYSEC-1'; aliases = @('GHSA-x') }
+            $global:WhmOsvRecords['GHSA-x'] = [PSCustomObject]@{ id = 'GHSA-x'; database_specific = [PSCustomObject]@{ severity = 'HIGH' } }
+            $result = Get-VulnerabilitySeverity -Advisory @{ 'PYSEC-1' = @(); 'GHSA-gone' = @(); 'MAL-2024-9' = @() } -CachePath $cache
+            $result['PYSEC-1'].Severity | Should -Be 'High'
+            $result['PYSEC-1'].Source | Should -Match 'GHSA-x'
+            $result['GHSA-gone'].Severity | Should -Be 'Unknown'
+            $result['GHSA-gone'].Error | Should -BeNullOrEmpty
+            $result['MAL-2024-9'].Severity | Should -Be 'Critical'
+            $global:WhmOsvCalls -contains 'MAL-2024-9' | Should -Be $false
+
+            # Cached: no second lookup.
+            $global:WhmOsvCalls.Clear()
+            (Get-VulnerabilitySeverity -Advisory @{ 'PYSEC-1' = @() } -CachePath $cache)['PYSEC-1'].Severity | Should -Be 'High'
+            $global:WhmOsvCalls.Count | Should -Be 0
+
+            # Offline: an expired cached answer is still used; an unknown ID is Unknown with
+            # an error, and only one lookup is tried.
+            $global:WhmOsvOffline = $true
+            $offline = Get-VulnerabilitySeverity -Advisory @{ 'PYSEC-1' = @(); 'GHSA-new1' = @(); 'GHSA-new2' = @() } -CachePath $cache -MaxAgeDays 0
+            $offline['PYSEC-1'].Severity | Should -Be 'High'
+            $offline['GHSA-new1'].Severity | Should -Be 'Unknown'
+            $offline['GHSA-new1'].Error | Should -Match 'OSV lookup failed'
+            $offline['GHSA-new2'].Error | Should -Match 'OSV lookup failed'
+            $global:WhmOsvCalls.Count | Should -Be 1
+
+            # A damaged cache is rebuilt, not fatal.
+            Set-Content -Path $cache -Value '{ broken'
+            $global:WhmOsvOffline = $false
+            (Get-VulnerabilitySeverity -Advisory @{ 'PYSEC-1' = @() } -CachePath $cache)['PYSEC-1'].Severity | Should -Be 'High'
+        }
+
+        It 'tracks a finding from new to overdue, waived, expired and resolved' {
+            $due = @{ Critical = 3; High = 7; Medium = 30; Low = 90; Unknown = 7 }
+            $severity = @{ 'GHSA-1' = [PSCustomObject]@{ Severity = 'High'; Score = 7.5; Source = 'test'; Error = '' } }
+            $catalog = New-TestFindingCatalog -Id @() -Severity $severity
+            @(Get-TestAlert -Catalog $catalog).Count | Should -Be 0
+
+            # New CVE: a finding with a due date, alerted once.
+            Write-TestFindingAudit -Catalog $catalog -Id @('GHSA-1') -Severity $severity
+            $finding = $catalog.Records['attrs==23.1.0'].findings[0]
+            $finding.severity | Should -Be 'High'
+            $finding.aliases -join ',' | Should -Be 'CVE-GHSA-1'
+            $finding.fix_versions -join ',' | Should -Be '99.0'
+            ((ConvertTo-UtcDateTime $finding.due) - (ConvertTo-UtcDateTime $finding.first_seen)).TotalDays | Should -Be $due.High
+            $alerts = @(Get-TestAlert -Catalog $catalog)
+            $alerts.Count | Should -Be 1
+            $alerts[0].AlertReason | Should -Be 'New'
+            $alerts[0].Status | Should -Be 'Open'
+            $alerts[0].GroupFiles -join ',' | Should -Be 'requirements-1.txt'
+            Set-CatalogFindingNotified -Catalog $catalog -Finding $alerts
+            (Get-TestAlert -Catalog $catalog)[0].AlertReason | Should -BeNullOrEmpty
+            # The next audit keeps first_seen.
+            $firstSeen = $finding.first_seen
+            Write-TestFindingAudit -Catalog $catalog -Id @('GHSA-1') -Severity $severity
+            $catalog.Records['attrs==23.1.0'].findings[0].first_seen | Should -Be $firstSeen
+
+            # Breach: alerted as overdue, then reminded after a week, not before.
+            $late = (ConvertTo-UtcDateTime $finding.due).AddDays(1)
+            $alerts = @(Get-TestAlert -Catalog $catalog -NowUtc $late)
+            $alerts[0].AlertReason | Should -Be 'Overdue'
+            Set-CatalogFindingNotified -Catalog $catalog -Finding $alerts -NowUtc $late
+            (Get-TestAlert -Catalog $catalog -NowUtc $late)[0].AlertReason | Should -BeNullOrEmpty
+            $catalog.Records['attrs==23.1.0'].findings[0].notified_utc = $late.AddDays(-8).ToString('o')
+            (Get-TestAlert -Catalog $catalog -NowUtc $late)[0].AlertReason | Should -Be 'Reminder'
+
+            # A waiver silences it; once it expires the finding is alerted again.
+            $waiverPath = Join-Path (Get-TestFolder) 'waivers.json'
+            [void](Add-WheelhouseWaiver -Name 'Attrs' -Version '23.1.0' -Id 'GHSA-1' -Reason 'not reachable in our use' -Days 30 -Path $waiverPath)
+            Set-CatalogFindingWaiver -Catalog $catalog -Waiver @(Read-WheelhouseWaiver -Path $waiverPath)
+            $alerts = @(Get-TestAlert -Catalog $catalog)
+            $alerts[0].Status | Should -Be 'Waived'
+            $alerts[0].AlertReason | Should -BeNullOrEmpty
+            Set-CatalogFindingNotified -Catalog $catalog -Finding $alerts
+            $catalog.Records['attrs==23.1.0'].findings[0].notified | Should -Be 'Waived'
+            $expired = @(Read-WheelhouseWaiver -Path $waiverPath | ForEach-Object { $_.expires_utc = (Get-Date).ToUniversalTime().AddDays(-1).ToString('o'); $_ })
+            Set-CatalogFindingWaiver -Catalog $catalog -Waiver $expired
+            $catalog.Records['attrs==23.1.0'].findings[0].waiver | Should -BeNullOrEmpty
+            (Get-TestAlert -Catalog $catalog)[0].AlertReason | Should -Be 'WaiverExpired'
+            (Get-TestAlert -Catalog $catalog -NowUtc $late)[0].AlertReason | Should -Be 'Overdue'
+            $events = @(Read-WheelhouseEvent -WheelhousePath $catalog.WheelhousePath -Package 'attrs' | ForEach-Object { $_.action })
+            $events | Should -Contain 'FindingNew'
+            $events | Should -Contain 'Waived'
+            $events | Should -Contain 'WaiverEnded'
+
+            # Resolved: alerted once, then dropped.
+            Set-CatalogFindingNotified -Catalog $catalog -Finding (Get-TestAlert -Catalog $catalog)
+            Write-TestFindingAudit -Catalog $catalog -Id @() -Severity $severity
+            $alerts = @(Get-TestAlert -Catalog $catalog)
+            $alerts[0].AlertReason | Should -Be 'Resolved'
+            Set-CatalogFindingNotified -Catalog $catalog -Finding $alerts
+            @($catalog.Records['attrs==23.1.0'].findings).Count | Should -Be 0
+            @(Read-WheelhouseEvent -WheelhousePath $catalog.WheelhousePath -Package 'attrs' | ForEach-Object { $_.action }) | Should -Contain 'FindingResolved'
+        }
+
+        It 'keeps a known severity when a lookup fails, and survives a save' {
+            $catalog = New-TestFindingCatalog -Id @('GHSA-2') -Severity @{ 'GHSA-2' = [PSCustomObject]@{ Severity = 'Critical'; Score = 9.8; Source = 'test'; Error = '' } }
+            Write-TestFindingAudit -Catalog $catalog -Id @('GHSA-2') -Severity @{ 'GHSA-2' = [PSCustomObject]@{ Severity = 'Unknown'; Score = $null; Source = ''; Error = 'offline' } }
+            $catalog.Records['attrs==23.1.0'].findings[0].severity | Should -Be 'Critical'
+            Save-WheelhouseCatalog -Catalog $catalog
+            $again = Read-WheelhouseCatalog -WheelhousePath $catalog.WheelhousePath
+            $finding = $again.Records['attrs==23.1.0'].findings[0]
+            $finding.severity | Should -Be 'Critical'
+            $finding.score | Should -Be 9.8
+            $finding.due | Should -Match '^\d{4}-\d\d-\d\dT'
+            # A re-rated advisory moves the due date and is recorded.
+            Write-TestFindingAudit -Catalog $again -Id @('GHSA-2') -Severity @{ 'GHSA-2' = [PSCustomObject]@{ Severity = 'Low'; Score = 2.0; Source = 'test'; Error = '' } }
+            $low = $again.Records['attrs==23.1.0'].findings[0]
+            ((ConvertTo-UtcDateTime $low.due) - (ConvertTo-UtcDateTime $low.first_seen)).TotalDays | Should -Be 90
+            @(Read-WheelhouseEvent -WheelhousePath $again.WheelhousePath -Package 'attrs' | ForEach-Object { $_.action }) | Should -Contain 'SeverityChanged'
+        }
+
+        It 'validates waivers and only matches unexpired, exact ones' {
+            $path = Join-Path (Get-TestFolder) 'waivers.json'
+            { Add-WheelhouseWaiver -Name 'six' -Version '1.16.0' -Id 'GHSA-1' -Reason '' -Days 10 -Path $path } | Should -Throw '*reason*'
+            { Add-WheelhouseWaiver -Name 'six' -Version '*' -Id 'GHSA-1' -Reason 'x' -Days 10 -Path $path } | Should -Throw '*exact version*'
+            { Add-WheelhouseWaiver -Name 'six' -Version '1.16.0' -Id 'all' -Reason 'x' -Days 10 -Path $path } | Should -Throw '*advisory ID*'
+            { Add-WheelhouseWaiver -Name 'six' -Version '1.16.0' -Id 'GHSA-1' -Reason 'x' -Days 91 -MaxDays 90 -Path $path } | Should -Throw '*at most 90*'
+            $entry = Add-WheelhouseWaiver -Name 'Six' -Version '1.16.0' -Id 'GHSA-1' -Reason 'ok' -Days 10 -Path $path
+            $entry.name | Should -Be 'six'
+            [void](Add-WheelhouseWaiver -Name 'six' -Version '1.16.0' -Id 'GHSA-1' -Reason 'renewed' -Days 20 -Path $path)
+            $all = @(Read-WheelhouseWaiver -Path $path)
+            $all.Count | Should -Be 1
+            $all[0].reason | Should -Be 'renewed'
+            (Get-WaiverMatch -Name 'six' -Version '1.16.0' -Id 'GHSA-1' -Waiver $all).reason | Should -Be 'renewed'
+            Get-WaiverMatch -Name 'six' -Version '1.17.0' -Id 'GHSA-1' -Waiver $all | Should -BeNullOrEmpty
+            Get-WaiverMatch -Name 'six' -Version '1.16.0' -Id 'GHSA-1' -Waiver $all -NowUtc (Get-Date).ToUniversalTime().AddDays(30) | Should -BeNullOrEmpty
+            Remove-WheelhouseWaiver -Name 'six' -Version '1.16.0' -Id 'GHSA-1' -Path $path | Should -Be $true
+            Remove-WheelhouseWaiver -Name 'six' -Version '1.16.0' -Id 'GHSA-1' -Path $path | Should -Be $false
+            Set-Content -Path $path -Value '[ broken'
+            { Read-WheelhouseWaiver -Path $path } | Should -Throw '*could not be parsed*'
+        }
+
+        It 'quarantines a published version with a malicious-package advisory only under AutoQuarantine' {
+            $wheelhouse = Get-TestWheelhouse
+            $deny = Join-Path (Get-TestFolder) 'deny.json'
+            $catalog = New-TestFindingCatalog -Wheelhouse $wheelhouse -Id @('MAL-2026-7')
+            Save-WheelhouseCatalog -Catalog $catalog
+            $catalog.Records['attrs==23.1.0'].findings[0].severity | Should -Be 'Unknown'
+
+            $report = @(Resolve-MaliciousPackage -WheelhousePath $wheelhouse -DenylistPath $deny)
+            $report.Count | Should -Be 1
+            $report[0].Kind | Should -Be 'Malicious'
+            (Read-WheelhouseCatalog -WheelhousePath $wheelhouse).Records['attrs==23.1.0'].state | Should -Be 'Published'
+
+            $lock = Open-WheelhouseWrite -WheelhousePath $wheelhouse -DenylistPath $deny
+            try { $done = @(Resolve-MaliciousPackage -WheelhousePath $wheelhouse -AutoQuarantine -DenylistPath $deny) } finally { Exit-WheelhouseLock -Lock $lock }
+            $done[0].Message | Should -Match 'quarantined'
+            (Read-WheelhouseCatalog -WheelhousePath $wheelhouse).Records['attrs==23.1.0'].state | Should -Be 'Quarantined'
+            (Get-DenylistMatch -Name 'attrs' -Version '23.1.0' -Denylist @(Read-WheelhouseDenylist -Path $deny)) | Should -Not -BeNullOrEmpty
+            Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt') | Should -Not -Contain 'attrs==23.1.0'
+            @(Resolve-MaliciousPackage -WheelhousePath $wheelhouse -AutoQuarantine -DenylistPath $deny).Count | Should -Be 0
+        }
+
+        It 'moves wheels nobody published out of the index only under AutoQuarantine' {
+            $wheelhouse = Get-TestWheelhouse
+            Set-Content -Path (Join-Path $wheelhouse 'stray-1.0-py3-none-any.whl') -Value 'unchecked'
+            $report = @(Move-UntrackedWheelFile -WheelhousePath $wheelhouse)
+            $report.Count | Should -Be 1
+            $report[0].Kind | Should -Be 'Untracked'
+            $report[0].Files -join ',' | Should -Be 'stray-1.0-py3-none-any.whl'
+            Test-Path (Join-Path $wheelhouse 'stray-1.0-py3-none-any.whl') | Should -Be $true
+
+            $moved = @(Move-UntrackedWheelFile -WheelhousePath $wheelhouse -AutoQuarantine)
+            $moved[0].Message | Should -Match '_untracked'
+            Test-Path (Join-Path $wheelhouse 'stray-1.0-py3-none-any.whl') | Should -Be $false
+            @(Get-ChildItem -Path (Join-Path $wheelhouse '_untracked') -Recurse -Filter '*.whl').Count | Should -Be 1
+            (Read-WheelhouseEvent -WheelhousePath $wheelhouse)[0].action | Should -Be 'UntrackedMoved'
+            @(Move-UntrackedWheelFile -WheelhousePath $wheelhouse -AutoQuarantine).Count | Should -Be 0
+
+            # First-time setup (empty manifest) adopts wheels instead.
+            $fresh = Get-TestFolder
+            Set-Content -Path (Join-Path $fresh 'old-1.0-py3-none-any.whl') -Value 'old'
+            @(Move-UntrackedWheelFile -WheelhousePath $fresh -AutoQuarantine).Count | Should -Be 0
+            Test-Path (Join-Path $fresh 'old-1.0-py3-none-any.whl') | Should -Be $true
+        }
+
+        It 'lists published versions without a recent completed audit as unverified' {
+            $catalog = New-TestFindingCatalog -Id @()
+            @(Get-CatalogUnverifiedRecord -Catalog $catalog -FreshnessDays 8).Count | Should -Be 0
+            $catalog.Records['six==1.16.0'].checks.audit.last_run = (Get-Date).ToUniversalTime().AddDays(-9).ToString('o')
+            $stale = @(Get-CatalogUnverifiedRecord -Catalog $catalog -FreshnessDays 8)
+            $stale.Count | Should -Be 1
+            $stale[0].name | Should -Be 'six'
+            # Never audited, published long ago.
+            $catalog.Records['attrs==23.1.0'].checks.audit = $null
+            $catalog.Records['attrs==23.1.0'].published_utc = (Get-Date).ToUniversalTime().AddDays(-30).ToString('o')
+            @(Get-CatalogUnverifiedRecord -Catalog $catalog -FreshnessDays 8).Count | Should -Be 2
+        }
+
+        It 'alerts tracked findings only when there is something new to say' {
+            $catalog = New-TestFindingCatalog -Id @('GHSA-3') -Severity @{ 'GHSA-3' = [PSCustomObject]@{ Severity = 'Medium'; Score = 5.0; Source = 'test'; Error = '' } }
+            $vulnerable = @([PSCustomObject]@{ Status = 'Vulnerable'; ReportPath = 'r.json'; Group = 'requirements-1'; Service = 'osv' })
+            $alerts = @(Get-TestAlert -Catalog $catalog)
+            $params = Get-VulnerabilityAlertParameter -AuditResult $vulnerable -Finding $alerts
+            $params.Findings.Count | Should -Be 1
+            $params.ContainsKey('ReportPaths') | Should -Be $false
+            Set-CatalogFindingNotified -Catalog $catalog -Finding $alerts
+            Get-VulnerabilityAlertParameter -AuditResult $vulnerable -Finding (Get-TestAlert -Catalog $catalog) | Should -BeNullOrEmpty
+            # Without tracked findings the reports are alerted as before.
+            (Get-VulnerabilityAlertParameter -AuditResult $vulnerable).ReportPaths | Should -Be 'r.json'
+
+            $html = ConvertTo-VulnerabilityAlertHtml -Findings @($alerts) -WheelhousePath $catalog.WheelhousePath
+            $html | Should -Match '<th>Severity</th>'
+            $html | Should -Match 'Medium \(5\)'
+            $html | Should -Match '>NEW<'
+            $resolved = $alerts[0].PSObject.Copy()
+            $resolved.AlertReason = 'Resolved'
+            ConvertTo-VulnerabilityAlertHtml -Findings @($resolved) | Should -Match 'Resolved since the last alert'
+        }
+
+        It 'records the due days from the settings' {
+            $days = Get-WheelhouseDueDayTable -Settings @{ DueDaysCritical = 1; DueDaysHigh = '' }
+            $days.Critical | Should -Be 1
+            $days.High | Should -Be 7
+            $days.Unknown | Should -Be 7
+            $days.Low | Should -Be 90
         }
     }
 
@@ -1927,6 +2217,41 @@ Describe 'WheelhouseManager' {
             $state = Invoke-WheelhouseUiApi -Method GET -Path '/api/state' -ManagerRoot $m.Root
             $state.Body.configured | Should -Be $true
             $state.Body.reachable | Should -Be $true
+        }
+
+        It 'adds and removes waivers and shows findings with their deadline' {
+            $m = Get-TestManager
+            Update-WheelhouseCatalog -WheelhousePath $m.Wheelhouse -DenylistPath (Join-Path $m.Root 'config\denylist.json') -Update {
+                param($catalog)
+                $report = Join-Path $m.Root 'report.json'
+                Set-Content -Path $report -Value '{"dependencies":[{"name":"attrs","version":"23.1.0","vulns":[{"id":"GHSA-9","fix_versions":["24.0"]}]}]}'
+                $results = @('osv', 'pypi' | ForEach-Object { [PSCustomObject]@{ Service = $_; Status = 'Vulnerable'; ReportPath = $report; GroupFile = 'x' } })
+                Update-CatalogAuditResult -Catalog $catalog -AuditResult $results -Severity @{ 'GHSA-9' = [PSCustomObject]@{ Severity = 'High'; Score = 8.1; Source = 'test'; Error = '' } }
+            }
+            $packages = (Invoke-WheelhouseUiApi -Method GET -Path '/api/packages' -ManagerRoot $m.Root).Body
+            $attrs = @($packages.packages | Where-Object { $_.name -eq 'attrs' })[0]
+            $attrs.severity | Should -Be 'High'
+            $attrs.open_findings | Should -Be 1
+            $attrs.overdue | Should -Be $false
+            $packages.check_overdue | Should -Be $true
+
+            $add = Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9","reason":"not used","days":"14"}')
+            $add.Status | Should -Be 200
+            $history = (Invoke-WheelhouseUiApi -Method GET -Path '/api/packages/attrs/23.1.0/history' -ManagerRoot $m.Root).Body
+            $finding = @($history.record.findings)[0]
+            $finding.status | Should -Be 'Waived'
+            @($finding.fix_versions) -join ',' | Should -Be '24.0'
+            @($history.events | ForEach-Object { $_.action }) | Should -Contain 'Waived'
+            $attrs = @((Invoke-WheelhouseUiApi -Method GET -Path '/api/packages' -ManagerRoot $m.Root).Body.packages | Where-Object { $_.name -eq 'attrs' })[0]
+            $attrs.open_findings | Should -Be 0
+            $attrs.waived_findings | Should -Be 1
+            @((Invoke-WheelhouseUiApi -Method GET -Path '/api/waivers' -ManagerRoot $m.Root).Body.items).Count | Should -Be 1
+
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9","reason":"","days":"14"}')).Status | Should -Be 400
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9","reason":"x","days":"365"}')).Status | Should -Be 400
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9"}')).Status | Should -Be 200
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/waivers/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"attrs","version":"23.1.0","id":"GHSA-9"}')).Status | Should -Be 404
+            @((Invoke-WheelhouseUiApi -Method GET -Path '/api/packages/attrs/23.1.0/history' -ManagerRoot $m.Root).Body.record.findings)[0].status | Should -Be 'Open'
         }
 
         It 'answers 409 when the wheelhouse is not configured' {

@@ -45,7 +45,7 @@ param(
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, VulnerabilityServices, ReportRetentionMonths
+    -Name WheelhousePath, VulnerabilityServices, ReportRetentionMonths, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow
 
 $title = 'Wheelhouse package audit'
 $outcome = $null
@@ -96,11 +96,22 @@ try {
     # The UI's package table shows the results from the catalog.
     $catalogAudits = $auditResults.ToArray()
     $catalogServices = $cfg.VulnerabilityServices
+    $catalogSeverity = Get-AuditResultSeverity -AuditResult $catalogAudits -WheelhousePath $cfg.WheelhousePath
+    $dueDays = Get-WheelhouseDueDayTable -Settings $cfg
     $recorded = $true
     try {
+        $waivers = @(Read-WheelhouseWaiver)
         Update-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath -Update ({
                 param($catalog)
-                Update-CatalogAuditResult -Catalog $catalog -AuditResult $catalogAudits -Services $catalogServices
+                $recordParams = @{
+                    Catalog     = $catalog
+                    AuditResult = $catalogAudits
+                    Services    = $catalogServices
+                    Severity    = $catalogSeverity
+                    DueDays     = $dueDays
+                    Waiver      = $waivers
+                }
+                Update-CatalogAuditResult @recordParams
             }.GetNewClosure())
     }
     catch {

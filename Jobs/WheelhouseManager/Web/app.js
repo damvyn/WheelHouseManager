@@ -68,6 +68,11 @@
     var d = new Date(s);
     return isNaN(d.getTime()) ? s : d.toLocaleString();
   }
+  function fmtDay(s) {
+    if (!s) { return ''; }
+    var d = new Date(s);
+    return isNaN(d.getTime()) ? s : d.toLocaleDateString();
+  }
   function toast(message, kind) {
     var el = h('div', { class: 'toast ' + (kind || 'ok') }, message);
     $('toasts').append(el);
@@ -165,6 +170,9 @@
       });
       state.groups = data.groups;
       state.untracked = data.untracked;
+      state.lastCheck = data.last_check_utc;
+      state.checkOverdue = data.check_overdue;
+      state.freshnessDays = data.audit_freshness_days;
       var present = {};
       state.pkgs.forEach(function (p) { present[pinKey(p)] = true; });
       Object.keys(state.selected).forEach(function (k) { if (!present[k]) { delete state.selected[k]; } });
@@ -181,6 +189,8 @@
       if (text && (p.name + ' ' + p.version + ' ' + p.file + ' ' + p.groups.join(' ')).toLowerCase().indexOf(text) < 0) { return false; }
       switch (state.statusFilter) {
         case 'vulnerable': return p.audit_status === 'Vulnerable';
+        case 'overdue': return p.overdue;
+        case 'waived': return p.waived_findings > 0;
         case 'threat': return p.scan_status === 'Threat';
         case 'unaudited': return p.audit_status === 'Unknown';
         case 'unscanned': return p.scan_status === 'Unknown';
@@ -221,12 +231,19 @@
       again.setSelectionRange(again.value.length, again.value.length);
     });
     var statusFilter = h('select', {},
-      [['all', 'All packages'], ['vulnerable', 'Vulnerable'], ['threat', 'Defender threat'], ['unaudited', 'Never audited'],
+      [['all', 'All packages'], ['vulnerable', 'Vulnerable'], ['overdue', 'Fix overdue'], ['waived', 'Risk accepted (waived)'],
+        ['threat', 'Defender threat'], ['unaudited', 'Never audited'],
         ['unscanned', 'Never scanned'], ['yanked', 'Yanked on PyPI'], ['denylisted', 'On the denylist'], ['missing', 'File missing']].map(function (o) {
         return h('option', { value: o[0], selected: state.statusFilter === o[0] }, o[1]);
       }));
     statusFilter.addEventListener('change', function () { state.statusFilter = statusFilter.value; renderPackages(); });
 
+    if (state.checkOverdue) {
+      root.append(h('div', { class: 'card warn-card' }, h('strong', {}, 'The scheduled check is not running. '),
+        state.lastCheck ? 'Test-Wheelhouse.ps1 last completed ' + fmtDate(state.lastCheck) + ', more than ' + state.freshnessDays + ' day(s) ago.'
+          : 'Test-Wheelhouse.ps1 has never completed for this wheelhouse.',
+        ' New vulnerabilities in published packages go unnoticed until it runs again - check its Scheduled Task.'));
+    }
     var toolbar = h('div', { class: 'toolbar' },
       h('div', { class: 'group' }, filter, statusFilter, h('button', { class: 'btn', type: 'button', onclick: loadPackages }, 'Refresh')),
       h('div', { class: 'group' },
@@ -267,9 +284,17 @@
         if (box.checked) { state.selected[k] = true; } else { delete state.selected[k]; }
         renderPackages();
       });
-      var auditCell = p.audit_status === 'Vulnerable'
-        ? badge('Vulnerable', 'bad', p.vulnerabilities.join(', '))
-        : p.audit_status === 'Passed' ? badge('Passed', 'ok', 'Last audit ' + p.last_audit) : badge('Not audited');
+      var auditCell;
+      if (p.open_findings > 0) {
+        auditCell = [badge(p.severity || 'Vulnerable', severityKind(p.severity), p.vulnerabilities.join(', ')), ' ',
+          p.overdue ? badge('overdue', 'bad', 'Fix was due ' + fmtDate(p.due)) : h('span', { class: 'muted' }, 'fix by ' + fmtDay(p.due))];
+      } else if (p.waived_findings > 0) {
+        auditCell = badge('Risk accepted', 'warn', 'Every finding is waived - see History');
+      } else if (p.audit_status === 'Vulnerable') {
+        auditCell = badge('Vulnerable', 'bad', p.vulnerabilities.join(', '));
+      } else {
+        auditCell = p.audit_status === 'Passed' ? badge('Passed', 'ok', 'Last audit ' + p.last_audit) : badge('Not audited');
+      }
       var scanCell = p.scan_status === 'Threat'
         ? badge('Threat', 'bad')
         : p.scan_status === 'Clean' ? badge('Clean', 'ok', 'Last scan ' + p.last_scan) : badge('Not scanned');
@@ -310,6 +335,37 @@
         line('Audit', checks.audit, function (c) { return c.status + (c.vulnerabilities && [].concat(c.vulnerabilities).length ? ' - ' + [].concat(c.vulnerabilities).join(', ') : ''); }),
         line('Defender', checks.scan, function (c) { return c.status; }),
         line('PyPI', checks.pypi, function (c) { return c.status + (c.reason ? ' - ' + c.reason : ''); }));
+      var findings = [].concat((record && record.findings) || []);
+      var findingTable = findings.length === 0 ? null : h('div', {}, h('h3', {}, 'Vulnerabilities'),
+        h('div', { class: 'table-wrap' }, h('table', {},
+          h('thead', {}, h('tr', {}, h('th', {}, 'Advisory'), h('th', {}, 'Severity'), h('th', {}, 'Fix by'), h('th', {}, 'Status'), h('th', {}, 'Fixed in'), h('th', {}, ''))),
+          h('tbody', {}, findings.map(function (f) {
+            var action;
+            if (f.waiver) {
+              action = h('button', { class: 'btn small', type: 'button' }, 'Remove waiver');
+              action.addEventListener('click', function () {
+                api('POST', '/api/waivers/remove', { name: data.name, version: data.version, id: f.id }).then(function () {
+                  toast('Waiver removed - ' + f.id + ' is alerted again.');
+                  closeOpenDialogs();
+                  showHistory(data.name, data.version);
+                  loadPackages();
+                }).catch(fail);
+              });
+            } else {
+              action = h('button', { class: 'btn small', type: 'button' }, 'Accept risk');
+              action.addEventListener('click', function () { acceptRisk(data.name, data.version, f); });
+            }
+            var status = f.status === 'Overdue' ? badge('overdue', 'bad') : f.status === 'Waived'
+              ? badge('waived', 'warn', f.waiver.reason + ' (' + f.waiver.by + ')') : badge('open');
+            return h('tr', {},
+              h('td', {}, h('span', { class: 'mono' }, f.id), [].concat(f.aliases || []).length ? h('div', { class: 'muted mono' }, [].concat(f.aliases).join(', ')) : null,
+                f.summary ? h('div', { class: 'muted' }, f.summary) : null),
+              h('td', {}, badge(f.severity, severityKind(f.severity)), f.score !== null && f.score !== undefined ? ' ' + f.score : ''),
+              h('td', {}, fmtDay(f.due)),
+              h('td', {}, status, f.waiver ? h('div', { class: 'muted' }, 'until ' + fmtDay(f.waiver.expires_utc)) : null),
+              h('td', { class: 'mono' }, [].concat(f.fix_versions || []).join(', ') || h('span', { class: 'muted' }, 'none yet')),
+              h('td', {}, action));
+          })))));
       var events = [].concat(data.events || []);
       var table = events.length === 0 ? h('p', { class: 'muted' }, 'No history recorded yet.') :
         h('div', { class: 'table-wrap' }, h('table', {},
@@ -317,8 +373,34 @@
           h('tbody', {}, events.map(function (e) {
             return h('tr', {}, h('td', {}, fmtDate(e.ts)), h('td', {}, e.action), h('td', {}, e.user), h('td', {}, e.detail));
           }))));
-      infoDialog(data.name + '==' + data.version, h('div', {}, summary, table));
+      infoDialog(data.name + '==' + data.version, h('div', {}, summary, findingTable, table));
     }).catch(fail);
+  }
+
+  function severityKind(severity) {
+    return severity === 'Critical' || severity === 'High' || severity === 'Unknown' ? 'bad' : 'warn';
+  }
+  function closeOpenDialogs() {
+    Array.prototype.forEach.call(document.querySelectorAll('dialog[open]'), function (d) { d.close(); });
+  }
+
+  // A waiver accepts one advisory for one version until a date; it is never permanent.
+  function acceptRisk(name, version, finding) {
+    var reason = h('input', { type: 'text', class: 'wide', placeholder: 'Why is this acceptable? (required, kept in the history)' });
+    var days = h('input', { type: 'number', min: '1', value: '30' });
+    var body = h('div', {},
+      h('p', {}, 'Accept ', h('span', { class: 'mono' }, finding.id), ' (' + finding.severity + ') for ', h('span', { class: 'mono' }, name + '==' + version), '.'),
+      h('p', { class: 'muted' }, 'It is not alerted while the waiver lasts. When the waiver ends it is alerted again. Other advisories and other versions are not covered.'),
+      h('div', { class: 'toolbar' }, reason), h('label', {}, 'Days: ', days));
+    closeOpenDialogs();
+    confirmDialog('Accept the risk?', body, 'Accept risk', false).then(function (ok) {
+      if (!ok) { showHistory(name, version); return; }
+      api('POST', '/api/waivers/add', { name: name, version: version, id: finding.id, reason: reason.value, days: days.value }).then(function (data) {
+        toast('Risk accepted until ' + fmtDay(data.expires_utc) + '.');
+        loadPackages();
+        showHistory(name, version);
+      }).catch(function (err) { fail(err); showHistory(name, version); });
+    });
   }
 
   function startJobRequest(promise) {
@@ -505,7 +587,34 @@
             h('td', { class: 'mono' }, e.version), h('td', {}, e.reason), h('td', {}, badge(e.source)),
             h('td', {}, fmtDate(e.added_utc), h('div', { class: 'muted' }, e.added_by)), h('td', {}, remove));
         })))));
-    }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
+    }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); })
+      .then(loadWaivers);
+  }
+
+  // Accepted risks are listed under the denylist: both decide what is alerted and blocked.
+  function loadWaivers() {
+    var root = $('tab-denylist');
+    api('GET', '/api/waivers').then(function (data) {
+      var card = h('div', { class: 'card' }, h('h2', {}, 'Accepted risks (waivers)'),
+        h('p', { class: 'muted' }, 'A waiver accepts one advisory for one package version until a date (at most ' + data.max_days +
+          ' days). Waived findings are not alerted; when the waiver ends they are alerted again. Add one from a package\'s History.'));
+      root.append(card);
+      if (data.items.length === 0) {
+        root.append(h('div', { class: 'table-wrap' }, h('div', { class: 'empty' }, 'No waivers.')));
+        return;
+      }
+      root.append(h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Package'), h('th', {}, 'Advisory'), h('th', {}, 'Reason'), h('th', {}, 'Until'), h('th', {}, 'Added'), h('th', {}, ''))),
+        h('tbody', {}, data.items.map(function (w) {
+          var remove = h('button', { class: 'btn small', type: 'button' }, 'Remove');
+          remove.addEventListener('click', function () {
+            api('POST', '/api/waivers/remove', { name: w.name, version: w.version, id: w.id }).then(function () { toast('Waiver removed.'); loadDenylist(); }).catch(fail);
+          });
+          return h('tr', {}, h('td', {}, h('strong', {}, w.name), ' ', h('span', { class: 'mono' }, w.version)), h('td', { class: 'mono' }, w.id), h('td', {}, w.reason),
+            h('td', {}, w.expired ? badge('expired', 'bad') : fmtDay(w.expires_utc)),
+            h('td', {}, fmtDate(w.added_utc), h('div', { class: 'muted' }, w.added_by)), h('td', {}, remove));
+        })))));
+    }).catch(function (err) { root.append(h('div', { class: 'empty' }, err.message)); });
   }
 
   // ---------------------------------------------------------------- settings tab

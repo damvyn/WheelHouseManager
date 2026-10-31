@@ -13,8 +13,10 @@ What it does for you:
   period for brand-new releases, PyPI's "yanked" flag, a hash comparison with what PyPI
   publishes, and a Microsoft Defender scan.
 - **Keeps watching what is already published.** A package that was clean when it was added can
-  become vulnerable, yanked or detected as malware later. A weekly check finds that and sends one
-  alert that says what is affected and what to do.
+  become vulnerable, yanked or detected as malware later. A weekly check finds that, rates each
+  vulnerability (Critical / High / Medium / Low, from OSV), gives it a fix-by date, and alerts
+  when something is new, overdue or resolved - not the same list every week. You can accept a
+  risk for a limited time (a *waiver*).
 - **Lets you act quickly.** Quarantine (reversible) or delete a package, block versions on a
   denylist, restore from quarantine, or fast-track an urgent security fix.
 - **Gives you a web UI** on the manager server for all of the above, plus email (or HTML file)
@@ -89,18 +91,32 @@ The two parts only share the wheelhouse folder: the manager writes it, clients r
    (`catalog.json`) marks the version *Published* and its history records who published it.
 6. **Monitored.** Every week `Test-Wheelhouse.ps1` re-checks everything that is published:
    files unchanged (hash), new vulnerabilities, yanked on PyPI since, denylisted since, and -
-   wheels the file server's antivirus removed or changed. Anything it finds goes into one alert, and
-   every result is recorded in the catalog - the UI shows it, and a change (for example *Passed*
-   -> *Vulnerable*) appears in the package's history.
-7. **Taken out (if needed).** You quarantine or delete the package. Its pin is removed and the
+   wheels the file server's antivirus removed or changed. Every result is recorded in the catalog -
+   the UI shows it, and a change (for example *Passed* -> *Vulnerable*) appears in the package's
+   history.
+7. **Flagged (if a vulnerability appears).** Each vulnerability becomes a *finding* with a
+   severity and a fix-by date (Critical 3 days, High 7, Medium 30, Low 90 - adjustable). The alert
+   goes out once when it is new, again when it becomes **overdue** (then weekly as a reminder), and
+   once when it is resolved. If you decide the risk is acceptable, you can **waive** that one
+   advisory for that one version until a date (at most 90 days); it is alerted again when the
+   waiver ends.
+8. **Taken out (if needed).** You quarantine or delete the package. Its pin is removed and the
    version is denylisted so it is not downloaded again. Quarantine can be undone.
 
 **Findings are not acted on automatically** - a package flagged as vulnerable, yanked or
-denylisted stays installable until an administrator acts on the alert. The one exception is a
-wheel that was **removed or changed on the share** by something else, typically the file
-server's antivirus: with `AutoQuarantine` on (the default), the weekly check or the next update
-takes a missing wheel out of the group files and the manifest, quarantines a changed one as
-evidence, denylists both, and alerts.
+denylisted stays installable until an administrator acts on the alert. The exceptions, all under
+the `AutoQuarantine` switch (on by default) and all alerted:
+
+- a wheel that was **removed or changed on the share** by something else, typically the file
+  server's antivirus: a missing wheel is taken out of the group files and the manifest, a changed
+  one is quarantined as evidence, and both are denylisted;
+- a published version that OSV lists as a **malicious package** (advisory `MAL-...`) is
+  quarantined and denylisted;
+- wheel files that appear in the share **without having been published by the manager** (copied
+  in by hand) are moved to `<wheelhouse>\_untracked\`, where clients cannot see them.
+
+If the weekly check stops running, the UI shows a warning and `Update-Wheelhouse.ps1` logs one; a
+version whose audits have not completed for `AuditFreshnessDays` (8) is alerted as *Unverified*.
 
 **Virus scanning of the share is not this tool's job** - the file server's own antivirus does
 that. This manager scans every *new* download with Microsoft Defender before it is published, and
@@ -119,6 +135,10 @@ can scan published wheels on demand (from hash-checked local copies).
 | **Quarantine** | `<wheelhouse>\_quarantine\`: removed packages kept for later restore. |
 | **Catalog** | `catalog.json` in the wheelhouse: each package version's state (*Published*, *Quarantined*, *Removed*) and its latest audit, Defender and PyPI results. Rebuilt automatically from the other files if it is missing. |
 | **History** | `events.jsonl` in the wheelhouse: who did what to which version, and when a check result changed. |
+| **Finding** | One vulnerability advisory reported for one published version, with its severity, fix-by date and alert status. |
+| **Overdue** | A finding still open after its fix-by date. |
+| **Waiver** | An accepted risk: one advisory, one exact version, until a date (`config\waivers.json`). Waived findings are not alerted. |
+| **Unverified** | A published version whose audits have not completed for `AuditFreshnessDays` - its status is no longer known to be current. |
 
 ---
 
@@ -292,7 +312,11 @@ settings file** > **the built-in default**. A key missing from the file uses its
 | `SmtpServer` | (empty) | SMTP relay (`host` or `host:port`). Empty: alerts are saved as HTML files instead of emailed. |
 | `MailTo` / `MailFrom` | `servicedesk@company.com` / `NoReply@company.com` | Alert recipient and sender. |
 | `RequireDefenderScanAtIntake` | `$false` | When a download cannot be scanned (not elevated, Defender missing): `$false` publishes with a warning, `$true` rejects it. A detection always rejects. |
-| `AutoQuarantine` | `$true` | A published wheel that disappeared from the share (e.g. moved to the file server antivirus' quarantine) is taken out of the group files and denylisted; one whose content changed is quarantined as evidence. `$false`: only reported, and updates stop until someone acts. Override per run with `-AutoQuarantine On|Off`. An alert is sent either way. |
+| `AutoQuarantine` | `$true` | A published wheel that disappeared from the share (e.g. moved to the file server antivirus' quarantine) is taken out of the group files and denylisted; one whose content changed is quarantined as evidence. The same switch quarantines a published version with a malicious-package advisory (`MAL-...`) and moves wheels nobody published to `_untracked\`. `$false`: only reported, and updates stop on a missing/changed wheel until someone acts. Override per run with `-AutoQuarantine On|Off`. An alert is sent either way. |
+| `DueDaysCritical` / `DueDaysHigh` / `DueDaysMedium` / `DueDaysLow` | `3` / `7` / `30` / `90` | Days a vulnerability of that severity may stay open before it is overdue. An advisory without a published severity counts as High. |
+| `WaiverMaxDays` | `90` | Longest allowed waiver. |
+| `AuditFreshnessDays` | `8` | A published version without a completed audit for this long is alerted as *Unverified*; the UI warns when the weekly check has not completed for this long. |
+| `OverdueReminderDays` | `7` | How often an overdue vulnerability is alerted again. |
 
 Example:
 
@@ -385,7 +409,8 @@ group file cannot list two versions of a package. Both wheels are then in the wh
 ```
 
 In the UI: **Packages** tab -> **Audit all / Audit selected**, **Scan all / Scan selected**. The
-table shows each package's latest audit and scan result.
+table shows each package's latest audit and scan result; a vulnerable package shows its worst
+severity and fix-by date (or *overdue*).
 
 ### 5.5 Respond to an alert
 
@@ -400,17 +425,31 @@ An alert (email, or `<wheelhouse>\reports\Alert_<timestamp>.html`) can contain t
 | `FileMissing` | A published wheel disappeared from the share - usually the file server's antivirus moved it to its quarantine. With AutoQuarantine on, the version was taken out of the group files and denylisted. | Check the file server's antivirus log. False positive: remove the version from the denylist and run `Update-Wheelhouse.ps1` (it downloads a verified copy). Otherwise keep it blocked and pin another version. |
 | `FileModified` | A published wheel's content changed. With AutoQuarantine on, it was quarantined as evidence and denylisted. | Find out what changed it; do not restore it. |
 | `IntakeBlocked` | A download did not match PyPI or was detected - nothing was published. | Investigate before trying that version again. |
+| `Malicious` | OSV lists a published version as a malicious package. With AutoQuarantine on, it was quarantined and denylisted. | Treat every client that installed it as compromised (`uv pip list`). Do not restore it unless the advisory is withdrawn. |
+| `Unverified` | No audit of this version has completed for `AuditFreshnessDays` - new vulnerabilities in it would go unnoticed. | Find out why the audits fail (network, proxy) in `Log_Audit_*.txt`. |
+| `Untracked` | Wheel files appeared in the share that the manager never published (never checked). With AutoQuarantine on, they were moved to `_untracked\<time>\`. | Find out who copied them in; publish the packages you need through `requirements.in`, then delete the folder. |
 
 **Vulnerability findings** - package, version, advisory ID (CVE/GHSA), description, fix
-version, the group file(s) that list it and the exact wheel file(s). A finding marked *Blocked
-before download* was a candidate that never reached the wheelhouse - just change
-`requirements.in`. For a published package:
+version, the group file(s) that list it and the exact wheel file(s). In the weekly check's alert
+each finding also has a **severity**, a **fix-by** date and a **status**: `NEW`, `OVERDUE`,
+`OVERDUE (reminder)`, `waiver ended`, or `open` (already alerted, listed again for completeness).
+Overdue ones come first; resolved findings are listed in a short section of their own. The weekly
+check alerts only when there is something new to say (a new, newly overdue, reminded, unwaived or
+resolved finding, a notice, or a failed check). A finding marked *Blocked before download* was a
+candidate that never reached the wheelhouse - just change `requirements.in`. For a published package:
 
 1. Quarantine (or delete) it - UI **Packages** tab. This removes the pin, the manifest entry and
    the file, and denylists that version.
 2. Put the fixed version in `requirements.in` (e.g. `requests>=2.32.4`), run
    `Update-Requirement.ps1`, review, run `Update-Wheelhouse.ps1`.
 3. If the fix is newer than the cooldown, see 5.6.
+
+If you decide not to fix it now - for example the vulnerable code path is not used - **accept the
+risk** for a limited time: UI **Packages** -> **History** of that version -> **Accept risk** on the
+advisory, with a reason and a number of days (at most `WaiverMaxDays`). The finding is no longer
+alerted and no longer makes the weekly check exit with code 1. When the waiver expires (or you
+remove it on the **Denylist** tab, under *Accepted risks*), it is alerted again. A waiver covers
+one advisory for one version only; the reason, the user and the dates are kept in the history.
 
 **Audits or checks that could not be completed** - the affected packages were *not* checked. Look
 at the run log (`<wheelhouse>\reports\Log_Audit_*.txt`), fix the cause (usually network) and run
@@ -520,10 +559,10 @@ whether Defender is available and the session is elevated.
 
 | Tab | What you can do |
 |---|---|
-| **Packages** | See every published wheel with its groups, latest audit and Defender result, a *yanked* badge if PyPI withdrew it, and the denylist flag; filter by name or status (vulnerable, threat, never audited/scanned, yanked, denylisted, file missing). Select rows to **Audit**, **Scan**, **Quarantine** or **Delete**; **History** shows one version's state, checks and history. |
+| **Packages** | See every published wheel with its groups, latest audit (for a vulnerable one: worst severity and fix-by date, or *overdue*) and Defender result, a *yanked* badge if PyPI withdrew it, and the denylist flag; filter by name or status (vulnerable, fix overdue, risk accepted, threat, never audited/scanned, yanked, denylisted, file missing). Select rows to **Audit**, **Scan**, **Quarantine** or **Delete**; **History** shows one version's state, checks, vulnerabilities (with **Accept risk** / **Remove waiver**) and history. A banner warns when the weekly check has not run for `AuditFreshnessDays`. |
 | **Add packages** | **1. Add**: enter packages; they are added to `requirements.in` and resolved - nothing is downloaded. **2. Review and publish**: read the resolved `requirements.txt`, then **Publish** (runs every check, then publishes). *Also publish right away* does both at once. The card at the bottom lists the latest rejected packages with their reasons. |
 | **Quarantine** | Quarantined packages; **Restore** one. |
-| **Denylist** | Add or remove blocked versions; shows whether a blocked version is still published. |
+| **Denylist** | Add or remove blocked versions; shows whether a blocked version is still published. Below it, **Accepted risks** lists every waiver with its reason and expiry, and lets you remove one. |
 | **Settings** | Edit `settings.psd1` with validation. |
 | **Jobs** | Long actions run as background jobs, one at a time, with a live log and **Cancel**. A job ends as *Succeeded*, *Needs attention* (findings or rejected packages - read the log) or *Failed*. |
 
@@ -546,7 +585,7 @@ shows the details.
 | `Jobs\Test-Wheelhouse.ps1` | Weekly check of everything published, with alert | `-AutoQuarantine On|Off`, `-VulnerabilityServices`, `-SmtpServer`, `-MailTo`, `-MailFrom` |
 | `Jobs\Test-WheelhousePackage.ps1` | Audit all or chosen pins, no alert | `-Package name==ver,...` |
 | `Jobs\Invoke-WheelhouseScan.ps1` | On-demand Defender scan of all or chosen wheels - copied locally and hash-checked first, never scanned on the share (elevated) | `-File name.whl,...` |
-| `Jobs\Send-VulnerabilityAlert.ps1` | Build and send/save an alert (used by the scripts above) | `-ReportPaths`, `-AuditErrors`, `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
+| `Jobs\Send-VulnerabilityAlert.ps1` | Build and send/save an alert (used by the scripts above) | `-ReportPaths`, `-Findings`, `-AuditErrors`, `-Notices`, `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
 | `Jobs\Start-WheelhouseUI.ps1` | Start the web UI | `-Port`, `-NoBrowser` |
 
 Changes to the wheelhouse are serialized, but only for the seconds in which files are written:
@@ -574,8 +613,10 @@ is deleted after `ReportRetentionMonths`.
 | `Report_Integrity_<ts>.json` | Integrity check | What did not match the manifest |
 | `Alert_<ts>.html` | Send-VulnerabilityAlert | Saved alert (no SMTP server) |
 
-Next to `reports\`, the wheelhouse holds `catalog.json` (current state and latest check results
-per package version) and `events.jsonl` (history). Neither is deleted by the retention setting.
+Next to `reports\`, the wheelhouse holds `catalog.json` (current state, latest check results and
+vulnerability findings per package version) and `events.jsonl` (history). Neither is deleted by the
+retention setting, nor is `reports\osv-cache.json` (severities looked up on OSV, refreshed weekly).
+Waivers are kept on the manager server in `config\waivers.json`.
 
 Jobs started from the UI also keep their console output in `C:\WheelHouseManager\logs\ui\`.
 
@@ -588,7 +629,7 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
 | Code | Meaning |
 |---|---|
 | `0` | OK. |
-| `1` | Finished, but **needs attention**: vulnerabilities, rejected packages, threats or other findings. |
+| `1` | Finished, but **needs attention**: vulnerabilities (not waived), rejected packages, threats or other findings. |
 | `2` | **Error**: the run aborted, or a check could not be completed (never reported as clean). |
 | `3` | **Busy**: another wheelhouse operation holds the lock. Try again later. |
 
@@ -617,7 +658,10 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
 | UI: `Open the address printed by Start-WheelhouseUI.ps1 (it contains the session token)` | Use the full URL from the console; it changes at every start. |
 | UI: `Cannot listen on port 8765` | The UI is already running, or the port is used - use `-Port`. |
 | UI: job *Needs attention* | Normal outcome with findings or rejections - open the log. |
-| No alert email arrives | Check `SmtpServer`; without it, alerts are saved as HTML in `reports\`. `Send-MailMessage` does not support authentication - use an internal relay. |
+| No alert email arrives | Check `SmtpServer`; without it, alerts are saved as HTML in `reports\`. `Send-MailMessage` does not support authentication - use an internal relay. The weekly check alerts only when something changed: a finding that was already alerted and is not yet due is not alerted again (exit code 1 still shows it is open). |
+| `OSV lookup failed: ... severities not in the cache count as High in this run` | The manager server cannot reach `api.osv.dev`. Nothing else is affected; severities are looked up again next run. |
+| UI banner *The scheduled check is not running* | `Test-Wheelhouse.ps1` has not completed within `AuditFreshnessDays`. Check its Scheduled Task and its last log (`Log_Audit_*.txt`). |
+| `waivers.json exists but could not be parsed` | The file is damaged; it is never treated as empty. Fix the JSON or restore it. |
 
 ---
 
@@ -643,10 +687,12 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
 
 - Wheels only (no source packages), for **one** Python version and platform per manager.
 - Vulnerable, yanked or denylisted packages are not quarantined automatically - an administrator
-  decides. Only wheels removed or changed on the share are taken out automatically (`AutoQuarantine`).
+  decides. Only wheels removed or changed on the share, malicious-package advisories and wheels
+  nobody published are acted on automatically (`AutoQuarantine`).
 - The share is not virus-scanned by this tool; that is the file server antivirus' job.
-- Wheels found in the share that the manager did not publish ("untracked") are reported, but are
-  still visible to clients until removed by hand.
+- Severities come from OSV. An advisory rated only with CVSS 4 and no database rating counts as
+  High. `Update-Wheelhouse.ps1` / the pipeline still alert every vulnerable deployed audit; only
+  the weekly check's alerts are stateful.
 - Email uses `Send-MailMessage` (no SMTP authentication).
 - Planned improvements are listed in [REFACTOR_PLAN.md](REFACTOR_PLAN.md).
 

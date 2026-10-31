@@ -12,7 +12,9 @@ function Invoke-WheelhouseSync {
     #   C. per group: Invoke-CandidateIntake (no lock), then Publish-CandidateIntake (write
     #      lock for the seconds the publish takes), then audit the group as deployed;
     #   D. first-time setup only: adopt the wheels the folder already held (write lock);
-    #   E. record every audit in the catalog (write lock).
+    #   E. record every audit in the catalog with severities, due dates and waivers, and
+    #      quarantine published versions with a malicious-package advisory
+    #      (-AutoQuarantine) (write lock).
     # The share itself is not virus-scanned here: that is the file server's antivirus' job.
     # When it removes a wheel, step A notices the missing file.
     # The sync lock is held for the whole run, so two runs never plan from the same state;
@@ -55,6 +57,15 @@ function Invoke-WheelhouseSync {
 
         [string]$DenylistPath = (Get-WheelhouseDenylistPath),
 
+        [string]$WaiverPath = (Get-WheelhouseWaiverPath),
+
+        # Fix-by days per severity (Get-WheelhouseDueDayTable).
+        [hashtable]$DueDays = (Get-WheelhouseDueDayTable),
+
+        # Warn when the scheduled check has not run for this long.
+        [ValidateRange(1, 3650)]
+        [int]$AuditFreshnessDays = 8,
+
         [string]$StagingRoot = (Join-Path $script:ManagerRoot 'staging'),
 
         # How long a write-lock step waits for a quarantine/restore/check to finish.
@@ -78,6 +89,7 @@ function Invoke-WheelhouseSync {
         try {
             $denylist = @(Read-WheelhouseDenylist -Path $DenylistPath)
             if ($denylist.Count -gt 0) { Write-Log "Denylist: $($denylist.Count) blocked package entr(y/ies) will be rejected at intake." }
+            $waivers = @(Read-WheelhouseWaiver -Path $WaiverPath)
 
             Write-Log "Loading manifest: $(Get-WheelhouseManifestPath -WheelhousePath $WheelhousePath)"
             $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
@@ -96,8 +108,22 @@ function Invoke-WheelhouseSync {
                 $overallPassed = $false
                 $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
             }
+            # Wheels nobody published (never on first-time setup, which adopts them).
+            foreach ($notice in @(Move-UntrackedWheelFile -WheelhousePath $WheelhousePath -AutoQuarantine:$AutoQuarantine)) {
+                $notices.Add($notice)
+                $overallPassed = $false
+            }
 
             Update-WheelhouseCatalog -WheelhousePath $WheelhousePath -LockHeld -DenylistPath $DenylistPath
+            if (-not $isBootstrap) {
+                $lastCheck = ConvertTo-OptionalUtcDateTime -Value (Read-WheelhouseCatalog -WheelhousePath $WheelhousePath).ScheduledCheckUtc
+                if (-not $lastCheck) {
+                    Write-Log 'The scheduled check (Test-Wheelhouse.ps1) has never completed for this wheelhouse - published packages are only re-checked by this update. Register it as a Scheduled Task (README).' 'WARN'
+                }
+                elseif (((Get-Date).ToUniversalTime() - $lastCheck).TotalDays -gt $AuditFreshnessDays) {
+                    Write-Log "The scheduled check (Test-Wheelhouse.ps1) last completed on $($lastCheck.ToString('yyyy-MM-dd')), more than $AuditFreshnessDays day(s) ago. Check its Scheduled Task." 'WARN'
+                }
+            }
 
             [string[]]$groupFiles = Get-WheelhouseGroupFile -WheelhousePath $WheelhousePath
             $listedByGroup = @{}
@@ -305,12 +331,27 @@ function Invoke-WheelhouseSync {
         # share itself is the file server's antivirus' job; new wheels were scanned
         # at intake.
         # -------------------------------------------------------------------
+        # Outside the write lock: it may go to the network.
+        $severity = Get-AuditResultSeverity -AuditResult $auditResults.ToArray() -WheelhousePath $WheelhousePath
         $lock = Open-WheelhouseWrite -WheelhousePath $WheelhousePath -TimeoutSeconds $LockTimeoutSeconds -DenylistPath $DenylistPath
         try {
             $catalog = Read-WheelhouseCatalog -WheelhousePath $WheelhousePath
             [void](Sync-WheelhouseCatalog -Catalog $catalog)
-            Update-CatalogAuditResult -Catalog $catalog -AuditResult $auditResults.ToArray() -Services $Services
+            $recordParams = @{
+                Catalog     = $catalog
+                AuditResult = $auditResults.ToArray()
+                Services    = $Services
+                Severity    = $severity
+                DueDays     = $DueDays
+                Waiver      = $waivers
+            }
+            Update-CatalogAuditResult @recordParams
             Save-WheelhouseCatalog -Catalog $catalog
+
+            foreach ($notice in @(Resolve-MaliciousPackage -WheelhousePath $WheelhousePath -AutoQuarantine:$AutoQuarantine -DenylistPath $DenylistPath)) {
+                $notices.Add($notice)
+                $overallPassed = $false
+            }
         }
         finally {
             Exit-WheelhouseLock -Lock $lock
