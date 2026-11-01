@@ -43,16 +43,16 @@ the *wheelhouse* - for Windows clients that may not reach PyPI.
 
 ```mermaid
 flowchart LR
-    subgraph Manager server
-        IN[Input\requirements.in] -->|Update-Requirement.ps1<br/>uv pip compile + pip dry-run| TXT[Input\requirements.txt]
-        TXT -->|Update-Wheelhouse.ps1 -> Invoke-WheelhouseSync<br/>merge plan + Invoke-CandidateIntake| STG[staging\]
-        STG -->|Publish-CandidateIntake<br/>write lock + journal| WH
-        SCHED[Scheduled Task] -->|Test-Wheelhouse.ps1| WH
-        UI[Start-WheelhouseUI.ps1<br/>HttpListener on localhost] -->|child processes / module calls| WH
+    subgraph MGR["Manager server"]
+        IN["Input\requirements.in"] -->|"Update-Requirement.ps1: uv pip compile + pip dry-run"| TXT["Input\requirements.txt"]
+        TXT -->|"approved proposal: Update-Wheelhouse.ps1, Invoke-WheelhouseSync"| STG["staging (checks: denylist, audit, PyPI, sha256, Defender)"]
+        STG -->|"Publish-CandidateIntake: write lock + journal"| WH
+        SCHED["Scheduled Task"] -->|"Test-Wheelhouse.ps1"| WH
+        UI["Start-WheelhouseUI.ps1 / whm.ps1"] -->|"child processes / module calls"| WH
     end
-    EXT[(pypi.org / files.pythonhosted.org<br/>api.osv.dev / Defender)] -.-> Manager server
-    WH[(Wheelhouse share<br/>*.whl, requirements-N.txt, manifest.json,<br/>catalog.json, events.jsonl, reports\, _quarantine\)]
-    WH -->|flat index, read only| CL[Clients: uv]
+    EXT[("pypi.org, files.pythonhosted.org, api.osv.dev")] -.-> MGR
+    WH[("Wheelhouse share: *.whl, requirements-N.txt, manifest.json, catalog.json, events.jsonl, advisories.json, index.html, reports, _quarantine")]
+    WH -->|"flat index, read only"| CL["Clients: uv"]
 ```
 
 Technology: PowerShell targeting **Windows PowerShell 5.1** (also runs on 7), one script module,
@@ -256,26 +256,29 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
 
 ```mermaid
 flowchart TD
-    subgraph Entry[Entry points]
-        SETUP[Setup.ps1]
-        PIPE[Invoke-WheelhousePipeline.ps1]
-        UISCR[Start-WheelhouseUI.ps1]
-        TASK[Scheduled Task]
+    subgraph Entry["Entry points"]
+        SETUP["Setup.ps1"]
+        WHM["whm.ps1"]
+        UISCR["Start-WheelhouseUI.ps1"]
+        TASK["Scheduled Task"]
     end
-    subgraph Scripts[Jobs\*.ps1]
-        UR[Update-Requirement] & UW[Update-Wheelhouse] & TW[Test-Wheelhouse] & TWP[Test-WheelhousePackage] & IWS[Invoke-WheelhouseScan] & SVA[Send-VulnerabilityAlert]
+    subgraph Scripts["Jobs scripts"]
+        UR["Update-Requirement"] & UW["Update-Wheelhouse"] & TW["Test-Wheelhouse"] & TWP["Test-WheelhousePackage"] & IWS["Invoke-WheelhouseScan"] & SVA["Send-VulnerabilityAlert"] & PIPE["Invoke-WheelhousePipeline"] & REM["Invoke-WheelhouseRemediation"]
     end
-    MOD[WheelhouseManager module]
-    EXT[python / pip / pip-audit / uv / PyPI / OSV / Defender / SMTP]
+    MOD["WheelhouseManager module"]
+    EXT["python, pip-audit, uv, PyPI, OSV, Defender, SMTP, Task Scheduler, Event Log"]
 
-    PIPE -->|& script| UW
-    PIPE -->|& script| SVA
+    WHM -->|"runs"| UR & UW & TW & TWP & IWS & PIPE & REM
+    WHM --> MOD
+    PIPE -->|"runs"| UW
+    PIPE -->|"runs"| SVA
+    REM -->|"runs"| UR
     TASK --> TW
-    TW -->|& script| SVA
+    TW -->|"runs"| SVA
     UISCR --> MOD
-    MOD -.->|Start-Process| UR & UW & TWP & IWS
+    MOD -.->|"Start-Process"| UR & UW & TWP & IWS & REM
     SETUP --> MOD
-    UR & UW & TW & TWP & IWS & SVA --> MOD
+    UR & UW & TW & TWP & IWS & SVA & PIPE & REM --> MOD
     MOD --> EXT
 ```
 
