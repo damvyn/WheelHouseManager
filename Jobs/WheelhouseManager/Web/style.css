@@ -216,3 +216,24 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .link-toggle:hover, .link-toggle:focus-visible { text-decoration: underline; }
 /* A job is running: buttons that would start another one look disabled (their clicks are blocked). */
 body.job-running [data-idle] { opacity: .45; cursor: not-allowed; }
+/* Audit tab */
+#tab-audit .table-wrap.scroll-list { max-height: 360px; margin-bottom: 14px; }
+.audit-desc { max-width: 520px; color: var(--muted); font-size: 12.5px; }
+.scroll-box { max-height: 220px; overflow: auto; }
+/* Top bar pill while a job runs: a spinner and a light sweeping across, so it is clear work is going on. */
+.job-indicator.running { position: relative; overflow: hidden; }
+.job-indicator.running .dot {
+  background: transparent; border: 2px solid var(--accent); border-right-color: transparent;
+  width: 12px; height: 12px; animation: job-spin .8s linear infinite;
+}
+.job-indicator.running::after {
+  content: ''; position: absolute; top: 0; bottom: 0; left: -40%; width: 40%; pointer-events: none;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 22%, transparent), transparent);
+  animation: job-sweep 1.6s ease-in-out infinite;
+}
+@keyframes job-spin { to { transform: rotate(360deg); } }
+@keyframes job-sweep { 0% { left: -40%; } 100% { left: 100%; } }
+@media (prefers-reduced-motion: reduce) {
+  .job-indicator.running .dot { animation: none; }
+  .job-indicator.running::after { animation: none; display: none; }
+}

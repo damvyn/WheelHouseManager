@@ -180,7 +180,7 @@
       s.classList.toggle('hidden', s.id !== 'tab-' + name);
     });
     var loaders = {
-      overview: loadOverview, packages: loadPackages, add: renderAdd, quarantine: loadQuarantine,
+      overview: loadOverview, packages: loadPackages, add: renderAdd, audit: loadAudits, quarantine: loadQuarantine,
       denylist: loadDenylist, schedule: loadScheduleTab, settings: loadSettings, jobs: loadJobs
     };
     return loaders[name]();
@@ -880,6 +880,86 @@
     }).catch(function () { /* the card stays empty */ });
   }
 
+  // ---------------------------------------------------------------- audit tab
+  // The pip-audit reports in <wheelhouse>\reports: one row per report, newest first; Open shows
+  // what it found (vulnerable packages first, with advisories and fix versions).
+  var stageNames = {
+    Scheduled: 'Weekly check', PreDownload: 'Before download', Deployed: 'Published packages', Manual: 'Manual audit'
+  };
+  function loadAudits() {
+    var root = $('tab-audit');
+    return api('GET', '/api/audits').then(function (data) {
+      clear(root);
+      var reports = [].concat(data.reports || []);
+      var onlyVulnerable = h('input', { type: 'checkbox', checked: !!state.auditOnlyVulnerable });
+      onlyVulnerable.addEventListener('change', function () { state.auditOnlyVulnerable = onlyVulnerable.checked; loadAudits(); });
+      root.append(h('div', { class: 'card' }, h('h2', {}, 'Audit reports'),
+        h('p', { class: 'muted' }, 'Every pip-audit run saves a report in ' + data.folder + '. They are kept for the report retention set in Settings. Open a report to see what it found.'),
+        h('div', { class: 'toolbar' }, h('label', {}, onlyVulnerable, ' Only reports with vulnerabilities'),
+          h('button', { class: 'btn', type: 'button', onclick: loadAudits }, 'Refresh'),
+          h('span', { class: 'muted' }, reports.length + ' report(s)'))));
+      var shown = state.auditOnlyVulnerable ? reports.filter(function (r) { return r.vulnerable > 0 || r.error; }) : reports;
+      var detail = h('div', { id: 'audit-detail' });
+      if (shown.length === 0) {
+        root.append(h('div', { class: 'table-wrap' }, h('div', { class: 'empty' }, reports.length ? 'No report found a vulnerability.' : 'No audit report yet. Audits run when packages are published, by the weekly check and from the Packages tab.')));
+        return;
+      }
+      root.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Run'), h('th', {}, 'Group'), h('th', {}, 'Service'), h('th', {}, 'Packages'), h('th', {}, 'Result'), h('th', {}, ''))),
+        h('tbody', {}, shown.map(function (r) {
+          var result = r.error ? badge('unreadable', 'bad', r.error)
+            : r.vulnerable > 0 ? badge(r.vulnerable + ' vulnerable (' + r.advisories + ' advisories)', 'bad') : badge('clean', 'ok');
+          return h('tr', { class: state.auditOpen === r.file ? 'selected' : '' },
+            h('td', {}, fmtDate(r.time)), h('td', {}, stageNames[r.stage] || r.stage), h('td', {}, r.group || h('span', { class: 'muted' }, '-')),
+            h('td', {}, r.service), h('td', { class: 'num' }, r.packages + (r.skipped ? ' (+' + r.skipped + ' skipped)' : '')), h('td', {}, result),
+            h('td', {}, h('button', { class: 'btn small', type: 'button', disabled: !!r.error, onclick: function () { state.auditOpen = r.file; loadAudits(); } }, 'Open')));
+        })))), detail);
+      if (state.auditOpen && shown.some(function (r) { return r.file === state.auditOpen; })) { showAuditReport(state.auditOpen, detail); }
+    }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
+  }
+
+  function showAuditReport(file, box) {
+    api('GET', '/api/audits/' + encodeURIComponent(file)).then(function (r) {
+      clear(box);
+      var deps = [].concat(r.dependencies || []);
+      var vulnerable = deps.filter(function (d) { return [].concat(d.vulns || []).length > 0; });
+      var clean = deps.filter(function (d) { return [].concat(d.vulns || []).length === 0 && !d.skipped; });
+      var skipped = deps.filter(function (d) { return d.skipped; });
+      var card = h('div', { class: 'card' },
+        h('div', { class: 'add-result-head' }, h('h2', {}, (stageNames[r.stage] || r.stage) + (r.group ? ' - ' + r.group : '') + ' (' + r.service + ')'),
+          h('span', { class: 'spacer' }), h('button', { class: 'btn small', type: 'button', onclick: function () { state.auditOpen = null; loadAudits(); } }, 'Close')),
+        h('p', { class: 'muted' }, fmtDate(r.time) + ' - ' + r.file));
+      if (vulnerable.length === 0) {
+        card.append(h('p', {}, badge('clean', 'ok'), ' No known vulnerability in the ' + r.packages + ' audited package(s).'));
+      } else {
+        var rows = [];
+        vulnerable.forEach(function (d) {
+          [].concat(d.vulns).forEach(function (v, i) {
+            rows.push(h('tr', {},
+              h('td', { class: 'mono' }, i === 0 ? d.name + '==' + d.version : ''),
+              h('td', {}, h('span', { class: 'mono' }, v.id), [].concat(v.aliases || []).length ? h('div', { class: 'muted mono' }, [].concat(v.aliases).join(', ')) : null),
+              h('td', { class: 'mono' }, [].concat(v.fix_versions || []).join(', ') || h('span', { class: 'muted' }, 'none yet')),
+              h('td', { class: 'audit-desc' }, v.description || '')));
+          });
+        });
+        card.append(h('p', {}, badge(vulnerable.length + ' vulnerable', 'bad'), ' of ' + r.packages + ' audited package(s). Fix them from the package\'s History on the Packages tab.'),
+          h('div', { class: 'table-wrap scroll-list' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Package'), h('th', {}, 'Advisory'), h('th', {}, 'Fixed in'), h('th', {}, 'Description'))),
+            h('tbody', {}, rows))));
+      }
+      if (clean.length) {
+        card.append(h('details', {}, h('summary', {}, 'Show the ' + clean.length + ' package(s) without findings'),
+          h('ul', { class: 'result-list scroll-box' }, clean.map(function (d) { return h('li', { class: 'mono' }, d.name + '==' + d.version); }))));
+      }
+      if (skipped.length) {
+        card.append(h('details', {}, h('summary', {}, 'Show the ' + skipped.length + ' skipped package(s)'),
+          h('ul', { class: 'result-list scroll-box' }, skipped.map(function (d) { return h('li', {}, h('span', { class: 'mono' }, d.name + (d.version ? '==' + d.version : '')), ' - ', d.skipped); }))));
+      }
+      box.append(card);
+      setTimeout(function () { card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 50);
+    }).catch(function (err) { clear(box); box.append(h('div', { class: 'empty' }, err.message)); });
+  }
+
   // ---------------------------------------------------------------- quarantine tab
   function loadQuarantine() {
     var root = $('tab-quarantine');
@@ -1316,7 +1396,7 @@
 
     refreshState().then(function (info) {
       if (!info) { return; }
-      var tabs = ['overview', 'packages', 'add', 'quarantine', 'denylist', 'schedule', 'settings', 'jobs'];
+      var tabs = ['overview', 'packages', 'add', 'audit', 'quarantine', 'denylist', 'schedule', 'settings', 'jobs'];
       var wanted = location.hash.replace('#', '');
       if (!info.configured) { showTab('settings'); }
       else { showTab(tabs.indexOf(wanted) >= 0 ? wanted : 'overview'); }

@@ -196,6 +196,7 @@
         'Test-WheelhouseHealth',
         'Get-WheelhouseUiToolStatus',
         'Get-WheelhouseUiApproval',
+        'ConvertTo-WheelhouseUiAuditReport',
         'Get-WheelhouseUiPendingPin',
         'Invoke-WheelhouseUiRequirementRemoval',
         'Assert-WheelhouseUiConfigured',

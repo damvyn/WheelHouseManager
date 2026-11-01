@@ -2983,6 +2983,34 @@ Describe 'WheelhouseManager' {
             $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
         }
 
+        It 'lists the audit reports and shows one with its advisories' {
+            $m = Get-TestManager
+            $reports = Join-Path $m.Wheelhouse 'reports'
+            New-Item -ItemType Directory -Path $reports -Force | Out-Null
+            $json = '{"dependencies":[{"name":"six","version":"1.16.0","vulns":[]},{"name":"attrs","version":"23.1.0","vulns":[{"id":"PYSEC-1","fix_versions":["23.2.0"],"aliases":["CVE-1"],"description":"bad"}]},{"name":"local","skip_reason":"not on PyPI"}]}'
+            Set-Content -Path (Join-Path $reports 'Report_Scheduled-requirements-1-OSV_20261101_100000.json') -Value $json
+            Set-Content -Path (Join-Path $reports 'Report_Scheduled-requirements-1-PYPI_20261101_090000.json') -Value 'not json'
+            Set-Content -Path (Join-Path $reports 'Report_Rejected_20261101_100000.json') -Value '[]'
+
+            $list = Invoke-WheelhouseUiApi -Method GET -Path '/api/audits' -ManagerRoot $m.Root
+            $list.Status | Should -Be 200
+            @($list.Body.reports).Count | Should -Be 2
+            $first = @($list.Body.reports)[0]
+            $first.file | Should -Be 'Report_Scheduled-requirements-1-OSV_20261101_100000.json'
+            $first.packages | Should -Be 2
+            $first.vulnerable | Should -Be 1
+            $first.skipped | Should -Be 1
+            @($list.Body.reports)[1].error | Should -Match 'not valid JSON'
+
+            $one = Invoke-WheelhouseUiApi -Method GET -Path '/api/audits/Report_Scheduled-requirements-1-OSV_20261101_100000.json' -ManagerRoot $m.Root
+            $one.Status | Should -Be 200
+            @($one.Body.dependencies)[0].name | Should -Be 'attrs'
+            @(@($one.Body.dependencies)[0].vulns)[0].fix_versions -join ',' | Should -Be '23.2.0'
+
+            (Invoke-WheelhouseUiApi -Method GET -Path '/api/audits/Report_Rejected_20261101_100000.json' -ManagerRoot $m.Root).Status | Should -Be 404
+            (Invoke-WheelhouseUiApi -Method GET -Path '/api/audits/Report_Missing-OSV_20261101_100000.json' -ManagerRoot $m.Root).Status | Should -Be 404
+        }
+
         It 'removes a package from requirements.in and resolves again' {
             $m = Get-TestManager
             $in = Join-Path $m.Root 'requirements.in'

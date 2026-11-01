@@ -146,6 +146,74 @@ function Invoke-WheelhouseUiRequirementRemoval {
     return @{ Status = 200; Body = @{ removed = $removedLines; job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
 }
 
+function ConvertTo-WheelhouseUiAuditReport {
+    # One pip-audit report (Report_<Stage>-<Group>-<SERVICE>_<timestamp>.json) for the Audit
+    # tab: { file; stage; group; service; time (local, as in the name); packages; vulnerable;
+    # advisories; skipped; error } and, with -IncludeDependency, every audited package with
+    # its advisories (vulnerable ones first). An unreadable report is returned with its error.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.IO.FileInfo]$File,
+
+        [switch]$IncludeDependency
+    )
+
+    $info = Get-AuditReportInfo -Path $File.FullName
+    if (-not $info) { return $null }
+    $time = [datetime]::ParseExact($info.Timestamp, 'yyyyMMdd_HHmmss', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-ddTHH:mm:ss')
+    $summary = [ordered]@{
+        file       = $File.Name
+        stage      = $info.Stage
+        group      = [string]$info.Group
+        service    = $info.Service
+        time       = $time
+        packages   = 0
+        vulnerable = 0
+        advisories = 0
+        skipped    = 0
+        error      = $null
+    }
+    try {
+        $dependencies = Get-PipAuditReport -Path $File.FullName
+    }
+    catch {
+        $summary['error'] = $_.Exception.Message
+        if ($IncludeDependency) { $summary['dependencies'] = @() }
+        return $summary
+    }
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($dependency in $dependencies) {
+        if ($null -eq $dependency.name) { continue }
+        if ($null -ne $dependency.skip_reason) {
+            $summary['skipped'] += 1
+            $rows.Add([ordered]@{ name = [string]$dependency.name; version = [string]$dependency.version; skipped = [string]$dependency.skip_reason; vulns = @() })
+            continue
+        }
+        $summary['packages'] += 1
+        $vulns = @(foreach ($vuln in @($dependency.vulns)) {
+                if (-not $vuln) { continue }
+                $description = [string]$vuln.description
+                if ($description.Length -gt 600) { $description = $description.Substring(0, 600) + '...' }
+                [ordered]@{
+                    id           = [string]$vuln.id
+                    aliases      = @(foreach ($alias in @($vuln.aliases)) { if ($alias) { [string]$alias } })
+                    fix_versions = @(foreach ($fix in @($vuln.fix_versions)) { if ($fix) { [string]$fix } })
+                    description  = $description
+                }
+            })
+        if ($vulns.Count -gt 0) {
+            $summary['vulnerable'] += 1
+            $summary['advisories'] += $vulns.Count
+        }
+        $rows.Add([ordered]@{ name = [string]$dependency.name; version = [string]$dependency.version; skipped = $null; vulns = $vulns })
+    }
+    if ($IncludeDependency) {
+        $summary['dependencies'] = @($rows | Sort-Object @{ Expression = { @($_.vulns).Count -gt 0 }; Descending = $true }, @{ Expression = { $_.name } })
+    }
+    return $summary
+}
+
 function Get-WheelhouseUiApproval {
     # The proposal state for the review card: the current proposal (if any), whether it is
     # for requirements.txt as it is now, and what this user may do with it under the
@@ -1253,6 +1321,38 @@ function Get-WheelhouseUiRoute {
                 Set-WheelhouseSetting -SettingsPath $Context.SettingsPath -Updates $updates
                 Write-Log "Settings changed from the UI: $(($updates.Keys | Sort-Object) -join ', ')" 'WARN'
                 return @{ Status = 200; Body = @{ saved = @($updates.Keys | Sort-Object) } }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/audits$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                # The newest pip-audit reports (at most 200), with their counts.
+                $files = @(Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_*.json' -File -ErrorAction SilentlyContinue |
+                        Where-Object { Get-AuditReportInfo -Path $_.FullName } |
+                        Sort-Object { (Get-AuditReportInfo -Path $_.FullName).Timestamp } -Descending |
+                        Select-Object -First 200)
+                $reports = @(foreach ($file in $files) { ConvertTo-WheelhouseUiAuditReport -File $file })
+                return @{ Status = 200; Body = @{ folder = $Context.ReportsFolder; reports = $reports } }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/audits/(?<file>Report_[A-Za-z0-9._-]+\.json)$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $name = [string]$Match['file']
+                $path = Join-Path $Context.ReportsFolder $name
+                if (-not (Get-AuditReportInfo -Path $path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                    return @{ Status = 404; Body = @{ error = "No audit report named $name." } }
+                }
+                $report = ConvertTo-WheelhouseUiAuditReport -File (Get-Item -LiteralPath $path) -IncludeDependency
+                return @{ Status = 200; Body = $report }
             }
         }
 
