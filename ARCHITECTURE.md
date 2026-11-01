@@ -963,7 +963,7 @@ leads to rejected packages, a failed resolve leads to the log. `loadSchedule` re
 tab's card (mapped-drive warning with a one-click switch to the UNC path).
 **Layout:** `body` is a window-high flex column - `.topbar`, `.tabs` (both `flex: 0 0 auto`), the
 scrolling `#page` (`flex: 1`, `overflow: auto`, holds `main`) and `#jobbar` (in the flow, not fixed).
-The job panel therefore takes its own space and never covers the page; scroll `#page`, not the
+The job panel therefore takes its own space and never covers the page. Actions only follow a job (`watchJob(id, false)`): `renderJobIndicator` keeps the top bar's `#job-indicator` pill up to date (pulsing while running, then the result) and a click toggles the panel (`showJobPanel`); `watchJob(id, true)` - Jobs tab, "Open the log" links - opens it at once. **Close** on a running job only hides the panel; scroll `#page`, not the
 window (`scrollIntoView` does). When an `add` job succeeds on the Add tab, `loadRequirements(true)`
 highlights the review card (`next-step`) and scrolls to it. The textarea resizes vertically only.
 

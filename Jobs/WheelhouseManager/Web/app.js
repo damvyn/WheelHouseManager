@@ -214,7 +214,7 @@
       return { label: 'Review and publish the fix', run: function () { state.reviewFix = true; showTab('add'); } };
     }
     if (job.status === 'Succeeded' || job.status === 'Cancelled' || job.status === 'Running') { return null; }
-    var showLog = { label: 'Open the log', run: function () { watchJob(job.id); } };
+    var showLog = { label: 'Open the log', run: function () { watchJob(job.id, true); } };
     if (job.status === 'Failed') { return showLog; }
     // An "add" job resolves first (step 1) and may then publish: only the publish step
     // produces rejected packages; a resolve that needs attention is explained in the log.
@@ -222,8 +222,8 @@
     if (publishing) {
       return { label: 'Show what needs attention', run: function () { showUpdateResult(job); } };
     }
-    if (job.kind === 'add') { return { label: 'Open the log to see why', run: function () { watchJob(job.id); } }; }
-    if (job.kind === 'remediate') { return { label: 'Open the log to see why', run: function () { watchJob(job.id); } }; }
+    if (job.kind === 'add') { return { label: 'Open the log to see why', run: function () { watchJob(job.id, true); } }; }
+    if (job.kind === 'remediate') { return { label: 'Open the log to see why', run: function () { watchJob(job.id, true); } }; }
     if (job.kind === 'audit') { return { label: 'Show the vulnerable packages', run: function () { showPackagesFiltered('vulnerable', job); } }; }
     if (job.kind === 'scan') { return { label: 'Show the threats', run: function () { showPackagesFiltered('threat', job); } }; }
     return showLog;
@@ -238,7 +238,7 @@
         state.statusFilter = 'all';
         renderPackages();
         toast('No package is marked like that in the table - the details are in the log.', 'bad');
-        watchJob(job.id);
+        watchJob(job.id, true);
       }
     });
   }
@@ -254,7 +254,7 @@
       } else {
         showPackagesFiltered('vulnerable', job);
       }
-    }).catch(function () { watchJob(job.id); });
+    }).catch(function () { watchJob(job.id, true); });
   }
 
   // ---------------------------------------------------------------- overview tab
@@ -569,7 +569,7 @@
 
   function startJobRequest(promise) {
     return promise.then(function (data) {
-      if (data.job) { watchJob(data.job.id); }
+      if (data.job) { watchJob(data.job.id, false); }
       return data;
     }).catch(fail);
   }
@@ -631,7 +631,7 @@
         if (data.skipped.length) {
           output.append(h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, data.skipped.map(function (s) { return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason); })));
         }
-        if (data.job) { specs.value = ''; watchJob(data.job.id); }
+        if (data.job) { specs.value = ''; watchJob(data.job.id, false); }
       }).catch(fail);
     });
     root.append(
@@ -1065,18 +1065,41 @@
         h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Job'), h('th', {}, 'Status'), h('th', {}, 'Started'), h('th', {}, 'Ended'), h('th', {}, ''))),
         h('tbody', {}, data.jobs.map(function (j) {
           return h('tr', {}, h('td', {}, j.id), h('td', {}, j.title), h('td', {}, jobBadge(j)), h('td', {}, fmtDate(j.started_utc)), h('td', {}, fmtDate(j.ended_utc)),
-            h('td', {}, h('button', { class: 'btn small', type: 'button', onclick: function () { watchJob(j.id); } }, 'Open log')));
+            h('td', {}, h('button', { class: 'btn small', type: 'button', onclick: function () { watchJob(j.id, true); } }, 'Open log')));
         })))));
     }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
   }
 
-  function watchJob(id) {
+  // Follows a job. Actions only start following it - the pulsing indicator in the top bar
+  // shows it is running and opens the log on click; "open" shows the log panel at once
+  // (Jobs tab, "Open the log" links).
+  function watchJob(id, open) {
     if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+    if (state.watchedJob !== id) { $('jobbar-log').textContent = ''; }
     state.watchedJob = id;
-    $('jobbar').classList.remove('hidden');
-    $('jobbar-log').classList.remove('collapsed');
-    $('jobbar-toggle').textContent = 'Hide log';
+    if (open) { showJobPanel(true); }
     pollJob(true);
+  }
+  function showJobPanel(show) {
+    $('jobbar').classList.toggle('hidden', !show);
+    if (show) {
+      $('jobbar-log').classList.remove('collapsed');
+      $('jobbar-toggle').textContent = 'Hide log';
+      var log = $('jobbar-log');
+      log.scrollTop = log.scrollHeight;
+    }
+    renderJobIndicator(state.lastJob);
+  }
+  // The top bar pill: pulsing while the followed job runs, its result when it ended.
+  function renderJobIndicator(job) {
+    var pill = $('job-indicator');
+    if (!job || state.watchedJob === null) { pill.className = 'job-indicator hidden'; return; }
+    var open = !$('jobbar').classList.contains('hidden');
+    var running = job.status === 'Running';
+    pill.className = 'job-indicator ' + (running ? 'running' : jobKind(job.status));
+    pill.title = open ? 'Hide the log' : 'Show the log';
+    clear(pill);
+    pill.append(h('span', { class: 'dot' }), (running ? 'Running: ' : jobLabel(job.status) + ': ') + job.title, h('span', { class: 'pill-action' }, open ? 'hide log' : 'view log'));
   }
 
   function pollJob(first) {
@@ -1085,6 +1108,8 @@
     api('GET', '/api/jobs/' + id).then(function (data) {
       if (state.watchedJob !== id) { return; }
       var job = data.job;
+      state.lastJob = job;
+      renderJobIndicator(job);
       $('jobbar-title').textContent = '#' + job.id + '  ' + job.title + (job.steps > 1 ? '  (step ' + job.step + '/' + job.steps + ')' : '');
       var state_ = $('jobbar-state');
       state_.textContent = jobLabel(job.status);
@@ -1138,9 +1163,15 @@
       b.addEventListener('click', function () { showTab(b.getAttribute('data-tab')); });
     });
     $('jobbar-close').addEventListener('click', function () {
-      state.watchedJob = null;
-      if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
-      $('jobbar').classList.add('hidden');
+      // A running job is still followed (the indicator stays); a finished one is let go.
+      if (!state.lastJob || state.lastJob.status !== 'Running') {
+        state.watchedJob = null;
+        if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+      }
+      showJobPanel(false);
+    });
+    $('job-indicator').addEventListener('click', function () {
+      showJobPanel($('jobbar').classList.contains('hidden'));
     });
     $('jobbar-toggle').addEventListener('click', function () {
       var log = $('jobbar-log');
@@ -1167,7 +1198,7 @@
       var wanted = location.hash.replace('#', '');
       if (!info.configured) { showTab('settings'); }
       else { showTab(tabs.indexOf(wanted) >= 0 ? wanted : 'overview'); }
-      if (info.running_job) { watchJob(info.running_job.id); }
+      if (info.running_job) { watchJob(info.running_job.id, false); }
     });
   }
 

@@ -140,7 +140,7 @@ dialog h3 { margin: 0 0 10px; }
 dialog .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 dialog ul { max-height: 160px; overflow: auto; padding-left: 18px; margin: 8px 0; }
 
-.toasts { position: fixed; right: 16px; top: 64px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
+.toasts { position: fixed; right: 16px; top: 104px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
 .toast { padding: 10px 14px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 4px 14px rgba(0,0,0,.18); max-width: 420px; }
 .toast.ok { border-left: 4px solid var(--ok); }
 .toast.bad { border-left: 4px solid var(--bad); }
@@ -179,3 +179,16 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .tile-label { color: var(--muted); font-size: 12.5px; }
 .attention-item { padding: 8px 0; border-bottom: 1px solid var(--line); }
 .attention-item:last-child { border-bottom: 0; }
+/* Top bar: the followed job. Pulses while running; click to show or hide its log. */
+.job-indicator { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; background: var(--panel); color: var(--text); font: inherit; font-size: 13px; cursor: pointer; max-width: 420px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.job-indicator .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+.job-indicator .pill-action { color: var(--accent); font-weight: 600; }
+.job-indicator.running { border-color: var(--accent); }
+.job-indicator.running .dot { background: var(--accent); animation: job-pulse 1.4s ease-in-out infinite; }
+.job-indicator.ok .dot { background: var(--ok); }
+.job-indicator.warn { border-color: var(--warn); }
+.job-indicator.warn .dot { background: var(--warn); }
+.job-indicator.bad { border-color: var(--bad); }
+.job-indicator.bad .dot { background: var(--bad); }
+@keyframes job-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .25; transform: scale(.8); } }
+@media (prefers-reduced-motion: reduce) { .job-indicator.running .dot { animation: none; } }
