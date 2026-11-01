@@ -843,7 +843,7 @@ function Get-WheelhouseUiRoute {
                 if ($path -and (Test-Path -LiteralPath $path -PathType Leaf) -and ([System.IO.File]::ReadAllText($path)).Trim()) { $pins = Read-RequirementFile -FilePath $path }
                 $names = @(Get-WheelhouseUiPendingPin -Context $Context -Pin $pins | Where-Object { $_.direct } | ForEach-Object { $_.name })
                 if ($names.Count -eq 0) {
-                    throw [System.InvalidOperationException]::new('Nothing to clear: no package waiting to be published is listed in requirements.in (the ones waiting are dependencies of published packages).')
+                    return @{ Status = 409; Body = @{ error = 'Nothing to clear: no package waiting to be published is listed in requirements.in (the ones waiting are dependencies of published packages).' } }
                 }
                 return (Invoke-WheelhouseUiRequirementRemoval -Context $Context -Name $names -Title 'Clear list')
             }
