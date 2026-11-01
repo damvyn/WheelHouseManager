@@ -79,10 +79,10 @@ param(
     [string]$From,
     [string]$OutputHtmlPath
 )
-$UpdateWheelhouseScriptPath = (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'Update-Wheelhouse.ps1')
-$SendAlertScriptPath = (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'Send-VulnerabilityAlert.ps1')
+$UpdateWheelhouseScriptPath = (Join-Path $PSScriptRoot 'Update-Wheelhouse.ps1')
+$SendAlertScriptPath = (Join-Path $PSScriptRoot 'Send-VulnerabilityAlert.ps1')
 
-Import-Module (Join-Path (Join-Path $PSScriptRoot 'Jobs') 'WheelhouseManager') -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 Write-Log '=== Wheelhouse pipeline started ==='
 

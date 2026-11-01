@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A PowerShell tool that maintains an offline, audited pip/uv "wheelhouse" (a folder of `.whl` files on a share) for locked-down Windows clients. There are two independent parts:
 - `Client Install/`: scripts that install uv and lock clients to the wheelhouse through GPO. They are deployed separately. **Leave `Startup_UV.ps1` unchanged.**
-- The manager: `Setup.ps1`, `Invoke-WheelhousePipeline.ps1` and `Jobs/`. `Setup.ps1` deploys it to `C:\WheelHouseManager` (by default) alongside `config\settings.psd1` (and `config\denylist.json`, created on first use) and `Input\`.
+- The manager: `Setup.ps1`, `whm.ps1` and `Jobs/`. `Setup.ps1` deploys it to `C:\WheelHouseManager` (by default) alongside `config\settings.psd1` (and `config\denylist.json`, created on first use) and `Input\`.
 
 ## Commands
 
@@ -73,7 +73,7 @@ Script roles:
   It emits `Wheelhouse.AuditResult` and `Wheelhouse.Notice` objects and **sends no alerts**.
 - `whm.ps1` (repo root, deployed next to `Jobs\`): one command (`status`, `doctor`, `list`, `info`, `resolve`, `approve`, `publish`, `fix`, ...). A script, not module code: it parses `-Name value` words into a hashtable itself (array splatting would pass `-Name` as a value) and runs the `Jobs\` scripts.
 - `Client Install\Test-PythonEnvironment.ps1`: optional, standalone (no module) - checks an environment against `advisories.json` offline. `Startup_UV.ps1` stays unchanged.
-- `Invoke-WheelhousePipeline.ps1` (repo root, the orchestrator) runs `Update-Wheelhouse.ps1`, keeps its `Wheelhouse.AuditResult` and `Wheelhouse.Notice` output, and calls `Send-VulnerabilityAlert.ps1` once - statefully for published packages (`Get-CatalogFindingAlert` as `-Finding`, marked after delivery), always for blocked candidates (`PreDownload`), notices and errors.
+- `Jobs\Invoke-WheelhousePipeline.ps1` (the orchestrator; `whm pipeline`) runs `Update-Wheelhouse.ps1`, keeps its `Wheelhouse.AuditResult` and `Wheelhouse.Notice` output, and calls `Send-VulnerabilityAlert.ps1` once - statefully for published packages (`Get-CatalogFindingAlert` as `-Finding`, marked after delivery), always for blocked candidates (`PreDownload`), notices and errors.
 - `Test-Wheelhouse.ps1` is what the Scheduled Task runs. It re-checks what is already published (integrity, denylist and PyPI yanked flag via `Get-DeployedPackageNotice`, audits, wheels missing/changed on the share, untracked wheels, malicious-package advisories, versions without a recent audit = `Unverified`), records the results and its heartbeat in the catalog (`Update-WheelhouseCatalog`) and alerts **statefully**: `Get-CatalogFindingAlert` gives each finding an `AlertReason` (New / Overdue / Reminder / WaiverExpired / Resolved), the alert goes out only if one has a reason, and `Set-CatalogFindingNotified` records it after delivery. No merge, no download; wheels, manifest and group files change only for the `AutoQuarantine` actions.
 - `Invoke-WheelhouseRemediation.ps1` fixes a vulnerable published version: plan -> requirements.in (`name>=fix`) -> `Update-Requirement.ps1 -PreferCurrent -NoProposal` (requirements.in restored on failure) -> remediation proposal. Publishing it swaps the changed pins into the groups that list the vulnerable version and then quarantines that version.
 - `Test-WheelhousePackage.ps1` (audit the whole index or `-Package name==ver`, no alert) and `Invoke-WheelhouseScan.ps1` (Defender, whole folder or `-File`) back the UI's buttons.

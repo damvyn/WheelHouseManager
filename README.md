@@ -48,7 +48,7 @@ Contents
 | Part | Runs on | What it does |
 |---|---|---|
 | **Client install** (`Client Install\`) | Every client computer | Installs `uv` and configures it, through Group Policy, so the wheelhouse is its **only** package source. Users cannot change this. |
-| **Manager** (`Setup.ps1`, `Invoke-WheelhousePipeline.ps1`, `Jobs\`) | One manager / build server | Prepares, checks, publishes and monitors the wheelhouse. Has the web UI. |
+| **Manager** (`Setup.ps1`, `whm.ps1`, `Jobs\`) | One manager / build server | Prepares, checks, publishes and monitors the wheelhouse. Has the web UI. |
 
 The two parts only share the wheelhouse folder: the manager writes it, clients read it.
 
@@ -201,7 +201,6 @@ Result:
 ```
 C:\WheelHouseManager\
     whm.ps1                         one command for everything (whm help)
-    Invoke-WheelhousePipeline.ps1   update + alert in one call
     Jobs\                           the scripts and the WheelhouseManager module (keep together)
     config\
         settings.psd1               your settings
@@ -442,7 +441,7 @@ cd C:\WheelHouseManager
    was rejected, and why; the rejections are also saved in
    `<wheelhouse>\reports\Report_Rejected_<timestamp>.json`.
 
-   Prefer `..\Invoke-WheelhousePipeline.ps1` instead if you also want an alert for whatever the
+   Prefer `.\Invoke-WheelhousePipeline.ps1` (or `whm pipeline`) instead if you also want an alert for whatever the
    run found (vulnerable candidates, Defender detections, ...).
 
 In the UI: **Add packages** tab -> enter the packages -> **Add and resolve** -> check the
@@ -583,10 +582,14 @@ check reports it as `Denylisted`.
 ### 5.9 Use the update and the alert together - `Invoke-WheelhousePipeline.ps1`
 
 ```powershell
-cd C:\WheelHouseManager
+cd C:\WheelHouseManager\Jobs
 .\Invoke-WheelhousePipeline.ps1
 .\Invoke-WheelhousePipeline.ps1 -SmtpServer 10.0.0.25
+..\whm.ps1 pipeline                # the same
 ```
+
+It used to live in the manager root; `Setup.ps1` removes that old copy, so point any Scheduled
+Task that runs it to `Jobs\Invoke-WheelhousePipeline.ps1`.
 
 Runs `Update-Wheelhouse.ps1`, then sends one alert. Like the weekly check, it alerts published
 packages only when there is something new to say (new, overdue, waiver ended, resolved), so a
@@ -699,7 +702,7 @@ shows the details.
 | `Client Install\Test-PythonEnvironment.ps1` | Optional, on clients: is anything installed affected? (3.4) | `-Project`, `-Python`, `-AdvisoriesPath`, `-InstalledJson` |
 | `Jobs\Update-Requirement.ps1` | `requirements.in` -> `requirements.txt` | `-RequirementsInPath`, `-RequirementsTxtPath`, `-PythonVersion`, `-Platform`, `-MinimumPackageAgeDays` |
 | `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins; audit what is published; take out wheels missing/changed on the share | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-AutoQuarantine On|Off`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
-| `Invoke-WheelhousePipeline.ps1` (root) | `Update-Wheelhouse.ps1` + one alert | as above, plus `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
+| `Jobs\Invoke-WheelhousePipeline.ps1` | `Update-Wheelhouse.ps1` + one alert | as above, plus `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
 | `Jobs\Test-Wheelhouse.ps1` | Weekly check of everything published, with alert | `-AutoQuarantine On|Off`, `-VulnerabilityServices`, `-SmtpServer`, `-MailTo`, `-MailFrom` |
 | `Jobs\Test-WheelhousePackage.ps1` | Audit all or chosen pins, no alert | `-Package name==ver,...` |
 | `Jobs\Invoke-WheelhouseRemediation.ps1` | Prepare the fix of a vulnerable published version as a proposal (5.14) | `-Package name==ver`, `-ExpediteReason` |

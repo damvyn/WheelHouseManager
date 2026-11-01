@@ -8,7 +8,7 @@
     Update-Requirement.ps1, Test-Wheelhouse.ps1, Test-WheelhousePackage.ps1,
     Invoke-WheelhouseScan.ps1, Start-WheelhouseUI.ps1, Send-VulnerabilityAlert.ps1; the module
     folder includes the UI's Web\ files) and
-    Invoke-WheelhousePipeline.ps1 and whm.ps1 (deployed to the destination root, not Jobs\)
+    whm.ps1 (deployed to the destination root, not Jobs\)
     from next to this script into -DestinationPath, creates config\settings.psd1
     if it doesn't exist yet, and creates an empty Input\requirements.in and
     Input\requirements.txt if they don't exist yet.
@@ -120,7 +120,14 @@ else {
 }
 Write-Log "Deployed Jobs\ scripts and the WheelhouseManager module to: $destJobsPath" "OK"
 
-foreach ($rootScript in 'Invoke-WheelhousePipeline.ps1', 'whm.ps1') {
+# Invoke-WheelhousePipeline.ps1 now lives in Jobs\ - remove the copy older versions put in the root.
+$oldPipeline = Join-Path $DestinationPath 'Invoke-WheelhousePipeline.ps1'
+if (-not $isSameFolder -and (Test-Path -LiteralPath $oldPipeline)) {
+    Remove-Item -LiteralPath $oldPipeline -Force
+    Write-Log "Removed the old $oldPipeline - it is in Jobs\ now; update any Scheduled Task that runs it." 'WARN'
+}
+
+foreach ($rootScript in @('whm.ps1')) {
     $source = Join-Path $PSScriptRoot $rootScript
     if (-not (Test-Path -Path $source)) {
         Write-Log "$rootScript not found next to Setup.ps1 - skipped." "WARN"

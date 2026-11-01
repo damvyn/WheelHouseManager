@@ -39,7 +39,7 @@ the *wheelhouse* - for Windows clients that may not reach PyPI.
 | Part | Code | Runs on | Coupling |
 |---|---|---|---|
 | Client install | `Client Install\UV_Installer.ps1`, `Client Install\Startup_UV.ps1` | Clients (deployment tool, GPO startup script as SYSTEM) | Reads the wheelhouse path only. Standalone scripts, no module. `Startup_UV.ps1` must not be changed. |
-| Manager | `Setup.ps1`, `Invoke-WheelhousePipeline.ps1`, `Jobs\` | One manager server | Owns every file in the wheelhouse. |
+| Manager | `Setup.ps1`, `whm.ps1`, `Jobs\` | One manager server | Owns every file in the wheelhouse. |
 
 ```mermaid
 flowchart LR
@@ -69,8 +69,9 @@ pip-audit), `uv`, Defender cmdlets (`Start-MpScan`, `Get-MpThreatDetection`, `Ge
 Client Install/UV_Installer.ps1          uv binaries + System32 hardlinks; Start-ProductInstall, Test-VersionStamp, Write-InstallLog
 Client Install/Startup_UV.ps1            machine env vars + %ProgramData%\uv\uv.toml (frozen)
 Setup.ps1                                deploys the manager (section 7.1)
-Invoke-WheelhousePipeline.ps1            orchestrator: Update-Wheelhouse.ps1 -> Send-VulnerabilityAlert.ps1
+whm.ps1                                  one command for everything (section 8.20)
 Jobs/
+    Invoke-WheelhousePipeline.ps1        orchestrator: Update-Wheelhouse.ps1 -> Send-VulnerabilityAlert.ps1
     Update-Requirement.ps1               resolve: requirements.in -> requirements.txt
     Update-Wheelhouse.ps1                the update run (thin: Invoke-WheelhouseSync does the work)
     Test-Wheelhouse.ps1                  scheduled re-check of everything published + alert
@@ -335,11 +336,11 @@ normalized form.
 ### 7.1 `Setup.ps1`
 `-DestinationPath` (default `C:\WheelHouseManager`), `-WheelhousePath`. Copies `Jobs\*.ps1`,
 replaces `Jobs\WheelhouseManager` as a whole (so deleted function files do not linger; skipped if
-source = destination), copies the orchestrator to the root, creates `config\settings.psd1` from
+source = destination), copies `whm.ps1` to the root (and removes an old root `Invoke-WheelhousePipeline.ps1` - it lives in `Jobs\` now), creates `config\settings.psd1` from
 `Get-WheelhouseDefaultSetting` if missing, sets `WheelhousePath` if passed, creates
 `Input\requirements.in`/`.txt` if missing (`Initialize-ManagerFile`). Idempotent.
 
-### 7.2 `Invoke-WheelhousePipeline.ps1`
+### 7.2 `Jobs\Invoke-WheelhousePipeline.ps1`
 Forwards only bound parameters: to the worker `WheelhousePath, LocalRequirementsPath,
 PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ExpeditePackage,
 ExpediteReason`; to the alert `WheelhousePath, SmtpServer, To, From, OutputHtmlPath`. Collects
@@ -1130,7 +1131,7 @@ Conventions:
 
 CI (`.github/workflows/powershell-tests.yml`, `windows-latest`, matrix Windows PowerShell 5.1 and
 PowerShell 7): Pester; every `FunctionsToExport` name is exported; every `.ps1`/`.psm1` parses;
-PSScriptAnalyzer on `Jobs`, `Tests`, `Setup.ps1`, `Invoke-WheelhousePipeline.ps1` at
+PSScriptAnalyzer on `Jobs`, `Tests`, `Setup.ps1`, `whm.ps1` at
 Warning/Error with **zero** findings. Excluded rules (`PSScriptAnalyzerSettings.psd1`):
 `PSAvoidUsingWriteHost` (intentional `Write-Log`), `PSAvoidOverwritingBuiltInCmdlets`
 (`Write-Log` only clashes with a 6.1 profile), `PSUseCmdletCorrectly` (false positive on

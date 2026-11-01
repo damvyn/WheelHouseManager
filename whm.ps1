@@ -15,6 +15,7 @@
       approve [-Note text]       approve the current proposal
       reject <reason>            reject the current proposal
       publish                    check and publish the approved proposal (Update-Wheelhouse.ps1)
+      pipeline                   publish, then send one alert       (Invoke-WheelhousePipeline.ps1)
       fix <name==version> [-ExpediteReason text]
                                  prepare the fix of a vulnerable version (Invoke-WheelhouseRemediation.ps1)
       quarantine <name==version> [-Reason text]
@@ -160,6 +161,7 @@ try {
         }
         'resolve' { $exitCode = Invoke-WhmScript 'Update-Requirement.ps1' $named }
         'publish' { $exitCode = Invoke-WhmScript 'Update-Wheelhouse.ps1' $named }
+        'pipeline' { $exitCode = Invoke-WhmScript 'Invoke-WheelhousePipeline.ps1' $named }
         'check' { $exitCode = Invoke-WhmScript 'Test-Wheelhouse.ps1' $named }
         'audit' { $exitCode = Invoke-WhmScript 'Test-WheelhousePackage.ps1' $named }
         'scan' { $exitCode = Invoke-WhmScript 'Invoke-WheelhouseScan.ps1' $named }

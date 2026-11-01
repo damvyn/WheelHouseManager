@@ -2,7 +2,7 @@
     RootModule        = 'WheelhouseManager.psm1'
     ModuleVersion     = '2.0.0'
     GUID              = '5b0f7c1e-3f4e-4c8e-9a51-0c6d2f7e9a14'
-    Description       = 'Shared functions for the wheelhouse manager scripts (Jobs\*.ps1, Setup.ps1, Invoke-WheelhousePipeline.ps1).'
+    Description       = 'Shared functions for the wheelhouse manager scripts (Jobs\*.ps1, Setup.ps1, whm.ps1).'
     PowerShellVersion = '5.1'
     FunctionsToExport = @(
         'Write-Log',
