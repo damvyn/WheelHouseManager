@@ -765,9 +765,12 @@ function Get-WheelhouseUiRoute {
                 if ($specs.Count -eq 0) { throw [System.ArgumentException]::new('Enter at least one package.') }
                 if ($specs.Count -gt 100) { throw [System.ArgumentException]::new('Too many packages at once (at most 100).') }
 
-                $addResult = Add-RequirementInLine -Path $Context.Settings.RequirementsInPath -Spec $specs -Denylist @(Read-WheelhouseDenylist -Path $Context.DenylistPath)
+                # "replace": true swaps a listed requirement's line for the new spec.
+                $replace = (Get-UiBodyValue -Body $Body -Name 'replace') -eq $true
+                $addResult = Add-RequirementInLine -Path $Context.Settings.RequirementsInPath -Spec $specs -Denylist @(Read-WheelhouseDenylist -Path $Context.DenylistPath) -Replace:$replace
                 $job = $null
-                if ($addResult.Added.Count -gt 0) {
+                $changed = @($addResult.Added) + @($addResult.Replaced)
+                if ($changed.Count -gt 0) {
                     $steps = @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
                     # By default the job stops at requirements.txt, so the resolved pins can
                     # be reviewed before anything is downloaded. "publish": true also runs
@@ -777,9 +780,9 @@ function Get-WheelhouseUiRoute {
                         $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() }
                         $title = 'Add and publish packages'
                     }
-                    $job = Start-WheelhouseUiJob -Title $title -Kind 'add' -Detail @($addResult.Added) -Context $Context -Steps $steps
+                    $job = Start-WheelhouseUiJob -Title $title -Kind 'add' -Detail $changed -Context $Context -Steps $steps
                 }
-                return @{ Status = 200; Body = @{ added = @($addResult.Added); skipped = @($addResult.Skipped); job = $(if ($job) { ConvertTo-WheelhouseUiJobSummary -Job $job } else { $null }) } }
+                return @{ Status = 200; Body = @{ added = @($addResult.Added); replaced = @($addResult.Replaced); skipped = @($addResult.Skipped); job = $(if ($job) { ConvertTo-WheelhouseUiJobSummary -Job $job } else { $null }) } }
             }
         }
 

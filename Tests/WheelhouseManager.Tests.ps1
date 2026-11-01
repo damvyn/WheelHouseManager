@@ -2579,6 +2579,21 @@ Describe 'WheelhouseManager' {
             (Get-Content -Path $path) -join '|' | Should -Be '# comment|numpy>=2.0|Pandas>=2.0,<3|old>=1.1|requests==2.32.3'
         }
 
+        It 'replaces a listed requirement only with -Replace and only when the spec differs' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            [IO.File]::WriteAllText($path, "# comment`r`nhuggingface-hub>=0.24,<1.dev0  # old`r`nnumpy")
+
+            $offer = Add-RequirementInLine -Path $path -Spec @('huggingface_hub~=1.5', 'numpy')
+            @($offer.Added).Count + @($offer.Replaced).Count | Should -Be 0
+            ($offer.Skipped | Where-Object { $_.Spec -eq 'huggingface_hub~=1.5' }).Replaceable | Should -Be $true
+            ($offer.Skipped | Where-Object { $_.Spec -eq 'numpy' }).Replaceable | Should -Be $false
+
+            $result = Add-RequirementInLine -Path $path -Spec @('huggingface_hub~=1.5', 'numpy', 'pandas') -Replace
+            $result.Replaced -join '|' | Should -Be 'huggingface_hub~=1.5'
+            $result.Added -join '|' | Should -Be 'pandas'
+            (Get-Content -Path $path) -join '|' | Should -Be '# comment|huggingface_hub~=1.5|numpy|pandas'
+        }
+
         It 'does not touch the file when nothing is added' {
             $path = Join-Path (Get-TestFolder) 'requirements.in'
             $result = Add-RequirementInLine -Path $path -Spec @('-e .')
@@ -2961,6 +2976,11 @@ Describe 'WheelhouseManager' {
             $none = Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"specs":["numpy"]}')
             $none.Body.job | Should -BeNullOrEmpty
             $global:WhmUiJobSteps | Should -BeNullOrEmpty
+
+            $swap = Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"specs":["numpy>=2.1"],"replace":true}')
+            @($swap.Body.replaced) -join ',' | Should -Be 'numpy>=2.1'
+            (Get-Content -Path (Join-Path $m.Root 'requirements.in')) -join '|' | Should -Be 'numpy>=2.1|pandas'
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
         }
 
         It 'removes a package from requirements.in and resolves again' {

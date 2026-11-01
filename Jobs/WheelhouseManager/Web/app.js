@@ -622,13 +622,17 @@
     var publishNow = h('input', { type: 'checkbox' });
     var output = h('div', { class: 'add-result hidden' });
     var go = h('button', { class: 'btn primary', type: 'button' }, 'Add and resolve');
+    // replace: swap the requirements.in line of a package that is already listed.
+    var submit = function (list, replace) {
+      api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked, replace: !!replace }).then(function (data) {
+        renderAddResult(output, data, submit);
+        if (data.job) { specs.value = ''; watchJob(data.job.id, false); }
+      }).catch(fail);
+    };
     go.addEventListener('click', function () {
       var list = specs.value.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(function (s) { return s && s.charAt(0) !== '#'; });
       if (list.length === 0) { toast('Enter at least one package.', 'bad'); return; }
-      api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked }).then(function (data) {
-        renderAddResult(output, [].concat(data.added || []), [].concat(data.skipped || []));
-        if (data.job) { specs.value = ''; watchJob(data.job.id, false); }
-      }).catch(fail);
+      submit(list, false);
     });
     root.append(
       h('div', { class: 'card' },
@@ -645,14 +649,28 @@
   }
 
   // The outcome of "Add and resolve", inside step 1: a summary line with a button to show or
-  // hide the lists, which scroll on their own when they are long.
-  function renderAddResult(output, added, skipped) {
+  // hide the lists, which scroll on their own when they are long. A package that is already
+  // listed with another version range can replace that line (submit(specs, true)).
+  function renderAddResult(output, data, submit) {
+    var added = [].concat(data.added || []);
+    var replaced = [].concat(data.replaced || []);
+    var skipped = [].concat(data.skipped || []);
     clear(output);
-    output.classList.toggle('hidden', added.length + skipped.length === 0);
-    if (added.length + skipped.length === 0) { return; }
+    var total = added.length + replaced.length + skipped.length;
+    output.classList.toggle('hidden', total === 0);
+    if (total === 0) { return; }
+    var replaceable = skipped.filter(function (s) { return s.Replaceable; }).map(function (s) { return s.Spec; });
+    var replaceButton = function (list, label) {
+      return h('button', { class: 'btn small', type: 'button', title: 'Use ' + list.join(', ') + ' instead of the line in requirements.in, then resolve again',
+        onclick: function () { submit(list, true); } }, label);
+    };
     var lists = h('div', { class: 'result-scroll' },
       added.length ? [h('p', {}, 'Added to requirements.in:'), h('ul', { class: 'result-list' }, added.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
-      skipped.length ? [h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, skipped.map(function (s) { return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason); }))] : null);
+      replaced.length ? [h('p', {}, 'Replaced in requirements.in:'), h('ul', { class: 'result-list' }, replaced.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
+      skipped.length ? [h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, skipped.map(function (s) {
+        return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason, s.Replaceable ? [' ', replaceButton([s.Spec], 'Replace')] : null);
+      }))] : null,
+      replaceable.length ? h('p', { class: 'muted' }, 'Replace swaps the listed line for the one you entered and resolves again - for example to fix a version range that makes the resolve fail.') : null);
     var toggle = h('button', { class: 'btn small', type: 'button' }, 'Hide list');
     toggle.addEventListener('click', function () {
       var hide = !lists.classList.contains('hidden');
@@ -662,8 +680,10 @@
     output.append(h('div', { class: 'add-result-head' },
       h('strong', {}, 'Result:'), ' ',
       added.length ? badge(added.length + ' added', 'ok') : null, ' ',
+      replaced.length ? badge(replaced.length + ' replaced', 'ok') : null, ' ',
       skipped.length ? badge(skipped.length + ' not added', 'bad') : null,
-      h('span', { class: 'spacer' }), toggle), lists);
+      h('span', { class: 'spacer' }),
+      replaceable.length > 1 ? replaceButton(replaceable, 'Replace all ' + replaceable.length) : null, toggle), lists);
   }
 
   function loadRequirements(showNextStep) {
