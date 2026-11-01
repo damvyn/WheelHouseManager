@@ -388,14 +388,14 @@
     var toolbar = h('div', { class: 'toolbar' },
       h('div', { class: 'group' }, filter, statusFilter, h('button', { class: 'btn', type: 'button', onclick: loadPackages }, 'Refresh')),
       h('div', { class: 'group' },
-        h('button', { class: 'btn', type: 'button', disabled: none, onclick: function () { runAudit(false); } }, 'Audit selected'),
-        h('button', { class: 'btn', type: 'button', onclick: function () { runAudit(true); } }, 'Audit all')),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, disabled: none, onclick: function () { runAudit(false); } }, 'Audit selected'),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, onclick: function () { runAudit(true); } }, 'Audit all')),
       h('div', { class: 'group' },
-        h('button', { class: 'btn', type: 'button', disabled: none, onclick: function () { runScan(false); } }, 'Scan selected'),
-        h('button', { class: 'btn', type: 'button', onclick: function () { runScan(true); } }, 'Scan all')),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, disabled: none, onclick: function () { runScan(false); } }, 'Scan selected'),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, onclick: function () { runScan(true); } }, 'Scan all')),
       h('div', { class: 'group' },
-        h('button', { class: 'btn', type: 'button', disabled: none, onclick: function () { removeSelected('quarantine'); } }, 'Quarantine'),
-        h('button', { class: 'btn danger', type: 'button', disabled: none, onclick: function () { removeSelected('delete'); } }, 'Delete')),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, disabled: none, onclick: function () { removeSelected('quarantine'); } }, 'Quarantine'),
+        h('button', { class: 'btn danger', type: 'button', 'data-idle': true, disabled: none, onclick: function () { removeSelected('delete'); } }, 'Delete')),
       h('span', { class: 'muted' }, pins.length + ' selected / ' + visible.length + ' shown / ' + state.pkgs.length + ' files'));
     root.append(toolbar);
 
@@ -495,7 +495,7 @@
               action.addEventListener('click', function () { acceptRisk(data.name, data.version, f); });
             }
             if ([].concat(f.fix_versions || []).length) {
-              var fix = h('button', { class: 'btn small primary', type: 'button' }, 'Fix');
+              var fix = h('button', { class: 'btn small primary', type: 'button', 'data-idle': true }, 'Fix');
               fix.addEventListener('click', function () { planFix(data.name, data.version); });
               action = h('div', { class: 'row-actions' }, fix, action);
             }
@@ -621,7 +621,7 @@
     var specs = h('textarea', { placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
     var publishNow = h('input', { type: 'checkbox' });
     var output = h('div', { class: 'add-result hidden' });
-    var go = h('button', { class: 'btn primary', type: 'button' }, 'Add and resolve');
+    var go = h('button', { class: 'btn primary', type: 'button', 'data-idle': true }, 'Add and resolve');
     // replace: swap the requirements.in line of a package that is already listed.
     var submit = function (list, replace) {
       api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked, replace: !!replace }).then(function (data) {
@@ -661,7 +661,7 @@
     if (total === 0) { return; }
     var replaceable = skipped.filter(function (s) { return s.Replaceable; }).map(function (s) { return s.Spec; });
     var replaceButton = function (list, label) {
-      return h('button', { class: 'btn small', type: 'button', title: 'Use ' + list.join(', ') + ' instead of the line in requirements.in, then resolve again',
+      return h('button', { class: 'btn small', type: 'button', 'data-idle': true, title: 'Use ' + list.join(', ') + ' instead of the line in requirements.in, then resolve again',
         onclick: function () { submit(list, true); } }, label);
     };
     var lists = h('div', { class: 'result-scroll' },
@@ -726,7 +726,7 @@
           var action = null;
           if (p.rejected) {
             action = p.direct
-              ? h('button', { class: 'btn small danger', type: 'button', title: 'Remove ' + p.name + ' from requirements.in and resolve again', onclick: function () { removeRequirement(p); } }, 'Remove')
+              ? h('button', { class: 'btn small danger', type: 'button', 'data-idle': true, title: 'Remove ' + p.name + ' from requirements.in and resolve again', onclick: function () { removeRequirement(p); } }, 'Remove')
               : h('span', { class: 'muted', title: 'Not listed in requirements.in: another requirement depends on it' }, 'dependency');
           }
           var status = !p.rejected ? badge('new', 'ok')
@@ -801,14 +801,14 @@
 
     var buttons = h('div', { class: 'toolbar after-output' });
     if (separate && a.can_approve && p && p.state === 'Proposed') {
-      var approve = h('button', { class: 'btn', type: 'button' }, 'Approve');
+      var approve = h('button', { class: 'btn', type: 'button', 'data-idle': true }, 'Approve');
       approve.addEventListener('click', function () {
         api('POST', '/api/proposal/approve', { id: p.id }).then(function () { toast('Proposal ' + p.id + ' approved.'); loadRequirements(); }).catch(fail);
       });
       buttons.append(approve);
     }
     if (separate && a.can_reject && p) {
-      var reject = h('button', { class: 'btn danger', type: 'button' }, 'Reject');
+      var reject = h('button', { class: 'btn danger', type: 'button', 'data-idle': true }, 'Reject');
       reject.addEventListener('click', function () {
         var reason = h('input', { type: 'text', class: 'wide', placeholder: 'Why? (required, recorded)' });
         confirmDialog('Reject proposal ' + p.id + '?', h('div', {}, h('p', {}, 'Nothing of it is published. To try again, change requirements.in and resolve again.'), reason), 'Reject', true).then(function (ok) {
@@ -819,13 +819,13 @@
       buttons.append(reject);
     }
     if (!a.current && separate) {
-      var propose = h('button', { class: 'btn', type: 'button' }, 'Propose this requirements.txt');
+      var propose = h('button', { class: 'btn', type: 'button', 'data-idle': true }, 'Propose this requirements.txt');
       propose.addEventListener('click', function () {
         api('POST', '/api/proposal/new', {}).then(function () { toast('Proposed. Another person has to approve it before it can be published.'); loadRequirements(); }).catch(fail);
       });
       buttons.append(propose);
     }
-    var publish = h('button', { class: 'btn primary', type: 'button', disabled: !a.can_publish || publishable === 0 },
+    var publish = h('button', { class: 'btn primary', type: 'button', 'data-idle': true, disabled: !a.can_publish || publishable === 0 },
       publishable === 0 ? 'Nothing to publish' : 'Publish ' + publishable + ' pin(s)');
     publish.addEventListener('click', function () {
       confirmDialog('Publish ' + publishable + ' pin(s)?', h('div', {},
@@ -837,7 +837,7 @@
     });
     buttons.append(publish);
     if (clearable) {
-      var clearList = h('button', { class: 'btn danger', type: 'button', title: 'Take every package waiting here out of requirements.in' }, 'Clear list');
+      var clearList = h('button', { class: 'btn danger', type: 'button', 'data-idle': true, title: 'Take every package waiting here out of requirements.in' }, 'Clear list');
       clearList.addEventListener('click', function () {
         confirmDialog('Clear the list?', h('div', {},
           h('p', {}, 'Every package waiting here is taken out of requirements.in and requirements.txt is resolved again. Nothing in the wheelhouse changes.'),
@@ -895,7 +895,7 @@
       root.append(h('div', { class: 'table-wrap' }, h('table', {},
         h('thead', {}, h('tr', {}, h('th', {}, 'Package'), h('th', {}, 'Files'), h('th', {}, 'Groups'), h('th', {}, 'Reason'), h('th', {}, 'When / who'), h('th', {}, ''))),
         h('tbody', {}, data.items.map(function (q) {
-          var restore = h('button', { class: 'btn small', type: 'button' }, 'Restore');
+          var restore = h('button', { class: 'btn small', type: 'button', 'data-idle': true }, 'Restore');
           restore.addEventListener('click', function () {
             confirmDialog('Restore ' + q.name + '==' + q.version + '?', h('p', {}, 'The package goes back into the wheelhouse and its group files. The denylist entry created by quarantining is removed.'), 'Restore', false).then(function (ok) {
               if (!ok) { return; }
@@ -1215,6 +1215,7 @@
       if (state.watchedJob !== id) { return; }
       var job = data.job;
       state.lastJob = job;
+      setJobRunning(job.status === 'Running');
       renderJobIndicator(job);
       $('jobbar-title').textContent = '#' + job.id + '  ' + job.title + (job.steps > 1 ? '  (step ' + job.step + '/' + job.steps + ')' : '');
       var state_ = $('jobbar-state');
@@ -1235,9 +1236,24 @@
       }
     }).catch(function (err) {
       $('jobbar-state').textContent = 'lost';
+      setJobRunning(false);
       toast(err.message, 'bad');
     });
   }
+
+  // While a job runs, every button that would start another job or change the wheelhouse
+  // (marked data-idle) looks disabled and its clicks are swallowed: the server refuses them anyway.
+  function setJobRunning(running) {
+    document.body.classList.toggle('job-running', !!running);
+  }
+  document.addEventListener('click', function (e) {
+    if (!document.body.classList.contains('job-running')) { return; }
+    var target = e.target && e.target.closest ? e.target.closest('[data-idle]') : null;
+    if (!target) { return; }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    toast('A job is still running. Wait for it to finish (or cancel it) first.', 'warn');
+  }, true);
 
   function onJobFinished(job) {
     if (state.currentTab === 'packages') { loadPackages(); }
@@ -1304,7 +1320,7 @@
       var wanted = location.hash.replace('#', '');
       if (!info.configured) { showTab('settings'); }
       else { showTab(tabs.indexOf(wanted) >= 0 ? wanted : 'overview'); }
-      if (info.running_job) { watchJob(info.running_job.id, false); }
+      if (info.running_job) { setJobRunning(true); watchJob(info.running_job.id, false); }
     });
   }
 
