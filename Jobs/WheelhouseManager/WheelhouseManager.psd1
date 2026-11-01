@@ -175,6 +175,7 @@
         'Restore-WheelhousePackage',
         'Test-PackageSpec',
         'Add-RequirementInLine',
+        'Remove-RequirementInLine',
         'Test-WheelhouseDefenderAvailable',
         'Invoke-MpScan',
         'Get-WheelhouseThreatDetection',

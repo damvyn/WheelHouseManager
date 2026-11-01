@@ -741,10 +741,20 @@ function Get-WheelhouseUiRoute {
                         catch { Write-Verbose "Unreadable rejection report: $($latest.Name)" }
                     }
                 }
+                # "direct": listed in requirements.in, so the UI can offer to take it out again;
+                # otherwise it is a dependency of another requirement.
+                $inLines = @()
+                $inPath = [string]$Context.Settings.RequirementsInPath
+                if ($inPath -and (Test-Path -LiteralPath $inPath -PathType Leaf)) { $inLines = @(Get-Content -LiteralPath $inPath) }
                 $pending = foreach ($name in ($pins.Keys | Sort-Object)) {
                     $key = "$name==$($pins[$name])"
                     if ($published.ContainsKey($key)) { continue }
-                    @{ name = $name; version = [string]$pins[$name]; rejected = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null }) }
+                    @{
+                        name     = $name
+                        version  = [string]$pins[$name]
+                        rejected = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null })
+                        direct   = [bool](Get-RequirementInLine -Lines ([string[]]$inLines) -Name $name)
+                    }
                 }
                 return @{ Status = 200; Body = @{
                         path            = $path
@@ -756,6 +766,23 @@ function Get-WheelhouseUiRoute {
                         approval        = (Get-WheelhouseUiApproval -Context $Context -RequirementsPath $path)
                     }
                 }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/requirements/remove$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                # Takes a package out of requirements.in and resolves requirements.txt again, so a
+                # pin that keeps being rejected stops waiting in "Review and publish".
+                $name = [string](Get-UiBodyValue -Body $Body -Name 'name')
+                if (-not (Test-WheelhousePackageName -Name $name)) { throw [System.ArgumentException]::new('Not a valid package name.') }
+                [string[]]$removedLines = Remove-RequirementInLine -Path $Context.Settings.RequirementsInPath -Name $name
+                $job = Start-WheelhouseUiJob -Title 'Remove packages' -Kind 'remove' -Detail $removedLines -Context $Context -Steps @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
+                return @{ Status = 200; Body = @{ removed = $removedLines; job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
         }
 

@@ -697,18 +697,34 @@
         card.append(h('div', { class: 'empty' }, 'Everything in requirements.txt is already in the wheelhouse - there is nothing to publish. Add packages above to resolve new ones.'), whole);
         return;
       }
-      card.append(h('div', { class: 'table-wrap' }, h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'))),
+      card.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'), h('th', {}, ''))),
         h('tbody', {}, pending.map(function (p) {
+          // A package listed in requirements.in can be taken out again; a dependency of another
+          // requirement goes away only with that requirement.
+          var action = p.direct
+            ? h('button', { class: 'btn small danger', type: 'button', title: 'Remove ' + p.name + ' from requirements.in and resolve again', onclick: function () { removeRequirement(p); } }, 'Remove')
+            : h('span', { class: 'muted', title: 'Not listed in requirements.in: another requirement depends on it' }, 'dependency');
           return h('tr', {}, h('td', { class: 'mono' }, p.name + '==' + p.version),
-            h('td', {}, p.rejected ? [badge('rejected last time', 'bad'), ' ', p.rejected] : badge('new', 'ok')));
+            h('td', {}, p.rejected ? [badge('rejected last time', 'bad'), ' ', p.rejected] : badge('new', 'ok')),
+            h('td', { class: 'num' }, action));
         })))));
       var rejectedCount = pending.filter(function (p) { return p.rejected; }).length;
       if (rejectedCount > 0) {
-        card.append(h('p', { class: 'muted' }, rejectedCount + ' pin(s) were rejected by the latest update for the reason shown. Publishing again rejects them again unless the reason is gone (for example the cooldown has passed); otherwise change them in requirements.in (step 1).'));
+        card.append(h('p', { class: 'muted' }, rejectedCount + ' pin(s) were rejected by the latest update for the reason shown. Publishing again rejects them again unless the reason is gone (for example the cooldown has passed). Otherwise click Remove to take the package out of requirements.in, or change it in step 1.'));
       }
       card.append(renderApproval(data.approval, pending.length), whole);
     }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
+  }
+
+  // Takes a package out of requirements.in and resolves requirements.txt again (a job).
+  function removeRequirement(p) {
+    confirmDialog('Remove ' + p.name + '?', h('div', {},
+      h('p', {}, h('span', { class: 'mono' }, p.name), ' is taken out of requirements.in and requirements.txt is resolved again, so ', h('span', { class: 'mono' }, p.name + '==' + p.version), ' is no longer waiting to be published.'),
+      h('p', { class: 'muted' }, 'Nothing in the wheelhouse changes. If another requirement still depends on it, the resolver keeps a version of it.')), 'Remove', true).then(function (ok) {
+      if (!ok) { return; }
+      startJobRequest(api('POST', '/api/requirements/remove', { name: p.name }));
+    });
   }
 
   // The proposal behind requirements.txt: who asked, who approved, and the buttons the
@@ -800,7 +816,7 @@
         return;
       }
       card.append(h('p', { class: 'muted' }, 'From ' + data.file),
-        h('div', { class: 'table-wrap' }, h('table', {},
+        h('div', { class: 'table-wrap scroll-list' }, h('table', {},
           h('thead', {}, h('tr', {}, h('th', {}, 'Package'), h('th', {}, 'Group'), h('th', {}, 'Reason'))),
           h('tbody', {}, data.items.map(function (r) {
             return h('tr', {}, h('td', { class: 'mono' }, r.Package + '==' + r.Version), h('td', {}, r.Group), h('td', {}, r.Reason));

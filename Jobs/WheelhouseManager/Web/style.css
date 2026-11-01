@@ -210,3 +210,5 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .result-scroll > p { margin: 8px 0 0; }
 /* Jobs tab: what a job worked on, listed on demand. */
 .job-detail { max-height: 200px; overflow: auto; margin-top: 4px; }
+/* Add tab: long pin lists scroll inside their card; the header row stays visible. */
+.table-wrap.scroll-list { max-height: 320px; overflow: auto; }

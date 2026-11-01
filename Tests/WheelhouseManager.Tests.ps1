@@ -2587,6 +2587,26 @@ Describe 'WheelhouseManager' {
         }
     }
 
+    Context 'Remove-RequirementInLine' {
+        It 'removes the package by its normalized name and keeps the other lines' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            [IO.File]::WriteAllText($path, "# comment`r`nnumpy>=2.0`r`nRequests == 2.32.3  # pinned`r`npandas")
+
+            [string[]]$removed = Remove-RequirementInLine -Path $path -Name 'requests'
+
+            $removed -join '|' | Should -Be 'Requests == 2.32.3  # pinned'
+            (Get-Content -Path $path) -join '|' | Should -Be '# comment|numpy>=2.0|pandas'
+        }
+
+        It 'refuses a package that is not listed and the only requirement' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            [IO.File]::WriteAllText($path, "# comment`r`nnumpy>=2.0")
+            { Remove-RequirementInLine -Path $path -Name 'urllib3' } | Should -Throw '*depends on it*'
+            { Remove-RequirementInLine -Path $path -Name 'numpy' } | Should -Throw '*only requirement*'
+            (Get-Content -Path $path) -join '|' | Should -Be '# comment|numpy>=2.0'
+        }
+    }
+
     Context 'Settings validation for the UI' {
         It 'coerces and validates values' {
             ConvertTo-WheelhouseSettingValue -Key 'MinimumPackageAgeDays' -Value '14' | Should -Be 14
@@ -2938,6 +2958,29 @@ Describe 'WheelhouseManager' {
             $none = Invoke-WheelhouseUiApi -Method POST -Path '/api/packages/add' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"specs":["numpy"]}')
             $none.Body.job | Should -BeNullOrEmpty
             $global:WhmUiJobSteps | Should -BeNullOrEmpty
+        }
+
+        It 'removes a package from requirements.in and resolves again' {
+            $m = Get-TestManager
+            $in = Join-Path $m.Root 'requirements.in'
+            [IO.File]::WriteAllText($in, "numpy>=2.0`r`nrequests==2.32.3")
+            $txt = Join-Path $m.Root 'requirements.txt'
+            Set-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1') -Updates @{ LocalRequirementsPath = $txt }
+            Set-Content -Path $txt -Value @('numpy==2.3.1', 'requests==2.32.3', 'urllib3==2.5.0')
+
+            $review = Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root
+            (@($review.Body.pending) | Where-Object { $_.name -eq 'requests' }).direct | Should -Be $true
+            (@($review.Body.pending) | Where-Object { $_.name -eq 'urllib3' }).direct | Should -Be $false
+
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"-r evil"}')).Status | Should -Be 400
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"urllib3"}')).Status | Should -Be 404
+            $global:WhmUiJobSteps | Should -BeNullOrEmpty
+
+            $result = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"requests"}')
+            $result.Status | Should -Be 200
+            @($result.Body.removed) -join '|' | Should -Be 'requests==2.32.3'
+            (Get-Content -Path $in) -join '|' | Should -Be 'numpy>=2.0'
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
         }
 
         It 'shows requirements.txt for review and publishes it only with a confirmation' {
