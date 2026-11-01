@@ -23,6 +23,8 @@ What it does for you:
   alerts, a history of every package version (who added, quarantined or restored it, and when
   its audit or scan result changed) and a full audit trail of reports and logs.
 
+![The web UI: Overview tab](Images/Overview.png)
+
 Contents
 
 1. [How it works](#1-how-it-works)
@@ -615,6 +617,8 @@ Pins whose wheel does not fit the new target are treated as missing and download
 
 Get the new version of this repository and run `Setup.ps1` again with the same
 `-DestinationPath`. Your settings, denylist, `Input\` files and the wheelhouse are not touched.
+If the web UI is running, stop it and start `Start-WheelhouseUI.ps1` again: a running UI keeps
+using the old version.
 
 ### 5.13 See a package's history - and what happens after a crash
 
@@ -674,17 +678,126 @@ can be found. A banner at the top names anything that stops something from worki
 *The wheelhouse folder is not set*, or *uv was not found ... Adding packages does not work* - and
 what to do about it.
 
-| Tab | What you can do |
-|---|---|
-| **Overview** (opens first) | The state at a glance - packages, open and overdue vulnerabilities, waived, yanked, unverified, quarantined (click a tile to see them) - a **Needs attention** list where each item leads to the place to handle it, and the weekly check's last run and task. |
-| **Packages** | See every published wheel with its groups, latest audit (for a vulnerable one: worst severity and fix-by date, or *overdue*) and Defender result, a *yanked* badge if PyPI withdrew it, and the denylist flag; filter by name or status (vulnerable, fix overdue, risk accepted, threat, never audited/scanned, yanked, denylisted, file missing). Select rows to **Audit**, **Scan**, **Quarantine** or **Delete**; **History** shows one version's state, checks, vulnerabilities (with **Accept risk** / **Remove waiver**) and history. The toolbar stays in place and only the table scrolls. A banner warns when the weekly check has not run for `AuditFreshnessDays`. |
-| **Add packages** | **1. Add**: enter packages; they are added to `requirements.in` and resolved - nothing is downloaded. A package that is already listed in `requirements.in` with another version range is not added, but gets a **Replace** button (and **Replace all** for several) that swaps the listed line for the one you entered and resolves again - for example when the resolve fails because an old range conflicts with another package. The result (what was added, replaced and not added, with the reason) appears inside step 1 in a scrolling list that **Hide list** / **Show list** folds away. **2. Review and publish**: lists only the resolved pins that are **not yet in the wheelhouse** (pins already published are only counted; the whole `requirements.txt` is behind *Show the whole requirements.txt*), each marked *new* or *rejected last time* with the reason. A pin the latest publish rejected is not counted by **Publish N pin(s)** (the button reads *Nothing to publish* when only rejected pins are left), except one rejected only for the cooldown (*waiting for cooldown*), which publishing adds once the cooldown has passed. A rejected pin has a **Remove** button (when it is listed in `requirements.in`) that takes it out of `requirements.in` and resolves again; a rejected pin marked *dependency* is needed by another requirement and goes away only with it. **Clear list** takes every waiting package out of `requirements.in` at once (the wheelhouse does not change). With the default approval mode there is no separate Approve step - publishing records who published; with `ApprovalMode = SeparateApprover` the **Approve** / **Reject** buttons appear for the second person. Then **Publish** (runs every check, then publishes). *Also publish right away* does both at once. When resolving succeeds, the page scrolls to step 2 and highlights it. A running job does not open its log by itself: a pill in the top bar with a spinner and a light sweeping across it (*Running: Add packages - view log*: the action only, not the package list) shows it, and clicking it opens the log panel at the bottom of the window (click again, or **Close**, to hide it). When the job ends the pill shows the result. The panel takes its own space, so it never covers the page. The card at the bottom lists the latest rejected packages with their reasons. Long lists scroll inside their card. |
-| **Audit** | Every pip-audit report in `<wheelhouse>\reports` (weekly check, before download, published packages, manual audits), newest first, with the group, service (OSV / PyPI), number of packages and the result. Click a report to expand it under its row (click again to collapse): the vulnerable packages with each advisory, its aliases, the fixed versions and the description, then the packages without findings and the ones pip-audit skipped. *Only reports with vulnerabilities* hides the clean ones. |
-| **Quarantine** | Quarantined packages; **Restore** one. |
-| **Denylist** | Add or remove blocked versions; shows whether a blocked version is still published. Below it, **Accepted risks** lists every waiver with its reason and expiry, and lets you remove one. |
-| **Schedule** | Register, update, run or remove the weekly check's Scheduled Task (see 3.3). |
-| **Settings** | Edit `settings.psd1` with validation. The **Save settings** bar stays at the top of the page; it turns yellow and lists the changed settings until you save or discard them, and leaving the tab with unsaved changes asks first. |
-| **Jobs** | Long actions run as background jobs, one at a time (while one runs, the buttons that would start another job or change the wheelhouse are greyed out), named by their action (*Add packages*, *Publish packages*, *Audit packages*, ...); a small *show* / *hide* link under the name lists the packages or files the job worked on. Each job has a live log (**Open log**, or the pill in the top bar) and **Cancel**. A job ends as *Succeeded*, *Needs attention* (findings or rejected packages) or *Failed*. The message shown when a job ends is clickable: it takes you to what needs attention - the rejected packages, the vulnerable packages or Defender threats in the table, or the log. Important notices (the weekly check is not running, Defender scans unavailable) appear the same way, once per page load, and stay until you click them; the first one takes you to the **Schedule** tab. |
+The page needs at least 1000 x 560 pixels; in a smaller window it shows scrollbars instead of
+squeezing the layout.
+
+**While a job runs.** Long actions run as background jobs, one at a time. A pill in the top bar
+shows the running job with a spinner and a light sweeping across it (*Running: Add packages -
+view log*: the action only, not the package list). Clicking it opens the log panel at the bottom
+of the window (click again, or **Close**, to hide it); the panel takes its own space, so it never
+covers the page. When the job ends the pill shows the result. While a job runs, the buttons that
+would start another job or change the wheelhouse are greyed out and their clicks are blocked.
+
+### 6.1 Overview
+
+![Overview tab](Images/Overview.png)
+
+Opens first. The state at a glance - packages, open and overdue vulnerabilities, waived, yanked,
+unverified, quarantined (click a tile to see them) - a **Needs attention** list where each item
+leads to the place to handle it, and the weekly check's last run and task.
+
+### 6.2 Packages
+
+![Packages tab](Images/Packages.png)
+
+Every published wheel with its groups, latest audit (for a vulnerable one: worst severity and
+fix-by date, or *overdue*) and Defender result, a *yanked* badge if PyPI withdrew it, and the
+denylist flag. Filter by name or status (vulnerable, fix overdue, risk accepted, threat, never
+audited/scanned, yanked, denylisted, file missing). Select rows to **Audit**, **Scan**,
+**Quarantine** or **Delete**; **History** shows one version's state, checks, vulnerabilities
+(with **Accept risk** / **Remove waiver** and **Fix**, see 5.14) and history. The toolbar stays
+in place and only the table scrolls. A banner warns when the weekly check has not run for
+`AuditFreshnessDays`.
+
+### 6.3 Add packages
+
+![Add packages tab](Images/AddPackages.png)
+
+**1. Add packages.** Enter one requirement per line; they are added to `requirements.in` and
+resolved - nothing is downloaded yet.
+
+- A package that is already listed in `requirements.in` with another version range is not added,
+  but gets a **Replace** button (and **Replace all** for several). It swaps the listed line for
+  the one you entered and resolves again - for example when the resolve fails because an old
+  range conflicts with another package.
+- The result (what was added, replaced and not added, with the reason) appears inside step 1 in
+  a scrolling list that **Hide list** / **Show list** folds away.
+- *Also publish right away* resolves and publishes in one go, skipping the review step.
+
+**2. Review and publish.** Lists only the resolved pins that are **not yet in the wheelhouse**
+(pins already published are only counted; the whole `requirements.txt` is behind *Show the whole
+requirements.txt*), each marked *new* or *rejected last time* with the reason. When resolving
+succeeds, the page scrolls to step 2 and highlights it.
+
+- **Publish N pin(s)** runs every check, then publishes. It counts only pins that can pass: a pin
+  the latest publish rejected is not counted, except one rejected only for the cooldown (*waiting
+  for cooldown*), which publishing adds once the cooldown has passed. When only rejected pins are
+  left, the button reads *Nothing to publish*.
+- **Remove** on a rejected pin (when it is listed in `requirements.in`) takes it out of
+  `requirements.in` and resolves again. A rejected pin marked *dependency* is needed by another
+  requirement and goes away only with it.
+- **Clear list** takes every waiting package out of `requirements.in` at once (the wheelhouse
+  does not change). Clearing the last requirement empties `requirements.txt`.
+- With the default approval mode there is no separate Approve step - publishing records who
+  published. With `ApprovalMode = SeparateApprover` the **Approve** / **Reject** buttons appear
+  for the second person.
+
+**Latest rejected packages** at the bottom lists the packages the latest publish rejected, with
+their reasons. Long lists scroll inside their card.
+
+### 6.4 Audit
+
+![Audit tab](Images/Audit.png)
+
+Every pip-audit report in `<wheelhouse>\reports` (weekly check, before download, published
+packages, manual audits), newest first, with the group, service (OSV / PyPI), number of packages
+and the result. Click a report to expand it under its row (click again to collapse): the
+vulnerable packages with each advisory, its aliases, the fixed versions and the description, then
+the packages without findings and the ones pip-audit skipped. *Only reports with vulnerabilities*
+hides the clean ones. To fix a vulnerable package, open its **History** on the Packages tab.
+
+### 6.5 Quarantine
+
+![Quarantine tab](Images/Quarantine.png)
+
+Quarantined packages; **Restore** one.
+
+### 6.6 Denylist
+
+![Denylist tab](Images/Denylist.png)
+
+Add or remove blocked versions; shows whether a blocked version is still published. Below it,
+**Accepted risks** lists every waiver with its reason and expiry, and lets you remove one.
+
+### 6.7 Schedule
+
+![Schedule tab](Images/Schedule.png)
+
+Register, update, run or remove the weekly check's Scheduled Task (see 3.3).
+
+### 6.8 Settings
+
+![Settings tab](Images/Settings.png)
+
+Edit `settings.psd1` with validation. The **Save settings** bar stays at the top of the page; it
+turns yellow and lists the changed settings until you save or discard them, and leaving the tab
+with unsaved changes asks first.
+
+### 6.9 Jobs
+
+![Jobs tab](Images/Jobs.png)
+
+Every background job, named by its action (*Add packages*, *Publish packages*, *Audit packages*,
+*Scan packages*, *Fix package*, *Remove packages*, *Clear list*). A small *show* / *hide* link
+under the name lists the packages or files the job worked on. Each job has a live log (**Open
+log**, or the pill in the top bar) and **Cancel**. A job ends as *Succeeded*, *Needs attention*
+(findings or rejected packages) or *Failed*.
+
+The message shown when a job ends is clickable: it takes you to what needs attention - the
+rejected packages, the vulnerable packages or Defender threats in the table, or the log.
+Important notices (the weekly check is not running, Defender scans unavailable) appear the same
+way, once per page load, and stay until you click them; the first one takes you to the
+**Schedule** tab.
 
 The UI does the same as the scripts - it runs them in the background - so the reports and logs
 are the same.
