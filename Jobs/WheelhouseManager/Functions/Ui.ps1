@@ -69,6 +69,151 @@ function Get-WheelhouseUiToolStatus {
     return $script:UiToolStatus
 }
 
+function Get-WheelhouseUiPendingPin {
+    # What publishing requirements.txt would add: its pins (-Pin, name -> version) that are not
+    # in the wheelhouse yet, as { name; version; rejected (the latest update's reason or $null);
+    # retryable (rejected only for the cooldown, so publishing again can pass); direct (listed
+    # in requirements.in - otherwise a dependency of another requirement) }. Without a
+    # reachable wheelhouse every pin is pending.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Context,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [hashtable]$Pin
+    )
+
+    $published = @{}
+    $rejected = @{}
+    if ($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container)) {
+        $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+        foreach ($entry in $manifest) { $published["$($entry.name)==$($entry.version)"] = $true }
+        $latest = Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_Rejected_*.json' -File -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($latest) {
+            try {
+                foreach ($item in (Get-Content -Path $latest.FullName -Raw | ConvertFrom-Json)) {
+                    $rejected["$(Get-NormalizedPackageName ([string]$item.Package))==$($item.Version)"] = [string]$item.Reason
+                }
+            }
+            catch { Write-Verbose "Unreadable rejection report: $($latest.Name)" }
+        }
+    }
+    $inLines = @()
+    $inPath = [string]$Context.Settings.RequirementsInPath
+    if ($inPath -and (Test-Path -LiteralPath $inPath -PathType Leaf)) { $inLines = @(Get-Content -LiteralPath $inPath) }
+    foreach ($name in ($Pin.Keys | Sort-Object)) {
+        $key = "$name==$($Pin[$name])"
+        if ($published.ContainsKey($key)) { continue }
+        $reason = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null })
+        @{
+            name      = $name
+            version   = [string]$Pin[$name]
+            rejected  = $reason
+            retryable = [bool]($reason -and $reason -match '^cooldown')
+            direct    = [bool](Get-RequirementInLine -Lines ([string[]]$inLines) -Name $name)
+        }
+    }
+}
+
+function Invoke-WheelhouseUiRequirementRemoval {
+    # Takes -Name out of requirements.in, then resolves requirements.txt again as a job. When no
+    # requirement is left there is nothing to resolve: requirements.txt is emptied instead.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        $Context,
+
+        [Parameter(Mandatory)]
+        [string[]]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Context.Settings.RequirementsInPath, $Title)) { return }
+    $inPath = [string]$Context.Settings.RequirementsInPath
+    [string[]]$removedLines = Remove-RequirementInLine -Path $inPath -Name $Name
+    $left = @(Get-Content -LiteralPath $inPath | Where-Object { ($_ -replace '(^|\s)#.*$', '').Trim() })
+    if ($left.Count -eq 0) {
+        $txt = [string]$Context.Settings.LocalRequirementsPath
+        if ($txt) { Write-TextFileAtomic -Path $txt -Content '# requirements.in lists no package' }
+        return @{ Status = 200; Body = @{ removed = $removedLines; job = $null } }
+    }
+    $job = Start-WheelhouseUiJob -Title $Title -Kind 'remove' -Detail $removedLines -Context $Context -Steps @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
+    return @{ Status = 200; Body = @{ removed = $removedLines; job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
+}
+
+function ConvertTo-WheelhouseUiAuditReport {
+    # One pip-audit report (Report_<Stage>-<Group>-<SERVICE>_<timestamp>.json) for the Audit
+    # tab: { file; stage; group; service; time (local, as in the name); packages; vulnerable;
+    # advisories; skipped; error } and, with -IncludeDependency, every audited package with
+    # its advisories (vulnerable ones first). An unreadable report is returned with its error.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.IO.FileInfo]$File,
+
+        [switch]$IncludeDependency
+    )
+
+    $info = Get-AuditReportInfo -Path $File.FullName
+    if (-not $info) { return $null }
+    $time = [datetime]::ParseExact($info.Timestamp, 'yyyyMMdd_HHmmss', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-ddTHH:mm:ss')
+    $summary = [ordered]@{
+        file       = $File.Name
+        stage      = $info.Stage
+        group      = [string]$info.Group
+        service    = $info.Service
+        time       = $time
+        packages   = 0
+        vulnerable = 0
+        advisories = 0
+        skipped    = 0
+        error      = $null
+    }
+    try {
+        $dependencies = Get-PipAuditReport -Path $File.FullName
+    }
+    catch {
+        $summary['error'] = $_.Exception.Message
+        if ($IncludeDependency) { $summary['dependencies'] = @() }
+        return $summary
+    }
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($dependency in $dependencies) {
+        if ($null -eq $dependency.name) { continue }
+        if ($null -ne $dependency.skip_reason) {
+            $summary['skipped'] += 1
+            $rows.Add([ordered]@{ name = [string]$dependency.name; version = [string]$dependency.version; skipped = [string]$dependency.skip_reason; vulns = @() })
+            continue
+        }
+        $summary['packages'] += 1
+        $vulns = @(foreach ($vuln in @($dependency.vulns)) {
+                if (-not $vuln) { continue }
+                $description = [string]$vuln.description
+                if ($description.Length -gt 600) { $description = $description.Substring(0, 600) + '...' }
+                [ordered]@{
+                    id           = [string]$vuln.id
+                    aliases      = @(foreach ($alias in @($vuln.aliases)) { if ($alias) { [string]$alias } })
+                    fix_versions = @(foreach ($fix in @($vuln.fix_versions)) { if ($fix) { [string]$fix } })
+                    description  = $description
+                }
+            })
+        if ($vulns.Count -gt 0) {
+            $summary['vulnerable'] += 1
+            $summary['advisories'] += $vulns.Count
+        }
+        $rows.Add([ordered]@{ name = [string]$dependency.name; version = [string]$dependency.version; skipped = $null; vulns = $vulns })
+    }
+    if ($IncludeDependency) {
+        $summary['dependencies'] = @($rows | Sort-Object @{ Expression = { @($_.vulns).Count -gt 0 }; Descending = $true }, @{ Expression = { $_.name } })
+    }
+    return $summary
+}
+
 function Get-WheelhouseUiApproval {
     # The proposal state for the review card: the current proposal (if any), whether it is
     # for requirements.txt as it is now, and what this user may do with it under the
@@ -248,6 +393,10 @@ function Start-WheelhouseUiJob {
         [Parameter(Mandatory)]
         [string]$Kind,
 
+        # What the job works on (package pins, file names): the UI shows the title alone
+        # and lists these on demand.
+        [string[]]$Detail = @(),
+
         [Parameter(Mandatory)]
         [object[]]$Steps,
 
@@ -268,6 +417,7 @@ function Start-WheelhouseUiJob {
         Id         = $script:UiJobCounter
         Title      = $Title
         Kind       = $Kind
+        Detail     = @($Detail)
         Status     = 'Running'
         StepIndex  = 0
         Steps      = [System.Collections.Generic.List[object]]::new()
@@ -407,6 +557,7 @@ function ConvertTo-WheelhouseUiJobSummary {
     $summary = [ordered]@{
         id          = $Job.Id
         title       = $Job.Title
+        detail      = @($Job.Detail | Where-Object { $_ })
         kind        = $Job.Kind
         status      = $Job.Status
         message     = $Job.Message
@@ -629,14 +780,14 @@ function Get-WheelhouseUiRoute {
             Handler    = {
                 param($Context, $Body, $Match)
                 if (Get-UiBodyValue -Body $Body -Name 'all') {
-                    $job = Start-WheelhouseUiJob -Title 'Audit: whole index' -Kind 'audit' -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @() })
+                    $job = Start-WheelhouseUiJob -Title 'Audit all packages' -Kind 'audit' -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @() })
                 }
                 else {
                     $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
                     $selection = Resolve-UiPackageSelection -Body $Body -Manifest $manifest
                     $list = ($selection | ForEach-Object { "$($_.Name)==$($_.Version)" }) -join ','
                     if ($list.Length -gt 20000) { throw [System.ArgumentException]::new('The selection is too large - use "Audit all" instead.') }
-                    $job = Start-WheelhouseUiJob -Title "Audit: $($selection.Count) selected package(s)" -Kind 'audit' -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @('-Package', $list) })
+                    $job = Start-WheelhouseUiJob -Title 'Audit packages' -Kind 'audit' -Detail @($selection | ForEach-Object { "$($_.Name)==$($_.Version)" }) -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @('-Package', $list) })
                 }
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
@@ -649,7 +800,7 @@ function Get-WheelhouseUiRoute {
             Handler    = {
                 param($Context, $Body, $Match)
                 if (Get-UiBodyValue -Body $Body -Name 'all') {
-                    $job = Start-WheelhouseUiJob -Title 'Defender scan: all published wheels (local copies)' -Kind 'scan' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @() })
+                    $job = Start-WheelhouseUiJob -Title 'Scan all packages' -Kind 'scan' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @() })
                 }
                 else {
                     $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
@@ -665,7 +816,7 @@ function Get-WheelhouseUiRoute {
                     if ($files.Count -eq 0) { throw [System.ArgumentException]::new('Select at least one package.') }
                     $list = $files -join ','
                     if ($list.Length -gt 20000) { throw [System.ArgumentException]::new('The selection is too large - use "Scan all" instead.') }
-                    $job = Start-WheelhouseUiJob -Title "Defender scan: $($files.Count) wheel(s) (local copies)" -Kind 'scan' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @('-File', $list) })
+                    $job = Start-WheelhouseUiJob -Title 'Scan packages' -Kind 'scan' -Detail $files.ToArray() -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @('-File', $list) })
                 }
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
@@ -682,17 +833,24 @@ function Get-WheelhouseUiRoute {
                 if ($specs.Count -eq 0) { throw [System.ArgumentException]::new('Enter at least one package.') }
                 if ($specs.Count -gt 100) { throw [System.ArgumentException]::new('Too many packages at once (at most 100).') }
 
-                $addResult = Add-RequirementInLine -Path $Context.Settings.RequirementsInPath -Spec $specs -Denylist @(Read-WheelhouseDenylist -Path $Context.DenylistPath)
+                # "replace": true swaps a listed requirement's line for the new spec.
+                $replace = (Get-UiBodyValue -Body $Body -Name 'replace') -eq $true
+                $addResult = Add-RequirementInLine -Path $Context.Settings.RequirementsInPath -Spec $specs -Denylist @(Read-WheelhouseDenylist -Path $Context.DenylistPath) -Replace:$replace
                 $job = $null
-                if ($addResult.Added.Count -gt 0) {
+                $changed = @($addResult.Added) + @($addResult.Replaced)
+                if ($changed.Count -gt 0) {
                     $steps = @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
                     # By default the job stops at requirements.txt, so the resolved pins can
                     # be reviewed before anything is downloaded. "publish": true also runs
                     # Update-Wheelhouse.ps1 (audit, cooldown, download) straight away.
-                    if ((Get-UiBodyValue -Body $Body -Name 'publish') -eq $true) { $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() } }
-                    $job = Start-WheelhouseUiJob -Title "Add: $($addResult.Added -join ', ')" -Kind 'add' -Context $Context -Steps $steps
+                    $title = 'Add packages'
+                    if ((Get-UiBodyValue -Body $Body -Name 'publish') -eq $true) {
+                        $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() }
+                        $title = 'Add and publish packages'
+                    }
+                    $job = Start-WheelhouseUiJob -Title $title -Kind 'add' -Detail $changed -Context $Context -Steps $steps
                 }
-                return @{ Status = 200; Body = @{ added = @($addResult.Added); skipped = @($addResult.Skipped); job = $(if ($job) { ConvertTo-WheelhouseUiJobSummary -Job $job } else { $null }) } }
+                return @{ Status = 200; Body = @{ added = @($addResult.Added); replaced = @($addResult.Replaced); skipped = @($addResult.Skipped); job = $(if ($job) { ConvertTo-WheelhouseUiJobSummary -Job $job } else { $null }) } }
             }
         }
 
@@ -713,29 +871,7 @@ function Get-WheelhouseUiRoute {
                 }
                 $pins = @{}
                 if ($text.Trim()) { $pins = Read-RequirementFile -FilePath $path }
-                # What publishing would add: pins not in the wheelhouse yet, with the reason if the
-                # latest update rejected them. Without a reachable wheelhouse every pin is pending.
-                $published = @{}
-                $rejected = @{}
-                if ($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container)) {
-                    $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
-                    foreach ($entry in $manifest) { $published["$($entry.name)==$($entry.version)"] = $true }
-                    $latest = Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_Rejected_*.json' -File -ErrorAction SilentlyContinue |
-                        Sort-Object Name -Descending | Select-Object -First 1
-                    if ($latest) {
-                        try {
-                            foreach ($item in (Get-Content -Path $latest.FullName -Raw | ConvertFrom-Json)) {
-                                $rejected["$(Get-NormalizedPackageName ([string]$item.Package))==$($item.Version)"] = [string]$item.Reason
-                            }
-                        }
-                        catch { Write-Verbose "Unreadable rejection report: $($latest.Name)" }
-                    }
-                }
-                $pending = foreach ($name in ($pins.Keys | Sort-Object)) {
-                    $key = "$name==$($pins[$name])"
-                    if ($published.ContainsKey($key)) { continue }
-                    @{ name = $name; version = [string]$pins[$name]; rejected = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null }) }
-                }
+                $pending = @(Get-WheelhouseUiPendingPin -Context $Context -Pin $pins)
                 return @{ Status = 200; Body = @{
                         path            = $path
                         text            = $text
@@ -746,6 +882,41 @@ function Get-WheelhouseUiRoute {
                         approval        = (Get-WheelhouseUiApproval -Context $Context -RequirementsPath $path)
                     }
                 }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/requirements/remove$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                # Takes one package out of requirements.in and resolves requirements.txt again, so a
+                # pin that is rejected (or not wanted yet) stops waiting in "Review and publish".
+                $name = [string](Get-UiBodyValue -Body $Body -Name 'name')
+                if (-not (Test-WheelhousePackageName -Name $name)) { throw [System.ArgumentException]::new('Not a valid package name.') }
+                return (Invoke-WheelhouseUiRequirementRemoval -Context $Context -Name @($name) -Title 'Remove packages')
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/requirements/clear$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                # "Clear list": takes every requirement whose pin is still waiting to be published out
+                # of requirements.in, then resolves again. The wheelhouse does not change.
+                $path = [string]$Context.Settings.LocalRequirementsPath
+                $pins = @{}
+                if ($path -and (Test-Path -LiteralPath $path -PathType Leaf) -and ([System.IO.File]::ReadAllText($path)).Trim()) { $pins = Read-RequirementFile -FilePath $path }
+                $names = @(Get-WheelhouseUiPendingPin -Context $Context -Pin $pins | Where-Object { $_.direct } | ForEach-Object { $_.name })
+                if ($names.Count -eq 0) {
+                    return @{ Status = 409; Body = @{ error = 'Nothing to clear: no package waiting to be published is listed in requirements.in (the ones waiting are dependencies of published packages).' } }
+                }
+                return (Invoke-WheelhouseUiRequirementRemoval -Context $Context -Name $names -Title 'Clear list')
             }
         }
 
@@ -840,7 +1011,7 @@ function Get-WheelhouseUiRoute {
                     if ($reason -notmatch '^[A-Za-z0-9 .,:;()/#+_-]{5,200}$') { throw [System.ArgumentException]::new('Write the reason as a short sentence (5-200 letters, digits and . , : ; ( ) / # + _ -).') }
                     $arguments += @('-ExpediteReason', $reason)
                 }
-                $job = Start-WheelhouseUiJob -Title "Fix: $name==$version" -Kind 'remediate' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseRemediation.ps1'; Arguments = $arguments })
+                $job = Start-WheelhouseUiJob -Title 'Fix package' -Kind 'remediate' -Detail @("$name==$version") -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseRemediation.ps1'; Arguments = $arguments })
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
         }
@@ -854,7 +1025,7 @@ function Get-WheelhouseUiRoute {
                 if ((Get-UiBodyValue -Body $Body -Name 'confirm') -ne $true) {
                     throw [System.ArgumentException]::new('Publishing needs an explicit confirmation.')
                 }
-                $job = Start-WheelhouseUiJob -Title 'Publish: Update-Wheelhouse' -Kind 'update' -Context $Context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() })
+                $job = Start-WheelhouseUiJob -Title 'Publish packages' -Kind 'update' -Context $Context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() })
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
         }
@@ -1150,6 +1321,38 @@ function Get-WheelhouseUiRoute {
                 Set-WheelhouseSetting -SettingsPath $Context.SettingsPath -Updates $updates
                 Write-Log "Settings changed from the UI: $(($updates.Keys | Sort-Object) -join ', ')" 'WARN'
                 return @{ Status = 200; Body = @{ saved = @($updates.Keys | Sort-Object) } }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/audits$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                # The newest pip-audit reports (at most 200), with their counts.
+                $files = @(Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_*.json' -File -ErrorAction SilentlyContinue |
+                        Where-Object { Get-AuditReportInfo -Path $_.FullName } |
+                        Sort-Object { (Get-AuditReportInfo -Path $_.FullName).Timestamp } -Descending |
+                        Select-Object -First 200)
+                $reports = @(foreach ($file in $files) { ConvertTo-WheelhouseUiAuditReport -File $file })
+                return @{ Status = 200; Body = @{ folder = $Context.ReportsFolder; reports = $reports } }
+            }
+        }
+
+        @{
+            Method     = 'GET'
+            Pattern    = '^/api/audits/(?<file>Report_[A-Za-z0-9._-]+\.json)$'
+            Wheelhouse = $true
+            Handler    = {
+                param($Context, $Body, $Match)
+                $name = [string]$Match['file']
+                $path = Join-Path $Context.ReportsFolder $name
+                if (-not (Get-AuditReportInfo -Path $path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                    return @{ Status = 404; Body = @{ error = "No audit report named $name." } }
+                }
+                $report = ConvertTo-WheelhouseUiAuditReport -File (Get-Item -LiteralPath $path) -IncludeDependency
+                return @{ Status = 200; Body = $report }
             }
         }
 

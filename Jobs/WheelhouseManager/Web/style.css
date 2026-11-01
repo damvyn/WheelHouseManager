@@ -38,6 +38,8 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
+/* Below this size the layout stops shrinking and the browser window gets scrollbars instead. */
+html { overflow: auto; background: var(--bg); }
 /* Header, tabs, the scrolling page and the job panel stack in one window-high column: the job
    panel takes its own space at the bottom, so it never covers the page. */
 body {
@@ -45,6 +47,7 @@ body {
   background: var(--bg);
   color: var(--text);
   display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  min-width: 1000px; min-height: 560px;
 }
 .topbar, .tabs { flex: 0 0 auto; }
 .page { flex: 1 1 auto; min-height: 0; overflow: auto; padding-bottom: 24px; }
@@ -191,4 +194,54 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .job-indicator.bad { border-color: var(--bad); }
 .job-indicator.bad .dot { background: var(--bad); }
 @keyframes job-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .25; transform: scale(.8); } }
-@media (prefers-reduced-motion: reduce) { .job-indicator.running .dot { animation: none; } }
+/* Packages tab: the toolbar stays put and only the table scrolls (its header row stays visible). */
+.page.fill { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 16px; }
+.page.fill main { flex: 1 1 auto; min-height: 0; width: 100%; display: flex; flex-direction: column; }
+.page.fill main > .banner { flex: 0 0 auto; }
+.page.fill #tab-packages { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#tab-packages > .toolbar, #tab-packages > .banner { flex: 0 0 auto; }
+#tab-packages > .banner { max-height: 120px; overflow: auto; }
+.page.fill #tab-packages > .table-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
+/* Add tab: the result of "Add and resolve" inside step 1, collapsible and scrolling on its own. */
+.add-result { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }
+.add-result-head { display: flex; gap: 6px; align-items: center; }
+.result-scroll { max-height: 260px; overflow: auto; margin-top: 8px; padding: 2px 10px 8px; border: 1px solid var(--line); border-radius: 8px; }
+.result-scroll > p { margin: 8px 0 0; }
+/* Jobs tab: what a job worked on, listed on demand. */
+.job-detail { max-height: 200px; overflow: auto; margin-top: 4px; }
+/* Add tab: long pin lists scroll inside their card; the header row stays visible. */
+.table-wrap.scroll-list { max-height: 320px; overflow: auto; }
+.link-toggle { display: block; border: 0; padding: 0; margin-top: 1px; background: none; color: var(--accent); font: inherit; font-size: 11px; line-height: 1.3; cursor: pointer; }
+.link-toggle:hover, .link-toggle:focus-visible { text-decoration: underline; }
+/* A job is running: buttons that would start another one look disabled (their clicks are blocked). */
+body.job-running [data-idle] { opacity: .45; cursor: not-allowed; }
+/* Audit tab */
+#tab-audit .table-wrap.scroll-list { max-height: 360px; margin: 8px 0; }
+.report-row { cursor: pointer; }
+.report-row:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.report-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.report-row .caret { display: inline-block; width: 1em; color: var(--muted); }
+td.report-detail { background: var(--bg); padding: 10px 16px 14px; }
+td.report-detail > p:first-child { margin-top: 0; }
+.audit-desc { max-width: 520px; color: var(--muted); font-size: 12.5px; }
+.scroll-box { max-height: 220px; overflow: auto; }
+/* Top bar pill while a job runs: a spinner and a light sweeping across, so it is clear work is going on. */
+.job-indicator.running { position: relative; overflow: hidden; }
+.job-indicator.running .dot {
+  background: transparent; border: 2px solid var(--accent); border-right-color: transparent;
+  width: 12px; height: 12px; animation: job-spin .8s linear infinite;
+}
+.job-indicator.running::after {
+  content: ''; position: absolute; top: 0; bottom: 0; left: -40%; width: 40%; pointer-events: none;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 22%, transparent), transparent);
+  animation: job-sweep 1.6s ease-in-out infinite;
+}
+@keyframes job-spin { to { transform: rotate(360deg); } }
+@keyframes job-sweep { 0% { left: -40%; } 100% { left: 100%; } }
+/* Windows "Animation effects: off" (common on servers and over Remote Desktop) asks for reduced
+   motion. The spinner is the only sign a job is still working, so it keeps turning, slower;
+   only the decorative sweep stops. */
+@media (prefers-reduced-motion: reduce) {
+  .job-indicator.running .dot { animation: job-spin 1.6s linear infinite; }
+  .job-indicator.running::after { animation: none; display: none; }
+}

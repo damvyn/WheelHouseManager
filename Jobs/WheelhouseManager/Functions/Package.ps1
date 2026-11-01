@@ -918,9 +918,10 @@ function Test-PackageSpec {
 
 function Add-RequirementInLine {
     # Appends requirement specs to requirements.in. Refuses invalid specs, packages
-    # the denylist blocks outright, and names that are already listed. Returns
-    # @{ Added = string[]; Skipped = [{Spec; Reason}] }; nothing is written if
-    # nothing is added.
+    # the denylist blocks outright, and names that are already listed - unless -Replace,
+    # which then swaps the listed line for the new spec (to change a version range that
+    # makes the resolve fail). Returns @{ Added = string[]; Replaced = string[];
+    # Skipped = [{Spec; Reason; Replaceable}] }; nothing is written if nothing changes.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -930,53 +931,98 @@ function Add-RequirementInLine {
         [string[]]$Spec,
 
         [AllowEmptyCollection()]
-        [object[]]$Denylist = @()
+        [object[]]$Denylist = @(),
+
+        [switch]$Replace
     )
 
-    $existingNames = @{}
+    $lines = [System.Collections.Generic.List[string]]::new()
     $existingText = ''
     if (Test-Path -Path $Path) {
         $existingText = Get-Content -Path $Path -Raw -ErrorAction Stop
-        foreach ($line in ($existingText -split "`r?`n")) {
-            $clean = ($line -replace '(^|\s)#.*$', '').Trim()
-            if ($clean -match '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)') {
-                $existingNames[(Get-NormalizedPackageName $Matches['name'])] = $clean
-            }
-        }
+        if ($null -eq $existingText) { $existingText = '' }
+        foreach ($line in ($existingText -split "`r?`n")) { $lines.Add($line) }
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
     }
 
     $added = [System.Collections.Generic.List[string]]::new()
+    $replaced = [System.Collections.Generic.List[string]]::new()
     $skipped = [System.Collections.Generic.List[object]]::new()
     foreach ($raw in $Spec) {
         $item = ([string]$raw).Trim()
         if (-not (Test-PackageSpec -Spec $item)) {
-            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = 'not a valid requirement (use a name with an optional version, e.g. numpy or pandas>=2.0)' })
+            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = 'not a valid requirement (use a name with an optional version, e.g. numpy or pandas>=2.0)'; Replaceable = $false })
             continue
         }
         $null = $item -match '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(?<rest>.*)$'
         $name = Get-NormalizedPackageName $Matches['name']
         $rest = $Matches['rest'].Replace(' ', '')
 
-        if ($existingNames.ContainsKey($name)) {
-            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "'$name' is already listed in requirements.in as '$($existingNames[$name])'" })
-            continue
+        $current = Get-RequirementInLine -Lines $lines.ToArray() -Name $name
+        if ($current) {
+            $listed = ($current.Line -replace '(^|\s)#.*$', '').Trim()
+            $same = $listed.Replace(' ', '') -eq $item.Replace(' ', '')
+            if ($same -or -not $Replace) {
+                $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "'$name' is already listed in requirements.in as '$listed'"; Replaceable = (-not $same) })
+                continue
+            }
         }
         $pinned = if ($rest -match '^==(?<v>[^,*]+)$') { $Matches['v'] } else { $null }
         $blocked = if ($pinned) { Get-DenylistMatch -Name $name -Version $pinned -Denylist $Denylist } else { Get-DenylistMatch -Name $name -Version '*' -Denylist @($Denylist | Where-Object { $_.version -eq '*' }) }
         if ($blocked) {
-            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "blocked by the denylist ($($blocked.version)): $($blocked.reason)" })
+            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "blocked by the denylist ($($blocked.version)): $($blocked.reason)"; Replaceable = $false })
             continue
         }
 
-        $existingNames[$name] = $item
-        $added.Add($item)
+        if ($current) {
+            $lines[$current.Index] = $item
+            $replaced.Add($item)
+        }
+        else {
+            $lines.Add($item)
+            $added.Add($item)
+        }
     }
 
-    if ($added.Count -gt 0 -and $PSCmdlet.ShouldProcess($Path, "Add $($added.Count) requirement(s)")) {
-        $prefix = if ($existingText -and -not $existingText.EndsWith("`n")) { "`r`n" } else { '' }
+    if (($added.Count + $replaced.Count) -gt 0 -and $PSCmdlet.ShouldProcess($Path, "Add $($added.Count), replace $($replaced.Count) requirement(s)")) {
         $folder = Split-Path -Path $Path -Parent
         if ($folder -and -not (Test-Path -Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
-        Add-Content -Path $Path -Value ($prefix + ($added -join "`r`n")) -Encoding utf8 -ErrorAction Stop
+        Write-TextFileAtomic -Path $Path -Content ($lines -join "`r`n")
     }
-    return @{ Added = $added.ToArray(); Skipped = $skipped.ToArray() }
+    return @{ Added = $added.ToArray(); Replaced = $replaced.ToArray(); Skipped = $skipped.ToArray() }
+}
+
+function Remove-RequirementInLine {
+    # Takes packages out of requirements.in (every line that names one; names compare
+    # normalized) and returns the removed lines. Throws, before writing, when a package is
+    # not listed - it is then a dependency of another requirement.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string[]]$Name
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if (Test-Path -LiteralPath $Path) { foreach ($item in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) { $lines.Add([string]$item) } }
+    $removed = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in $Name) {
+        $found = $false
+        while ($true) {
+            $current = Get-RequirementInLine -Lines $lines.ToArray() -Name $item
+            if (-not $current) { break }
+            $found = $true
+            $removed.Add($current.Line.Trim())
+            $lines.RemoveAt($current.Index)
+        }
+        if (-not $found) {
+            throw [System.Collections.Generic.KeyNotFoundException]::new("'$(Get-NormalizedPackageName $item)' is not listed in requirements.in: another requirement depends on it. Remove or change that requirement instead.")
+        }
+    }
+    if ($PSCmdlet.ShouldProcess($Path, "Remove $($Name -join ', ')")) {
+        Write-TextFileAtomic -Path $Path -Content ($lines -join "`r`n")
+    }
+    Write-Output -NoEnumerate $removed.ToArray()
 }

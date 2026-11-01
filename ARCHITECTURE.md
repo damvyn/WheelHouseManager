@@ -107,7 +107,7 @@ is the repo root; tests pass explicit paths (`-ManagerRoot`, `-StagingRoot`, `-S
 | `config\settings.psd1` | Setup.ps1, `Set-WheelhouseSetting` (UI) | psd1, keys sorted, written atomically | Warning, defaults are used (`Get-WheelhouseSetting`) |
 | `config\denylist.json` | `Add-/Remove-WheelhouseDenylistEntry` | JSON array (section 11) | **Throws** - never read as empty |
 | `config\waivers.json` | `Add-/Remove-WheelhouseWaiver` (UI, under the write lock) | JSON array (section 11) | **Throws** - never read as empty |
-| `Input\requirements.in` | User, `Add-RequirementInLine` (UI) | pip requirements, unpinned allowed | uv fails |
+| `Input\requirements.in` | User, `Add-RequirementInLine` / `Remove-RequirementInLine` (UI) | pip requirements, unpinned allowed | uv fails |
 | `Input\requirements.txt` | Update-Requirement.ps1 (move of the candidate file) | uv output, exact pins | Unsupported lines are skipped with a warning |
 | `Input\requirements.candidate.txt` / `.rejected.txt` / `.constraints.tmp` | Update-Requirement.ps1 | transient / last rejected result / denylist as `!=` constraints | - |
 | `staging\<guid>\` | `Invoke-CandidateIntake` | downloads of one intake call; deleted in `finally` | - |
@@ -560,7 +560,8 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Resolve-MaliciousPackage` | published versions with an open, unwaived `MAL-*` finding: with `-AutoQuarantine` quarantine (denylisted); one `Malicious` notice per version; call under the write lock | `Invoke-WheelhouseSync`, scheduled check |
 | `Restore-WheelhousePackage` | section 9.5 (verify, journal, `Complete-WheelhouseRestoreJournal`, catalog + history); `-KeepDenylist` | UI |
 | `Test-PackageSpec` | allowed `requirements.in` line (name, extras, version operators; <= 200 chars) | `Add-RequirementInLine` |
-| `Add-RequirementInLine` | append valid, new, non-denylisted specs | UI add |
+| `Add-RequirementInLine` | append valid, new, non-denylisted specs; `-Replace` swaps the line of a listed package (skipped entries say `Replaceable`) | UI add |
+| `Remove-RequirementInLine` | take packages' line(s) out of `requirements.in`; throws before writing if one is not listed (a dependency) | UI remove / clear |
 
 ### 8.11 `Scan.ps1`
 
@@ -862,7 +863,8 @@ Invoke-WheelhouseUiRequest: token from X-Wheelhouse-Token (API) or ?t= (page)
     Test-WheelhouseUiRequest (host, token, origin, content type, method) -> deny | continue
     /api/*: body <= 1 MB, JSON -> Invoke-WheelhouseUiApi -> ConvertTo-Json -Depth 8
     else: static whitelist (/, /app.js, /style.css)
-Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <current host exe>
+Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it works on, steps)
+      -> Start-WheelhouseUiJobStep: Start-Process <current host exe>
       -NoProfile -File Jobs\<script> <validated args>, hidden, stdout/err -> logs\ui
       Sync: step exit 0 -> next step / Succeeded; 1 -> Attention; 3 -> Failed (busy); other -> Failed
       Cancel: taskkill /PID /T /F -> Cancelled. Shutdown cancels the running job.
@@ -922,7 +924,11 @@ Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <
 | `POST /api/waivers/add`, `POST /api/waivers/remove` | `{name, version, id, reason, days}` / `{name, version, id}` | `Add-/Remove-WheelhouseWaiver` + `Set-CatalogFindingWaiver` inside `Update-WheelhouseCatalog -TimeoutSeconds 0` (history at once) | 200 / 400 / 404 / 409 |
 | `POST /api/packages/audit` | `{all}` or `{packages:[{name,version}]}` (<= 500) | job `Test-WheelhousePackage.ps1 [-Package ...]` | 202 |
 | `POST /api/packages/scan` | `{all}` or `{files:[...]}` | job `Invoke-WheelhouseScan.ps1 [-File ...]` | 202 |
-| `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
+| `GET /api/audits` | - | the newest 200 pip-audit reports (`Get-AuditReportInfo` names) as `ConvertTo-WheelhouseUiAuditReport` summaries | 200 |
+| `GET /api/audits/<file>` | - | one report with every package and advisory (`-IncludeDependency`); 404 for a file that is not an audit report | 200 |
+| `POST /api/requirements/remove` | `{name}` | `Invoke-WheelhouseUiRequirementRemoval` -> `Remove-RequirementInLine`; job `Update-Requirement.ps1` (title *Remove packages*), or requirements.txt emptied when requirements.in lists nothing | 200 |
+| `POST /api/requirements/clear` | `{}` | the same for every pending pin listed in requirements.in (`Get-WheelhouseUiPendingPin`, `direct`); title *Clear list*; 409 when none | 200 |
+| `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool, replace:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
 | `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review, plus `pending` (pins not in the manifest, each with the reason from the latest `Report_Rejected_*` if any) and `published_count` | 200 `{path, text, modified_utc, pin_count}` |
 | `POST /api/wheelhouse/update` | `{confirm:true}` | job `Update-Wheelhouse.ps1` | 202 / 400 |
 | `POST /api/packages/remove` | `{packages (<= 200), mode:'quarantine'\|'delete', reason (<= 400), confirm}` | `Remove-WheelhousePackage` per package; refused while a job runs | 200 `{results}` |

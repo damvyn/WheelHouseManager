@@ -171,6 +171,8 @@
       !window.confirm('Your settings changes are not saved yet. Leave the Settings tab and discard them?')) { return; }
     state.settingsDirty = false;
     state.currentTab = name;
+    // The Packages tab keeps its toolbar in place and scrolls the table alone.
+    $('page').classList.toggle('fill', name === 'packages');
     Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), function (b) {
       b.classList.toggle('active', b.getAttribute('data-tab') === name);
     });
@@ -178,7 +180,7 @@
       s.classList.toggle('hidden', s.id !== 'tab-' + name);
     });
     var loaders = {
-      overview: loadOverview, packages: loadPackages, add: renderAdd, quarantine: loadQuarantine,
+      overview: loadOverview, packages: loadPackages, add: renderAdd, audit: loadAudits, quarantine: loadQuarantine,
       denylist: loadDenylist, schedule: loadScheduleTab, settings: loadSettings, jobs: loadJobs
     };
     return loaders[name]();
@@ -386,14 +388,14 @@
     var toolbar = h('div', { class: 'toolbar' },
       h('div', { class: 'group' }, filter, statusFilter, h('button', { class: 'btn', type: 'button', onclick: loadPackages }, 'Refresh')),
       h('div', { class: 'group' },
-        h('button', { class: 'btn', type: 'button', disabled: none, onclick: function () { runAudit(false); } }, 'Audit selected'),
-        h('button', { class: 'btn', type: 'button', onclick: function () { runAudit(true); } }, 'Audit all')),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, disabled: none, onclick: function () { runAudit(false); } }, 'Audit selected'),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, onclick: function () { runAudit(true); } }, 'Audit all')),
       h('div', { class: 'group' },
-        h('button', { class: 'btn', type: 'button', disabled: none, onclick: function () { runScan(false); } }, 'Scan selected'),
-        h('button', { class: 'btn', type: 'button', onclick: function () { runScan(true); } }, 'Scan all')),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, disabled: none, onclick: function () { runScan(false); } }, 'Scan selected'),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, onclick: function () { runScan(true); } }, 'Scan all')),
       h('div', { class: 'group' },
-        h('button', { class: 'btn', type: 'button', disabled: none, onclick: function () { removeSelected('quarantine'); } }, 'Quarantine'),
-        h('button', { class: 'btn danger', type: 'button', disabled: none, onclick: function () { removeSelected('delete'); } }, 'Delete')),
+        h('button', { class: 'btn', type: 'button', 'data-idle': true, disabled: none, onclick: function () { removeSelected('quarantine'); } }, 'Quarantine'),
+        h('button', { class: 'btn danger', type: 'button', 'data-idle': true, disabled: none, onclick: function () { removeSelected('delete'); } }, 'Delete')),
       h('span', { class: 'muted' }, pins.length + ' selected / ' + visible.length + ' shown / ' + state.pkgs.length + ' files'));
     root.append(toolbar);
 
@@ -493,7 +495,7 @@
               action.addEventListener('click', function () { acceptRisk(data.name, data.version, f); });
             }
             if ([].concat(f.fix_versions || []).length) {
-              var fix = h('button', { class: 'btn small primary', type: 'button' }, 'Fix');
+              var fix = h('button', { class: 'btn small primary', type: 'button', 'data-idle': true }, 'Fix');
               fix.addEventListener('click', function () { planFix(data.name, data.version); });
               action = h('div', { class: 'row-actions' }, fix, action);
             }
@@ -618,21 +620,19 @@
     state.reviewFix = false;
     var specs = h('textarea', { placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
     var publishNow = h('input', { type: 'checkbox' });
-    var output = h('div', {});
-    var go = h('button', { class: 'btn primary', type: 'button' }, 'Add and resolve');
+    var output = h('div', { class: 'add-result hidden' });
+    var go = h('button', { class: 'btn primary', type: 'button', 'data-idle': true }, 'Add and resolve');
+    // replace: swap the requirements.in line of a package that is already listed.
+    var submit = function (list, replace) {
+      api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked, replace: !!replace }).then(function (data) {
+        renderAddResult(output, data, submit);
+        if (data.job) { specs.value = ''; watchJob(data.job.id, false); }
+      }).catch(fail);
+    };
     go.addEventListener('click', function () {
       var list = specs.value.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(function (s) { return s && s.charAt(0) !== '#'; });
       if (list.length === 0) { toast('Enter at least one package.', 'bad'); return; }
-      api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked }).then(function (data) {
-        clear(output);
-        if (data.added.length) {
-          output.append(h('p', {}, 'Added to requirements.in:'), h('ul', { class: 'result-list' }, data.added.map(function (a) { return h('li', { class: 'mono' }, a); })));
-        }
-        if (data.skipped.length) {
-          output.append(h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, data.skipped.map(function (s) { return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason); })));
-        }
-        if (data.job) { specs.value = ''; watchJob(data.job.id, false); }
-      }).catch(fail);
+      submit(list, false);
     });
     root.append(
       h('div', { class: 'card' },
@@ -640,12 +640,50 @@
         h('p', { class: 'muted' }, 'One requirement per line, for example numpy or pandas>=2.0. The names go into requirements.in, and Update-Requirement.ps1 resolves them (with the cooldown) into requirements.txt. Nothing is downloaded yet: review the result below first.'),
         specs,
         h('p', {}, h('label', {}, publishNow, ' Also publish right away (skips the review step)')),
-        h('div', { class: 'toolbar' }, go)),
-      output,
+        h('div', { class: 'toolbar' }, go),
+        output),
       h('div', { class: 'card', id: 'requirements-card' }),
       h('div', { class: 'card', id: 'rejected-card' }));
     loadRequirements(reviewFix ? 'fix' : false);
     loadRejected();
+  }
+
+  // The outcome of "Add and resolve", inside step 1: a summary line with a button to show or
+  // hide the lists, which scroll on their own when they are long. A package that is already
+  // listed with another version range can replace that line (submit(specs, true)).
+  function renderAddResult(output, data, submit) {
+    var added = [].concat(data.added || []);
+    var replaced = [].concat(data.replaced || []);
+    var skipped = [].concat(data.skipped || []);
+    clear(output);
+    var total = added.length + replaced.length + skipped.length;
+    output.classList.toggle('hidden', total === 0);
+    if (total === 0) { return; }
+    var replaceable = skipped.filter(function (s) { return s.Replaceable; }).map(function (s) { return s.Spec; });
+    var replaceButton = function (list, label) {
+      return h('button', { class: 'btn small', type: 'button', 'data-idle': true, title: 'Use ' + list.join(', ') + ' instead of the line in requirements.in, then resolve again',
+        onclick: function () { submit(list, true); } }, label);
+    };
+    var lists = h('div', { class: 'result-scroll' },
+      added.length ? [h('p', {}, 'Added to requirements.in:'), h('ul', { class: 'result-list' }, added.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
+      replaced.length ? [h('p', {}, 'Replaced in requirements.in:'), h('ul', { class: 'result-list' }, replaced.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
+      skipped.length ? [h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, skipped.map(function (s) {
+        return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason, s.Replaceable ? [' ', replaceButton([s.Spec], 'Replace')] : null);
+      }))] : null,
+      replaceable.length ? h('p', { class: 'muted' }, 'Replace swaps the listed line for the one you entered and resolves again - for example to fix a version range that makes the resolve fail.') : null);
+    var toggle = h('button', { class: 'btn small', type: 'button' }, 'Hide list');
+    toggle.addEventListener('click', function () {
+      var hide = !lists.classList.contains('hidden');
+      lists.classList.toggle('hidden', hide);
+      toggle.textContent = hide ? 'Show list' : 'Hide list';
+    });
+    output.append(h('div', { class: 'add-result-head' },
+      h('strong', {}, 'Result:'), ' ',
+      added.length ? badge(added.length + ' added', 'ok') : null, ' ',
+      replaced.length ? badge(replaced.length + ' replaced', 'ok') : null, ' ',
+      skipped.length ? badge(skipped.length + ' not added', 'bad') : null,
+      h('span', { class: 'spacer' }),
+      replaceable.length > 1 ? replaceButton(replaceable, 'Replace all ' + replaceable.length) : null, toggle), lists);
   }
 
   function loadRequirements(showNextStep) {
@@ -656,7 +694,7 @@
       if (showNextStep) {
         card.classList.add('next-step');
         card.append(h('p', { class: 'next-hint' }, showNextStep === 'fix'
-          ? 'Fix proposed. Next: review what changes below, approve it, then publish it to the wheelhouse.'
+          ? 'Fix prepared. Next: review what changes below, then publish it to the wheelhouse.'
           : 'Resolved. Next: review the pins below, then publish them to the wheelhouse.'));
         setTimeout(function () { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 50);
       } else {
@@ -679,33 +717,70 @@
         card.append(h('div', { class: 'empty' }, 'Everything in requirements.txt is already in the wheelhouse - there is nothing to publish. Add packages above to resolve new ones.'), whole);
         return;
       }
-      card.append(h('div', { class: 'table-wrap' }, h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'))),
-        h('tbody', {}, pending.map(function (p) {
-          return h('tr', {}, h('td', { class: 'mono' }, p.name + '==' + p.version),
-            h('td', {}, p.rejected ? [badge('rejected last time', 'bad'), ' ', p.rejected] : badge('new', 'ok')));
-        })))));
       var rejectedCount = pending.filter(function (p) { return p.rejected; }).length;
-      if (rejectedCount > 0) {
-        card.append(h('p', { class: 'muted' }, rejectedCount + ' pin(s) were rejected by the latest update for the reason shown. Publishing again rejects them again unless the reason is gone (for example the cooldown has passed); otherwise change them in requirements.in (step 1).'));
+      card.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'), rejectedCount ? h('th', {}, '') : null)),
+        h('tbody', {}, pending.map(function (p) {
+          // Only a pin the latest publish rejected can be taken out of requirements.in here; a
+          // dependency of another requirement goes away only with that requirement.
+          var action = null;
+          if (p.rejected) {
+            action = p.direct
+              ? h('button', { class: 'btn small danger', type: 'button', 'data-idle': true, title: 'Remove ' + p.name + ' from requirements.in and resolve again', onclick: function () { removeRequirement(p); } }, 'Remove')
+              : h('span', { class: 'muted', title: 'Not listed in requirements.in: another requirement depends on it' }, 'dependency');
+          }
+          var status = !p.rejected ? badge('new', 'ok')
+            : p.retryable ? [badge('waiting for cooldown', 'warn'), ' ', p.rejected] : [badge('rejected', 'bad'), ' ', p.rejected];
+          return h('tr', {}, h('td', { class: 'mono' }, p.name + '==' + p.version), h('td', {}, status),
+            rejectedCount ? h('td', { class: 'num' }, action) : null);
+        })))));
+      // A rejected pin is not counted for publishing; one rejected only for the cooldown is,
+      // because it passes once the cooldown is over.
+      var publishable = pending.filter(function (p) { return !p.rejected || p.retryable; }).length;
+      var blocked = pending.filter(function (p) { return p.rejected && !p.retryable; }).length;
+      var waiting = rejectedCount - blocked;
+      if (blocked > 0) {
+        card.append(h('p', { class: 'muted' }, blocked + ' pin(s) were rejected by the latest publish for the reason shown and are not counted for publishing. Click Remove to take them out of requirements.in.'));
       }
-      card.append(renderApproval(data.approval, pending.length), whole);
+      if (waiting > 0) {
+        card.append(h('p', { class: 'muted' }, waiting + ' pin(s) are newer than the cooldown. Publishing again adds them once the cooldown has passed; Remove takes them out if you do not want to wait.'));
+      }
+      var clearable = pending.some(function (p) { return p.direct; });
+      card.append(renderApproval(data.approval, publishable, clearable), whole);
     }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
   }
 
-  // The proposal behind requirements.txt: who asked, who approved, and the buttons the
-  // approval mode allows this user (decision D3).
-  function renderApproval(a, pendingCount) {
+  // Takes a package out of requirements.in and resolves requirements.txt again (a job).
+  function removeRequirement(p) {
+    confirmDialog('Remove ' + p.name + '?', h('div', {},
+      h('p', {}, h('span', { class: 'mono' }, p.name), ' is taken out of requirements.in and requirements.txt is resolved again, so ', h('span', { class: 'mono' }, p.name + '==' + p.version), ' is no longer waiting to be published.'),
+      h('p', { class: 'muted' }, 'Nothing in the wheelhouse changes. If another requirement still depends on it, the resolver keeps a version of it.')), 'Remove', true).then(function (ok) {
+      if (!ok) { return; }
+      api('POST', '/api/requirements/remove', { name: p.name }).then(function (data) {
+        if (data.job) { watchJob(data.job.id, false); } else { toast(p.name + ' removed.'); loadRequirements(); }
+      }).catch(fail);
+    });
+  }
+
+  // The proposal behind requirements.txt and the buttons. With the default approval mode the
+  // person who publishes is recorded and there is nothing to approve separately; the
+  // SeparateApprover mode (decision D3) keeps Approve / Reject for a second person.
+  function renderApproval(a, publishable, clearable) {
     var box = h('div', { class: 'approval' });
     var p = a.proposal;
-    var modeText = a.mode === 'SeparateApprover' ? 'Another person than the requester must approve it.' : 'The requester may approve it; publishing approves it. Who did what is recorded.';
+    var separate = a.mode === 'SeparateApprover';
     if (p && a.current) {
-      var stateKind = p.state === 'Approved' || p.state === 'Published' ? 'ok' : p.state === 'Rejected' ? 'bad' : 'warn';
-      box.append(h('p', {}, h('strong', {}, (p.kind === 'remediation' ? 'Fix proposal ' : 'Proposal ') + p.id), ' ', badge(p.state, stateKind),
-        ' requested by ' + p.requested_by + ' on ' + fmtDate(p.requested_utc),
-        p.approved_by ? ', approved by ' + p.approved_by + (p.approved_utc ? ' on ' + fmtDate(p.approved_utc) : '') : '',
-        p.rejected_by ? ', rejected by ' + p.rejected_by + ': ' + p.decision_note : ''));
-      if (p.note) { box.append(h('p', { class: 'muted' }, p.note)); }
+      if (separate) {
+        var stateKind = p.state === 'Approved' || p.state === 'Published' ? 'ok' : p.state === 'Rejected' ? 'bad' : 'warn';
+        box.append(h('p', {}, h('strong', {}, (p.kind === 'remediation' ? 'Fix proposal ' : 'Proposal ') + p.id), ' ', badge(p.state, stateKind),
+          ' requested by ' + p.requested_by + ' on ' + fmtDate(p.requested_utc),
+          p.approved_by ? ', approved by ' + p.approved_by + (p.approved_utc ? ' on ' + fmtDate(p.approved_utc) : '') : '',
+          p.rejected_by ? ', rejected by ' + p.rejected_by + ': ' + p.decision_note : ''));
+      } else {
+        box.append(h('p', { class: 'muted' }, (p.kind === 'remediation' ? 'Fix prepared by ' : 'Resolved by ') + p.requested_by + ' on ' + fmtDate(p.requested_utc) + '.',
+          p.state === 'Published' && p.approved_by ? ' Last published by ' + p.approved_by + (p.approved_utc ? ' on ' + fmtDate(p.approved_utc) : '') + '.' : ''));
+      }
+      if (p.note && separate) { box.append(h('p', { class: 'muted' }, p.note)); }
       var retire = [].concat(p.retire || []);
       if (p.kind === 'remediation' && retire.length) {
         box.append(h('ul', { class: 'result-list' },
@@ -714,24 +789,26 @@
           h('p', { class: 'muted' }, 'The fixed versions replace the old ones in the group files that list the vulnerable version - the files clients install from.'));
       }
       if (p.expedite_reason) { box.append(h('p', {}, badge('cooldown skipped', 'warn'), ' ' + p.expedite_reason)); }
-    } else if (p) {
+    } else if (p && separate) {
       box.append(h('p', { class: 'muted' }, 'requirements.txt changed after proposal ' + p.id + ' was made - it is not covered by it.'));
-    } else {
+    } else if (separate) {
       box.append(h('p', { class: 'muted' }, 'No proposal yet for requirements.txt.'));
     }
-    box.append(h('p', { class: 'muted' }, 'Approval: ' + modeText + ' You are ' + a.current_user + '.'));
+    box.append(h('p', { class: 'muted' }, separate
+      ? 'Approval: another person than the requester must approve it before it can be published. You are ' + a.current_user + '.'
+      : 'Publishing records who published it. You are ' + a.current_user + '.'));
     if (a.blocked_by) { box.append(h('div', { class: 'banner' }, a.blocked_by)); }
 
     var buttons = h('div', { class: 'toolbar after-output' });
-    if (a.can_approve && p && p.state === 'Proposed') {
-      var approve = h('button', { class: 'btn', type: 'button' }, 'Approve');
+    if (separate && a.can_approve && p && p.state === 'Proposed') {
+      var approve = h('button', { class: 'btn', type: 'button', 'data-idle': true }, 'Approve');
       approve.addEventListener('click', function () {
         api('POST', '/api/proposal/approve', { id: p.id }).then(function () { toast('Proposal ' + p.id + ' approved.'); loadRequirements(); }).catch(fail);
       });
       buttons.append(approve);
     }
-    if (a.can_reject && p) {
-      var reject = h('button', { class: 'btn danger', type: 'button' }, 'Reject');
+    if (separate && a.can_reject && p) {
+      var reject = h('button', { class: 'btn danger', type: 'button', 'data-idle': true }, 'Reject');
       reject.addEventListener('click', function () {
         var reason = h('input', { type: 'text', class: 'wide', placeholder: 'Why? (required, recorded)' });
         confirmDialog('Reject proposal ' + p.id + '?', h('div', {}, h('p', {}, 'Nothing of it is published. To try again, change requirements.in and resolve again.'), reason), 'Reject', true).then(function (ok) {
@@ -741,25 +818,38 @@
       });
       buttons.append(reject);
     }
-    if (!a.current && a.mode === 'SeparateApprover') {
-      var propose = h('button', { class: 'btn', type: 'button' }, 'Propose this requirements.txt');
+    if (!a.current && separate) {
+      var propose = h('button', { class: 'btn', type: 'button', 'data-idle': true }, 'Propose this requirements.txt');
       propose.addEventListener('click', function () {
         api('POST', '/api/proposal/new', {}).then(function () { toast('Proposed. Another person has to approve it before it can be published.'); loadRequirements(); }).catch(fail);
       });
       buttons.append(propose);
     }
-    var approving = a.can_publish && !(p && a.current && (p.state === 'Approved' || p.state === 'Published'));
-    var publish = h('button', { class: 'btn primary', type: 'button', disabled: !a.can_publish },
-      (approving ? 'Approve and publish ' : 'Publish ') + pendingCount + ' pin(s) to the wheelhouse');
+    var publish = h('button', { class: 'btn primary', type: 'button', 'data-idle': true, disabled: !a.can_publish || publishable === 0 },
+      publishable === 0 ? 'Nothing to publish' : 'Publish ' + publishable + ' pin(s)');
     publish.addEventListener('click', function () {
-      confirmDialog('Publish requirements.txt?', h('div', {},
+      confirmDialog('Publish ' + publishable + ' pin(s)?', h('div', {},
         h('p', {}, 'Every pin that is not yet in the wheelhouse goes through all checks; a package that fails one is rejected with the reason and nothing about it is published.'),
-        approving ? h('p', {}, 'Publishing also approves the proposal, recorded as ' + a.current_user + '.') : null), 'Publish', false).then(function (ok) {
+        h('p', { class: 'muted' }, 'Recorded as published by ' + a.current_user + '.')), 'Publish', false).then(function (ok) {
         if (!ok) { return; }
         startJobRequest(api('POST', '/api/wheelhouse/update', { confirm: true }));
       });
     });
     buttons.append(publish);
+    if (clearable) {
+      var clearList = h('button', { class: 'btn danger', type: 'button', 'data-idle': true, title: 'Take every package waiting here out of requirements.in' }, 'Clear list');
+      clearList.addEventListener('click', function () {
+        confirmDialog('Clear the list?', h('div', {},
+          h('p', {}, 'Every package waiting here is taken out of requirements.in and requirements.txt is resolved again. Nothing in the wheelhouse changes.'),
+          h('p', { class: 'muted' }, 'Packages that are only dependencies of published packages stay, because those packages need them.')), 'Clear list', true).then(function (ok) {
+          if (!ok) { return; }
+          api('POST', '/api/requirements/clear', {}).then(function (data) {
+            if (data.job) { watchJob(data.job.id, false); } else { toast('The list is cleared.'); loadRequirements(); }
+          }).catch(fail);
+        });
+      });
+      buttons.append(clearList);
+    }
     box.append(buttons);
     return box;
   }
@@ -782,12 +872,110 @@
         return;
       }
       card.append(h('p', { class: 'muted' }, 'From ' + data.file),
-        h('div', { class: 'table-wrap' }, h('table', {},
+        h('div', { class: 'table-wrap scroll-list' }, h('table', {},
           h('thead', {}, h('tr', {}, h('th', {}, 'Package'), h('th', {}, 'Group'), h('th', {}, 'Reason'))),
           h('tbody', {}, data.items.map(function (r) {
             return h('tr', {}, h('td', { class: 'mono' }, r.Package + '==' + r.Version), h('td', {}, r.Group), h('td', {}, r.Reason));
           })))));
     }).catch(function () { /* the card stays empty */ });
+  }
+
+  // ---------------------------------------------------------------- audit tab
+  // The pip-audit reports in <wheelhouse>\reports: one row per report, newest first; Open shows
+  // what it found (vulnerable packages first, with advisories and fix versions).
+  var stageNames = {
+    Scheduled: 'Weekly check', PreDownload: 'Before download', Deployed: 'Published packages', Manual: 'Manual audit'
+  };
+  function loadAudits() {
+    var root = $('tab-audit');
+    state.auditOpen = state.auditOpen || {};
+    return api('GET', '/api/audits').then(function (data) {
+      clear(root);
+      var reports = [].concat(data.reports || []);
+      var onlyVulnerable = h('input', { type: 'checkbox', checked: !!state.auditOnlyVulnerable });
+      onlyVulnerable.addEventListener('change', function () { state.auditOnlyVulnerable = onlyVulnerable.checked; loadAudits(); });
+      root.append(h('div', { class: 'card' }, h('h2', {}, 'Audit reports'),
+        h('p', { class: 'muted' }, 'Every pip-audit run saves a report in ' + data.folder + '. They are kept for the report retention set in Settings. Click a report to show or hide what it found.'),
+        h('div', { class: 'toolbar' }, h('label', {}, onlyVulnerable, ' Only reports with vulnerabilities'),
+          h('button', { class: 'btn', type: 'button', onclick: loadAudits }, 'Refresh'),
+          h('span', { class: 'muted' }, reports.length + ' report(s)'))));
+      var shown = state.auditOnlyVulnerable ? reports.filter(function (r) { return r.vulnerable > 0 || r.error; }) : reports;
+      if (shown.length === 0) {
+        root.append(h('div', { class: 'table-wrap' }, h('div', { class: 'empty' }, reports.length ? 'No report found a vulnerability.' : 'No audit report yet. Audits run when packages are published, by the weekly check and from the Packages tab.')));
+        return;
+      }
+      var body = h('tbody', {});
+      shown.forEach(function (r) {
+        var result = r.error ? badge('unreadable', 'bad', r.error)
+          : r.vulnerable > 0 ? badge(r.vulnerable + ' vulnerable (' + r.advisories + ' advisories)', 'bad') : badge('clean', 'ok');
+        var caret = h('span', { class: 'caret' }, '▸');
+        var row = h('tr', { class: 'report-row', tabindex: '0', role: 'button', 'aria-expanded': 'false', title: 'Show or hide this report' },
+          h('td', {}, caret, ' ', fmtDate(r.time)), h('td', {}, stageNames[r.stage] || r.stage), h('td', {}, r.group || h('span', { class: 'muted' }, '-')),
+          h('td', {}, r.service), h('td', { class: 'num' }, r.packages + (r.skipped ? ' (+' + r.skipped + ' skipped)' : '')), h('td', {}, result));
+        var cell = h('td', { colspan: '6', class: 'report-detail' });
+        var detailRow = h('tr', { class: 'hidden' }, cell);
+        var loaded = false;
+        var toggle = function () {
+          var open = detailRow.classList.contains('hidden');
+          detailRow.classList.toggle('hidden', !open);
+          row.classList.toggle('selected', open);
+          row.setAttribute('aria-expanded', open ? 'true' : 'false');
+          caret.textContent = open ? '▾' : '▸';
+          if (open) { state.auditOpen[r.file] = true; } else { delete state.auditOpen[r.file]; }
+          if (open && !loaded) {
+            loaded = true;
+            if (r.error) { cell.append(h('p', { class: 'bad' }, r.error)); } else { showAuditReport(r.file, cell); }
+          }
+        };
+        row.addEventListener('click', toggle);
+        row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+        body.append(row, detailRow);
+        if (state.auditOpen[r.file]) { toggle(); }
+      });
+      root.append(h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Run'), h('th', {}, 'Group'), h('th', {}, 'Service'), h('th', {}, 'Packages'), h('th', {}, 'Result'))),
+        body)));
+    }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
+  }
+
+  // What one report found, inside its expanded row: vulnerable packages with their advisories,
+  // then (folded) the clean and the skipped packages.
+  function showAuditReport(file, box) {
+    box.append(h('p', { class: 'muted' }, 'Loading...'));
+    api('GET', '/api/audits/' + encodeURIComponent(file)).then(function (r) {
+      clear(box);
+      var deps = [].concat(r.dependencies || []);
+      var vulnerable = deps.filter(function (d) { return [].concat(d.vulns || []).length > 0; });
+      var clean = deps.filter(function (d) { return [].concat(d.vulns || []).length === 0 && !d.skipped; });
+      var skipped = deps.filter(function (d) { return d.skipped; });
+      box.append(h('p', { class: 'muted mono' }, r.file));
+      if (vulnerable.length === 0) {
+        box.append(h('p', {}, badge('clean', 'ok'), ' No known vulnerability in the ' + r.packages + ' audited package(s).'));
+      } else {
+        var rows = [];
+        vulnerable.forEach(function (d) {
+          [].concat(d.vulns).forEach(function (v, i) {
+            rows.push(h('tr', {},
+              h('td', { class: 'mono' }, i === 0 ? d.name + '==' + d.version : ''),
+              h('td', {}, h('span', { class: 'mono' }, v.id), [].concat(v.aliases || []).length ? h('div', { class: 'muted mono' }, [].concat(v.aliases).join(', ')) : null),
+              h('td', { class: 'mono' }, [].concat(v.fix_versions || []).join(', ') || h('span', { class: 'muted' }, 'none yet')),
+              h('td', { class: 'audit-desc' }, (v.description || '').replace(/#+\s*/g, '').replace(/\s+/g, ' ').trim())));
+          });
+        });
+        box.append(h('p', {}, badge(vulnerable.length + ' vulnerable', 'bad'), ' of ' + r.packages + ' audited package(s). Fix them from the package\'s History on the Packages tab.'),
+          h('div', { class: 'table-wrap scroll-list' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Package'), h('th', {}, 'Advisory'), h('th', {}, 'Fixed in'), h('th', {}, 'Description'))),
+            h('tbody', {}, rows))));
+      }
+      if (clean.length) {
+        box.append(h('details', {}, h('summary', {}, 'Show the ' + clean.length + ' package(s) without findings'),
+          h('ul', { class: 'result-list scroll-box' }, clean.map(function (d) { return h('li', { class: 'mono' }, d.name + '==' + d.version); }))));
+      }
+      if (skipped.length) {
+        box.append(h('details', {}, h('summary', {}, 'Show the ' + skipped.length + ' skipped package(s)'),
+          h('ul', { class: 'result-list scroll-box' }, skipped.map(function (d) { return h('li', {}, h('span', { class: 'mono' }, d.name + (d.version ? '==' + d.version : '')), ' - ', d.skipped); }))));
+      }
+    }).catch(function (err) { clear(box); box.append(h('p', { class: 'bad' }, err.message)); });
   }
 
   // ---------------------------------------------------------------- quarantine tab
@@ -805,7 +993,7 @@
       root.append(h('div', { class: 'table-wrap' }, h('table', {},
         h('thead', {}, h('tr', {}, h('th', {}, 'Package'), h('th', {}, 'Files'), h('th', {}, 'Groups'), h('th', {}, 'Reason'), h('th', {}, 'When / who'), h('th', {}, ''))),
         h('tbody', {}, data.items.map(function (q) {
-          var restore = h('button', { class: 'btn small', type: 'button' }, 'Restore');
+          var restore = h('button', { class: 'btn small', type: 'button', 'data-idle': true }, 'Restore');
           restore.addEventListener('click', function () {
             confirmDialog('Restore ' + q.name + '==' + q.version + '?', h('p', {}, 'The package goes back into the wheelhouse and its group files. The denylist entry created by quarantining is removed.'), 'Restore', false).then(function (ok) {
               if (!ok) { return; }
@@ -1053,6 +1241,22 @@
     return badge(jobLabel(job.status), jobKind(job.status), job.message);
   }
 
+  // A job's action, and a small button that lists what it worked on (packages, files).
+  function jobTitleCell(job) {
+    var detail = [].concat(job.detail || []);
+    if (detail.length === 0) { return job.title; }
+    var list = h('ul', { class: 'result-list job-detail hidden' }, detail.map(function (d) { return h('li', { class: 'mono' }, d); }));
+    var label = function (show) { return show ? 'show' : 'hide'; };
+    var more = h('button', { class: 'link-toggle', type: 'button', 'aria-expanded': 'false' }, label(true));
+    more.addEventListener('click', function () {
+      var show = list.classList.contains('hidden');
+      list.classList.toggle('hidden', !show);
+      more.textContent = label(!show);
+      more.setAttribute('aria-expanded', show ? 'true' : 'false');
+    });
+    return h('div', {}, h('div', {}, job.title), more, list);
+  }
+
   function loadJobs() {
     var root = $('tab-jobs');
     api('GET', '/api/jobs').then(function (data) {
@@ -1064,7 +1268,7 @@
       root.append(h('div', { class: 'table-wrap' }, h('table', {},
         h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Job'), h('th', {}, 'Status'), h('th', {}, 'Started'), h('th', {}, 'Ended'), h('th', {}, ''))),
         h('tbody', {}, data.jobs.map(function (j) {
-          return h('tr', {}, h('td', {}, j.id), h('td', {}, j.title), h('td', {}, jobBadge(j)), h('td', {}, fmtDate(j.started_utc)), h('td', {}, fmtDate(j.ended_utc)),
+          return h('tr', {}, h('td', {}, j.id), h('td', {}, jobTitleCell(j)), h('td', {}, jobBadge(j)), h('td', {}, fmtDate(j.started_utc)), h('td', {}, fmtDate(j.ended_utc)),
             h('td', {}, h('button', { class: 'btn small', type: 'button', onclick: function () { watchJob(j.id, true); } }, 'Open log')));
         })))));
     }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
@@ -1109,6 +1313,7 @@
       if (state.watchedJob !== id) { return; }
       var job = data.job;
       state.lastJob = job;
+      setJobRunning(job.status === 'Running');
       renderJobIndicator(job);
       $('jobbar-title').textContent = '#' + job.id + '  ' + job.title + (job.steps > 1 ? '  (step ' + job.step + '/' + job.steps + ')' : '');
       var state_ = $('jobbar-state');
@@ -1129,9 +1334,24 @@
       }
     }).catch(function (err) {
       $('jobbar-state').textContent = 'lost';
+      setJobRunning(false);
       toast(err.message, 'bad');
     });
   }
+
+  // While a job runs, every button that would start another job or change the wheelhouse
+  // (marked data-idle) looks disabled and its clicks are swallowed: the server refuses them anyway.
+  function setJobRunning(running) {
+    document.body.classList.toggle('job-running', !!running);
+  }
+  document.addEventListener('click', function (e) {
+    if (!document.body.classList.contains('job-running')) { return; }
+    var target = e.target && e.target.closest ? e.target.closest('[data-idle]') : null;
+    if (!target) { return; }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    toast('A job is still running. Wait for it to finish (or cancel it) first.', 'warn');
+  }, true);
 
   function onJobFinished(job) {
     if (state.currentTab === 'packages') { loadPackages(); }
@@ -1194,11 +1414,11 @@
 
     refreshState().then(function (info) {
       if (!info) { return; }
-      var tabs = ['overview', 'packages', 'add', 'quarantine', 'denylist', 'schedule', 'settings', 'jobs'];
+      var tabs = ['overview', 'packages', 'add', 'audit', 'quarantine', 'denylist', 'schedule', 'settings', 'jobs'];
       var wanted = location.hash.replace('#', '');
       if (!info.configured) { showTab('settings'); }
       else { showTab(tabs.indexOf(wanted) >= 0 ? wanted : 'overview'); }
-      if (info.running_job) { watchJob(info.running_job.id, false); }
+      if (info.running_job) { setJobRunning(true); watchJob(info.running_job.id, false); }
     });
   }
 
