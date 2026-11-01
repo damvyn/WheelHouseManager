@@ -939,7 +939,7 @@
               h('td', { class: 'mono' }, i === 0 ? d.name + '==' + d.version : ''),
               h('td', {}, h('span', { class: 'mono' }, v.id), [].concat(v.aliases || []).length ? h('div', { class: 'muted mono' }, [].concat(v.aliases).join(', ')) : null),
               h('td', { class: 'mono' }, [].concat(v.fix_versions || []).join(', ') || h('span', { class: 'muted' }, 'none yet')),
-              h('td', { class: 'audit-desc' }, v.description || '')));
+              h('td', { class: 'audit-desc' }, (v.description || '').replace(/#+\s*/g, '').replace(/\s+/g, ' ').trim())));
           });
         });
         card.append(h('p', {}, badge(vulnerable.length + ' vulnerable', 'bad'), ' of ' + r.packages + ' audited package(s). Fix them from the package\'s History on the Packages tab.'),
