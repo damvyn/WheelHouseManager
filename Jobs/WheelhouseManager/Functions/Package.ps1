@@ -982,36 +982,35 @@ function Add-RequirementInLine {
 }
 
 function Remove-RequirementInLine {
-    # Takes a package out of requirements.in (every line that names it; names compare
-    # normalized) and returns the removed lines. Throws when the package is not listed -
-    # it is then a dependency of another requirement - or when it is the only requirement.
+    # Takes packages out of requirements.in (every line that names one; names compare
+    # normalized) and returns the removed lines. Throws, before writing, when a package is
+    # not listed - it is then a dependency of another requirement.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path,
 
         [Parameter(Mandatory)]
-        [string]$Name
+        [string[]]$Name
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
     if (Test-Path -LiteralPath $Path) { foreach ($item in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) { $lines.Add([string]$item) } }
     $removed = [System.Collections.Generic.List[string]]::new()
-    while ($true) {
-        $current = Get-RequirementInLine -Lines $lines.ToArray() -Name $Name
-        if (-not $current) { break }
-        $removed.Add($current.Line.Trim())
-        $lines.RemoveAt($current.Index)
+    foreach ($item in $Name) {
+        $found = $false
+        while ($true) {
+            $current = Get-RequirementInLine -Lines $lines.ToArray() -Name $item
+            if (-not $current) { break }
+            $found = $true
+            $removed.Add($current.Line.Trim())
+            $lines.RemoveAt($current.Index)
+        }
+        if (-not $found) {
+            throw [System.Collections.Generic.KeyNotFoundException]::new("'$(Get-NormalizedPackageName $item)' is not listed in requirements.in: another requirement depends on it. Remove or change that requirement instead.")
+        }
     }
-    $normalized = Get-NormalizedPackageName $Name
-    if ($removed.Count -eq 0) {
-        throw [System.Collections.Generic.KeyNotFoundException]::new("'$normalized' is not listed in requirements.in: another requirement depends on it. Remove or change that requirement instead.")
-    }
-    $remaining = @($lines | Where-Object { ($_ -replace '(^|\s)#.*$', '').Trim() })
-    if ($remaining.Count -eq 0) {
-        throw [System.InvalidOperationException]::new("'$normalized' is the only requirement in requirements.in and cannot be removed.")
-    }
-    if ($PSCmdlet.ShouldProcess($Path, "Remove $normalized")) {
+    if ($PSCmdlet.ShouldProcess($Path, "Remove $($Name -join ', ')")) {
         Write-TextFileAtomic -Path $Path -Content ($lines -join "`r`n")
     }
     Write-Output -NoEnumerate $removed.ToArray()

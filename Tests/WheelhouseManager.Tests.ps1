@@ -2598,12 +2598,15 @@ Describe 'WheelhouseManager' {
             (Get-Content -Path $path) -join '|' | Should -Be '# comment|numpy>=2.0|pandas'
         }
 
-        It 'refuses a package that is not listed and the only requirement' {
+        It 'removes several packages, and nothing when one of them is not listed' {
             $path = Join-Path (Get-TestFolder) 'requirements.in'
-            [IO.File]::WriteAllText($path, "# comment`r`nnumpy>=2.0")
-            { Remove-RequirementInLine -Path $path -Name 'urllib3' } | Should -Throw '*depends on it*'
-            { Remove-RequirementInLine -Path $path -Name 'numpy' } | Should -Throw '*only requirement*'
-            (Get-Content -Path $path) -join '|' | Should -Be '# comment|numpy>=2.0'
+            [IO.File]::WriteAllText($path, "# comment`r`nnumpy>=2.0`r`npandas")
+            { Remove-RequirementInLine -Path $path -Name @('numpy', 'urllib3') } | Should -Throw '*depends on it*'
+            (Get-Content -Path $path) -join '|' | Should -Be '# comment|numpy>=2.0|pandas'
+
+            [string[]]$removed = Remove-RequirementInLine -Path $path -Name @('numpy', 'pandas')
+            $removed -join '|' | Should -Be 'numpy>=2.0|pandas'
+            (Get-Content -Path $path) -join '|' | Should -Be '# comment'
         }
     }
 
@@ -2981,6 +2984,36 @@ Describe 'WheelhouseManager' {
             @($result.Body.removed) -join '|' | Should -Be 'requests==2.32.3'
             (Get-Content -Path $in) -join '|' | Should -Be 'numpy>=2.0'
             $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
+        }
+
+        It 'clears every requirement still waiting to be published' {
+            $m = Get-TestManager
+            $in = Join-Path $m.Root 'requirements.in'
+            # six is in the test wheelhouse; requests and urllib3 (a dependency) are not.
+            [IO.File]::WriteAllText($in, "six`r`nrequests==2.32.3")
+            $txt = Join-Path $m.Root 'requirements.txt'
+            Set-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1') -Updates @{ LocalRequirementsPath = $txt }
+            Set-Content -Path $txt -Value @('six==1.16.0', 'requests==2.32.3', 'urllib3==2.5.0')
+
+            $result = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/clear' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')
+            $result.Status | Should -Be 200
+            @($result.Body.removed) -join '|' | Should -Be 'requests==2.32.3'
+            (Get-Content -Path $in) -join '|' | Should -Be 'six'
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
+
+            # Nothing listed is waiting any more: refused.
+            Set-Content -Path $txt -Value @('six==1.16.0', 'urllib3==2.5.0')
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/clear' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')).Status | Should -Be 409
+
+            # Clearing the last requirement empties requirements.txt instead of resolving nothing.
+            $global:WhmUiJobSteps = $null
+            [IO.File]::WriteAllText($in, 'requests==2.32.3')
+            Set-Content -Path $txt -Value @('requests==2.32.3')
+            $last = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/clear' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')
+            $last.Status | Should -Be 200
+            $last.Body.job | Should -BeNullOrEmpty
+            $global:WhmUiJobSteps | Should -BeNullOrEmpty
+            (Get-Content -Path $txt) -join '|' | Should -Not -Match 'requests'
         }
 
         It 'shows requirements.txt for review and publishes it only with a confirmation' {

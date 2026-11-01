@@ -69,6 +69,83 @@ function Get-WheelhouseUiToolStatus {
     return $script:UiToolStatus
 }
 
+function Get-WheelhouseUiPendingPin {
+    # What publishing requirements.txt would add: its pins (-Pin, name -> version) that are not
+    # in the wheelhouse yet, as { name; version; rejected (the latest update's reason or $null);
+    # retryable (rejected only for the cooldown, so publishing again can pass); direct (listed
+    # in requirements.in - otherwise a dependency of another requirement) }. Without a
+    # reachable wheelhouse every pin is pending.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Context,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [hashtable]$Pin
+    )
+
+    $published = @{}
+    $rejected = @{}
+    if ($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container)) {
+        $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+        foreach ($entry in $manifest) { $published["$($entry.name)==$($entry.version)"] = $true }
+        $latest = Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_Rejected_*.json' -File -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($latest) {
+            try {
+                foreach ($item in (Get-Content -Path $latest.FullName -Raw | ConvertFrom-Json)) {
+                    $rejected["$(Get-NormalizedPackageName ([string]$item.Package))==$($item.Version)"] = [string]$item.Reason
+                }
+            }
+            catch { Write-Verbose "Unreadable rejection report: $($latest.Name)" }
+        }
+    }
+    $inLines = @()
+    $inPath = [string]$Context.Settings.RequirementsInPath
+    if ($inPath -and (Test-Path -LiteralPath $inPath -PathType Leaf)) { $inLines = @(Get-Content -LiteralPath $inPath) }
+    foreach ($name in ($Pin.Keys | Sort-Object)) {
+        $key = "$name==$($Pin[$name])"
+        if ($published.ContainsKey($key)) { continue }
+        $reason = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null })
+        @{
+            name      = $name
+            version   = [string]$Pin[$name]
+            rejected  = $reason
+            retryable = [bool]($reason -and $reason -match '^cooldown')
+            direct    = [bool](Get-RequirementInLine -Lines ([string[]]$inLines) -Name $name)
+        }
+    }
+}
+
+function Invoke-WheelhouseUiRequirementRemoval {
+    # Takes -Name out of requirements.in, then resolves requirements.txt again as a job. When no
+    # requirement is left there is nothing to resolve: requirements.txt is emptied instead.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        $Context,
+
+        [Parameter(Mandatory)]
+        [string[]]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Context.Settings.RequirementsInPath, $Title)) { return }
+    $inPath = [string]$Context.Settings.RequirementsInPath
+    [string[]]$removedLines = Remove-RequirementInLine -Path $inPath -Name $Name
+    $left = @(Get-Content -LiteralPath $inPath | Where-Object { ($_ -replace '(^|\s)#.*$', '').Trim() })
+    if ($left.Count -eq 0) {
+        $txt = [string]$Context.Settings.LocalRequirementsPath
+        if ($txt) { Write-TextFileAtomic -Path $txt -Content '# requirements.in lists no package' }
+        return @{ Status = 200; Body = @{ removed = $removedLines; job = $null } }
+    }
+    $job = Start-WheelhouseUiJob -Title $Title -Kind 'remove' -Detail $removedLines -Context $Context -Steps @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
+    return @{ Status = 200; Body = @{ removed = $removedLines; job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
+}
+
 function Get-WheelhouseUiApproval {
     # The proposal state for the review card: the current proposal (if any), whether it is
     # for requirements.txt as it is now, and what this user may do with it under the
@@ -723,39 +800,7 @@ function Get-WheelhouseUiRoute {
                 }
                 $pins = @{}
                 if ($text.Trim()) { $pins = Read-RequirementFile -FilePath $path }
-                # What publishing would add: pins not in the wheelhouse yet, with the reason if the
-                # latest update rejected them. Without a reachable wheelhouse every pin is pending.
-                $published = @{}
-                $rejected = @{}
-                if ($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container)) {
-                    $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
-                    foreach ($entry in $manifest) { $published["$($entry.name)==$($entry.version)"] = $true }
-                    $latest = Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_Rejected_*.json' -File -ErrorAction SilentlyContinue |
-                        Sort-Object Name -Descending | Select-Object -First 1
-                    if ($latest) {
-                        try {
-                            foreach ($item in (Get-Content -Path $latest.FullName -Raw | ConvertFrom-Json)) {
-                                $rejected["$(Get-NormalizedPackageName ([string]$item.Package))==$($item.Version)"] = [string]$item.Reason
-                            }
-                        }
-                        catch { Write-Verbose "Unreadable rejection report: $($latest.Name)" }
-                    }
-                }
-                # "direct": listed in requirements.in, so the UI can offer to take it out again;
-                # otherwise it is a dependency of another requirement.
-                $inLines = @()
-                $inPath = [string]$Context.Settings.RequirementsInPath
-                if ($inPath -and (Test-Path -LiteralPath $inPath -PathType Leaf)) { $inLines = @(Get-Content -LiteralPath $inPath) }
-                $pending = foreach ($name in ($pins.Keys | Sort-Object)) {
-                    $key = "$name==$($pins[$name])"
-                    if ($published.ContainsKey($key)) { continue }
-                    @{
-                        name     = $name
-                        version  = [string]$pins[$name]
-                        rejected = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null })
-                        direct   = [bool](Get-RequirementInLine -Lines ([string[]]$inLines) -Name $name)
-                    }
-                }
+                $pending = @(Get-WheelhouseUiPendingPin -Context $Context -Pin $pins)
                 return @{ Status = 200; Body = @{
                         path            = $path
                         text            = $text
@@ -776,13 +821,31 @@ function Get-WheelhouseUiRoute {
             Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
             Handler    = {
                 param($Context, $Body, $Match)
-                # Takes a package out of requirements.in and resolves requirements.txt again, so a
-                # pin that keeps being rejected stops waiting in "Review and publish".
+                # Takes one package out of requirements.in and resolves requirements.txt again, so a
+                # pin that is rejected (or not wanted yet) stops waiting in "Review and publish".
                 $name = [string](Get-UiBodyValue -Body $Body -Name 'name')
                 if (-not (Test-WheelhousePackageName -Name $name)) { throw [System.ArgumentException]::new('Not a valid package name.') }
-                [string[]]$removedLines = Remove-RequirementInLine -Path $Context.Settings.RequirementsInPath -Name $name
-                $job = Start-WheelhouseUiJob -Title 'Remove packages' -Kind 'remove' -Detail $removedLines -Context $Context -Steps @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
-                return @{ Status = 200; Body = @{ removed = $removedLines; job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
+                return (Invoke-WheelhouseUiRequirementRemoval -Context $Context -Name @($name) -Title 'Remove packages')
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/requirements/clear$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                # "Clear list": takes every requirement whose pin is still waiting to be published out
+                # of requirements.in, then resolves again. The wheelhouse does not change.
+                $path = [string]$Context.Settings.LocalRequirementsPath
+                $pins = @{}
+                if ($path -and (Test-Path -LiteralPath $path -PathType Leaf) -and ([System.IO.File]::ReadAllText($path)).Trim()) { $pins = Read-RequirementFile -FilePath $path }
+                $names = @(Get-WheelhouseUiPendingPin -Context $Context -Pin $pins | Where-Object { $_.direct } | ForEach-Object { $_.name })
+                if ($names.Count -eq 0) {
+                    throw [System.InvalidOperationException]::new('Nothing to clear: no package waiting to be published is listed in requirements.in (the ones waiting are dependencies of published packages).')
+                }
+                return (Invoke-WheelhouseUiRequirementRemoval -Context $Context -Name $names -Title 'Clear list')
             }
         }
 

@@ -561,7 +561,7 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Restore-WheelhousePackage` | section 9.5 (verify, journal, `Complete-WheelhouseRestoreJournal`, catalog + history); `-KeepDenylist` | UI |
 | `Test-PackageSpec` | allowed `requirements.in` line (name, extras, version operators; <= 200 chars) | `Add-RequirementInLine` |
 | `Add-RequirementInLine` | append valid, new, non-denylisted specs | UI add |
-| `Remove-RequirementInLine` | take a package's line(s) out of `requirements.in`; throws if it is not listed (a dependency) or is the only requirement | UI remove |
+| `Remove-RequirementInLine` | take packages' line(s) out of `requirements.in`; throws before writing if one is not listed (a dependency) | UI remove / clear |
 
 ### 8.11 `Scan.ps1`
 
@@ -924,7 +924,8 @@ Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it wor
 | `POST /api/waivers/add`, `POST /api/waivers/remove` | `{name, version, id, reason, days}` / `{name, version, id}` | `Add-/Remove-WheelhouseWaiver` + `Set-CatalogFindingWaiver` inside `Update-WheelhouseCatalog -TimeoutSeconds 0` (history at once) | 200 / 400 / 404 / 409 |
 | `POST /api/packages/audit` | `{all}` or `{packages:[{name,version}]}` (<= 500) | job `Test-WheelhousePackage.ps1 [-Package ...]` | 202 |
 | `POST /api/packages/scan` | `{all}` or `{files:[...]}` | job `Invoke-WheelhouseScan.ps1 [-File ...]` | 202 |
-| `POST /api/requirements/remove` | `{name}` | `Remove-RequirementInLine`; job `Update-Requirement.ps1` (title *Remove packages*) | 200 |
+| `POST /api/requirements/remove` | `{name}` | `Invoke-WheelhouseUiRequirementRemoval` -> `Remove-RequirementInLine`; job `Update-Requirement.ps1` (title *Remove packages*), or requirements.txt emptied when requirements.in lists nothing | 200 |
+| `POST /api/requirements/clear` | `{}` | the same for every pending pin listed in requirements.in (`Get-WheelhouseUiPendingPin`, `direct`); title *Clear list*; 409 when none | 200 |
 | `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
 | `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review, plus `pending` (pins not in the manifest, each with the reason from the latest `Report_Rejected_*` if any) and `published_count` | 200 `{path, text, modified_utc, pin_count}` |
 | `POST /api/wheelhouse/update` | `{confirm:true}` | job `Update-Wheelhouse.ps1` | 202 / 400 |
