@@ -697,19 +697,22 @@
         card.append(h('div', { class: 'empty' }, 'Everything in requirements.txt is already in the wheelhouse - there is nothing to publish. Add packages above to resolve new ones.'), whole);
         return;
       }
+      var rejectedCount = pending.filter(function (p) { return p.rejected; }).length;
       card.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'), h('th', {}, ''))),
+        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'), rejectedCount ? h('th', {}, '') : null)),
         h('tbody', {}, pending.map(function (p) {
-          // A package listed in requirements.in can be taken out again; a dependency of another
-          // requirement goes away only with that requirement.
-          var action = p.direct
-            ? h('button', { class: 'btn small danger', type: 'button', title: 'Remove ' + p.name + ' from requirements.in and resolve again', onclick: function () { removeRequirement(p); } }, 'Remove')
-            : h('span', { class: 'muted', title: 'Not listed in requirements.in: another requirement depends on it' }, 'dependency');
+          // Only a pin the latest publish rejected can be taken out of requirements.in here; a
+          // dependency of another requirement goes away only with that requirement.
+          var action = null;
+          if (p.rejected) {
+            action = p.direct
+              ? h('button', { class: 'btn small danger', type: 'button', title: 'Remove ' + p.name + ' from requirements.in and resolve again', onclick: function () { removeRequirement(p); } }, 'Remove')
+              : h('span', { class: 'muted', title: 'Not listed in requirements.in: another requirement depends on it' }, 'dependency');
+          }
           return h('tr', {}, h('td', { class: 'mono' }, p.name + '==' + p.version),
             h('td', {}, p.rejected ? [badge('rejected last time', 'bad'), ' ', p.rejected] : badge('new', 'ok')),
-            h('td', { class: 'num' }, action));
+            rejectedCount ? h('td', { class: 'num' }, action) : null);
         })))));
-      var rejectedCount = pending.filter(function (p) { return p.rejected; }).length;
       if (rejectedCount > 0) {
         card.append(h('p', { class: 'muted' }, rejectedCount + ' pin(s) were rejected by the latest update for the reason shown. Publishing again rejects them again unless the reason is gone (for example the cooldown has passed). Otherwise click Remove to take the package out of requirements.in, or change it in step 1.'));
       }
@@ -1092,14 +1095,15 @@
     var detail = [].concat(job.detail || []);
     if (detail.length === 0) { return job.title; }
     var list = h('ul', { class: 'result-list job-detail hidden' }, detail.map(function (d) { return h('li', { class: 'mono' }, d); }));
-    var more = h('button', { class: 'btn small ghost', type: 'button', 'aria-expanded': 'false' }, 'show ' + detail.length);
+    var label = function (show) { return (show ? 'show' : 'hide') + ' (' + detail.length + ')'; };
+    var more = h('button', { class: 'link-toggle', type: 'button', 'aria-expanded': 'false' }, label(true));
     more.addEventListener('click', function () {
       var show = list.classList.contains('hidden');
       list.classList.toggle('hidden', !show);
-      more.textContent = (show ? 'hide ' : 'show ') + detail.length;
+      more.textContent = label(!show);
       more.setAttribute('aria-expanded', show ? 'true' : 'false');
     });
-    return h('div', {}, job.title, ' ', more, list);
+    return h('div', {}, h('div', {}, job.title), more, list);
   }
 
   function loadJobs() {
