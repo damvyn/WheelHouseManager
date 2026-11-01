@@ -37,8 +37,8 @@
          Any other problem (a file that cannot be read, a broken manifest record) stops
          the run.
       3. Checks every published version against the denylist and PyPI's yanked flag.
-      4. For every group file (also when the manifest is still empty), runs pip-audit
-         against each configured vulnerability service.
+      4. Audits every published version with pip-audit against each configured service,
+         packed into as few runs as possible (Invoke-PublishedAudit).
       5. Looks up each advisory's severity on OSV (cached; offline = treated as High) and
          records the results in the catalog (the UI's package table and history),
          including when this check last ran.
@@ -215,24 +215,19 @@ try {
     foreach ($text in $deployed.Errors) { $checkErrors.Add($text) }
 
     # -----------------------------------------------------------------------
-    # Step 3: audit every group file against every configured vulnerability service
+    # Step 3: audit every published version against every configured service - in as
+    # few pip-audit runs as possible, whatever the number of group files
     # -----------------------------------------------------------------------
 
     $auditResults = [System.Collections.Generic.List[object]]::new()
-    if ($groupFiles.Count -gt 0) {
-        Write-Log "Auditing $($groupFiles.Count) requirement group file(s)."
+    $publishedAuditParams = @{
+        'Manifest' = @($published)
+        'Services' = $cfg.VulnerabilityServices
+        'Stage' = 'Scheduled'
+        'ReportsFolder' = $reportsFolder
     }
-    foreach ($groupFile in $groupFiles) {
-        Write-Log "--- Group: $([System.IO.Path]::GetFileNameWithoutExtension($groupFile)) ---"
-        $groupAuditParams = @{
-            'GroupFile' = $groupFile
-            'Services' = $cfg.VulnerabilityServices
-            'Stage' = 'Scheduled'
-            'ReportsFolder' = $reportsFolder
-        }
-        $groupResults = Invoke-GroupAudit @groupAuditParams
-        foreach ($result in $groupResults) { $auditResults.Add($result) }
-    }
+    $publishedResults = Invoke-PublishedAudit @publishedAuditParams
+    foreach ($result in $publishedResults) { $auditResults.Add($result) }
 
     # -----------------------------------------------------------------------
     # Step 4: severities, then record the results in the catalog (the UI shows

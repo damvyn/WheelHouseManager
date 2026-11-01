@@ -76,21 +76,12 @@ try {
         foreach ($result in $results) { $auditResults.Add($result) }
     }
     else {
-        $groupFiles = Get-WheelhouseGroupFile -WheelhousePath $cfg.WheelhousePath
-        if ($groupFiles.Count -eq 0) {
-            Write-Log 'No requirement group files found in the wheelhouse - nothing to audit.' 'WARN'
+        if ($manifest.Count -eq 0) {
+            Write-Log 'Nothing is published yet - nothing to audit.' 'WARN'
         }
-        foreach ($groupFile in $groupFiles) {
-            Write-Log "--- Group: $([System.IO.Path]::GetFileNameWithoutExtension($groupFile)) ---"
-            $groupAuditParams = @{
-                'GroupFile' = $groupFile
-                'Services' = $cfg.VulnerabilityServices
-                'Stage' = 'Manual'
-                'ReportsFolder' = $reportsFolder
-            }
-            $groupResults = Invoke-GroupAudit @groupAuditParams
-            foreach ($result in $groupResults) { $auditResults.Add($result) }
-        }
+        # Every published version, in as few pip-audit runs as possible.
+        $publishedResults = Invoke-PublishedAudit -Manifest $manifest -Services $cfg.VulnerabilityServices -Stage 'Manual' -ReportsFolder $reportsFolder
+        foreach ($result in $publishedResults) { $auditResults.Add($result) }
     }
 
     # The UI's package table shows the results from the catalog.

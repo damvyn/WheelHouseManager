@@ -594,3 +594,72 @@ function Get-PyPIProjectRelease {
         }
     }
 }
+
+function Get-AuditChunk {
+    # The published versions packed into the fewest requirement sets pip-audit accepts: one
+    # version per package name per set, so set 1 holds every package's first version, set 2
+    # every second version, and so on. Returns ordered name -> version hashtables.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Manifest
+    )
+
+    $versions = [ordered]@{}
+    # Name and version, so the sets are the same on every run (5.1's sort is not stable).
+    foreach ($entry in ($Manifest | Sort-Object name, version)) {
+        $name = Get-NormalizedPackageName ([string]$entry.name)
+        if (-not $versions.Contains($name)) { $versions[$name] = [System.Collections.Generic.List[string]]::new() }
+        if (-not $versions[$name].Contains([string]$entry.version)) { $versions[$name].Add([string]$entry.version) }
+    }
+    $chunks = [System.Collections.Generic.List[object]]::new()
+    foreach ($name in $versions.Keys) {
+        for ($i = 0; $i -lt $versions[$name].Count; $i++) {
+            if ($chunks.Count -le $i) { $chunks.Add([ordered]@{}) }
+            $chunks[$i][$name] = $versions[$name][$i]
+        }
+    }
+    Write-Output -NoEnumerate $chunks.ToArray()
+}
+
+function Invoke-PublishedAudit {
+    # Audits published versions in as few pip-audit runs as possible: Get-AuditChunk packs
+    # them into sets (usually one or two, whatever the number of group files), each written to
+    # <reports>\audit-sets\<Stage>\published-<n>.txt and audited against every service with
+    # Invoke-GroupAudit. Results are per package version (Update-CatalogAuditResult), so it
+    # does not matter which set a version was in. Returns AuditResults (-NoEnumerate).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Manifest,
+
+        [Parameter(Mandatory)]
+        [string[]]$Services,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z]+$')]
+        [string]$Stage,
+
+        [Parameter(Mandatory)]
+        [string]$ReportsFolder
+    )
+
+    $chunks = Get-AuditChunk -Manifest $Manifest
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($chunks.Count -eq 0) {
+        Write-Output -NoEnumerate $results.ToArray()
+        return
+    }
+    $folder = Join-Path (Join-Path $ReportsFolder 'audit-sets') $Stage
+    if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $count = @($chunks | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+    Write-Log "Auditing $count published version(s) in $($chunks.Count) set(s) x $($Services.Count) service(s)..."
+    for ($i = 0; $i -lt $chunks.Count; $i++) {
+        $file = Join-Path $folder "published-$($i + 1).txt"
+        Write-TextFileAtomic -Path $file -Content (($chunks[$i].Keys | ForEach-Object { "$_==$($chunks[$i][$_])" }) -join "`r`n")
+        foreach ($result in (Invoke-GroupAudit -GroupFile $file -Services $Services -Stage $Stage -ReportsFolder $ReportsFolder)) { $results.Add($result) }
+    }
+    Write-Output -NoEnumerate $results.ToArray()
+}

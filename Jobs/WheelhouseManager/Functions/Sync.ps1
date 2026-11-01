@@ -13,7 +13,8 @@ function Invoke-WheelhouseSync {
     #      (Resolve-WheelhouseProposalForPublish, -ApprovalMode). A remediation proposal
     #      swaps its pins in the groups that list the vulnerable version instead;
     #   C. per group: Invoke-CandidateIntake (no lock), then Publish-CandidateIntake (write
-    #      lock for the seconds the publish takes), then audit the group as deployed;
+    #      lock for the seconds the publish takes); then one batched audit of everything
+    #      published before this run (Invoke-PublishedAudit);
     #   R. remediation: quarantine the vulnerable version once no group lists it any more
     #      and its replacement is published (write lock);
     #   D. first-time setup only: adopt the wheels the folder already held (write lock);
@@ -345,18 +346,22 @@ function Invoke-WheelhouseSync {
                 }
             }
 
-            # Audit what the group lists as deployed. A group created in this run holds
-            # only packages that were just audited as candidates.
-            if ($groupExisted -and $listed.Count -gt 0) {
-                Write-Log "Auditing $groupName as deployed (no download)..."
-                $groupResults = Invoke-GroupAudit -GroupFile $groupFile -Services $Services -Stage 'Deployed' -ReportsFolder $ReportsFolder
-                foreach ($result in $groupResults) { $auditResults.Add($result) }
-                if ($groupResults | Where-Object { $_.Status -ne 'Passed' }) {
-                    Write-Log "$groupName has known vulnerabilities (or an incomplete audit) in listed packages." 'ERROR'
-                    $overallPassed = $false
-                }
-                if ($groupResults | Where-Object { $_.Status -eq 'Error' }) { $auditIncomplete = $true }
+        }
+
+        # Audit what was published before this run, in as few pip-audit runs as possible
+        # (whatever the number of group files). What this run published was just audited
+        # as a candidate.
+        $justPublished = @{}
+        foreach ($entry in $publishedAll) { $justPublished["$($entry.name)==$($entry.version)"] = $true }
+        $deployedManifest = @($manifest | Where-Object { -not $justPublished.ContainsKey("$($_.name)==$($_.version)") })
+        if ($deployedManifest.Count -gt 0) {
+            $deployedResults = Invoke-PublishedAudit -Manifest $deployedManifest -Services $Services -Stage 'Deployed' -ReportsFolder $ReportsFolder
+            foreach ($result in $deployedResults) { $auditResults.Add($result) }
+            if ($deployedResults | Where-Object { $_.Status -ne 'Passed' }) {
+                Write-Log 'Published packages have known vulnerabilities (or an incomplete audit).' 'ERROR'
+                $overallPassed = $false
             }
+            if ($deployedResults | Where-Object { $_.Status -eq 'Error' }) { $auditIncomplete = $true }
         }
 
         foreach ($name in ($Expedite.Keys | Sort-Object)) {

@@ -350,6 +350,37 @@ Describe 'WheelhouseManager' {
         }
     }
 
+    Context 'Batched audits' {
+        It 'packs published versions into the fewest sets with one version per package' {
+            $manifest = @(
+                [PSCustomObject]@{ name = 'Six'; version = '1.16.0'; file = 'six-1.16.0-a.whl' },
+                [PSCustomObject]@{ name = 'six'; version = '1.16.0'; file = 'six-1.16.0-b.whl' },
+                [PSCustomObject]@{ name = 'attrs'; version = '23.1.0'; file = 'a1.whl' },
+                [PSCustomObject]@{ name = 'attrs'; version = '24.0'; file = 'a2.whl' },
+                [PSCustomObject]@{ name = 'numpy'; version = '2.3.1'; file = 'n.whl' })
+            $chunks = Get-AuditChunk -Manifest $manifest
+            $chunks.Count | Should -Be 2
+            (($chunks[0].Keys | ForEach-Object { "$_==$($chunks[0][$_])" }) -join ',') | Should -Be 'attrs==23.1.0,numpy==2.3.1,six==1.16.0'
+            (($chunks[1].Keys | ForEach-Object { "$_==$($chunks[1][$_])" }) -join ',') | Should -Be 'attrs==24.0'
+            (Get-AuditChunk -Manifest @()).Count | Should -Be 0
+        }
+
+        It 'audits each set once per service and leaves the set files for the catalog' {
+            $reports = Get-TestFolder
+            $global:WhmAuditedFiles = [System.Collections.Generic.List[string]]::new()
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-GroupAudit -MockWith {
+                $global:WhmAuditedFiles.Add((Get-Content -Path $GroupFile) -join ',')
+                , @(foreach ($service in $Services) { [PSCustomObject]@{ PSTypeName = 'Wheelhouse.AuditResult'; Stage = $Stage; GroupFile = $GroupFile; Service = $service; Status = 'Passed'; ReportPath = 'x' } })
+            }
+            $manifest = @([PSCustomObject]@{ name = 'six'; version = '1.16.0' }, [PSCustomObject]@{ name = 'attrs'; version = '23.1.0' }, [PSCustomObject]@{ name = 'attrs'; version = '24.0' })
+            $results = Invoke-PublishedAudit -Manifest $manifest -Services @('osv', 'pypi') -Stage 'Scheduled' -ReportsFolder $reports
+            $results.Count | Should -Be 4
+            $global:WhmAuditedFiles -join ' | ' | Should -Be 'attrs==23.1.0,six==1.16.0 | attrs==24.0'
+            Test-Path -Path (Join-Path $reports 'audit-sets\Scheduled\published-2.txt') | Should -Be $true
+            Remove-Variable -Name WhmAuditedFiles -Scope Global
+        }
+    }
+
     Context 'Quick integrity check' {
         It 'hashes only files changed since their last verification; the full check hashes all' {
             $wheelhouse = Get-TestWheelhouse

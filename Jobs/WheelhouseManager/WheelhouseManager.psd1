@@ -115,6 +115,8 @@
         'Invoke-PipAudit',
         'Show-PipAuditFixSuggestion',
         'Invoke-GroupAudit',
+        'Get-AuditChunk',
+        'Invoke-PublishedAudit',
         'Get-PyPIReleaseInfo',
         'Get-PyPIProjectRelease',
         'Test-PackageAge',

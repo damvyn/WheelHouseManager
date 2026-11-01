@@ -67,7 +67,7 @@ Script roles:
   1. under the write lock: journal repair, integrity check against `manifest.json`, take out wheels removed/changed on the share (`Resolve-WheelhouseIntegrityProblem`, `AutoQuarantine`), move untracked wheels to `_untracked\` (`Move-UntrackedWheelFile`), catalog reconcile, heartbeat warning, group snapshot;
   2. an in-memory merge plan of `Input\requirements.txt` into the `requirements-N.txt` groups;
   3. per group, `Invoke-CandidateIntake` (no lock): denylist → audit → PyPI release data (yanked, cooldown `MinimumPackageAgeDays`, `-ExpeditePackage` skips it per pin) → download into `<manager root>\staging\` → sha256/yanked/upload-date check of each file against PyPI → Defender scan of the staged files; then `Publish-CandidateIntake` (write lock): denylist re-check → journal → `Publish-StagedWheel` (`.partial` copy, then rename) → manifest, then pins → catalog + history;
-  4. an audit-only pass over existing groups;
+  4. one batched audit of everything published before this run (`Invoke-PublishedAudit`: as few pip-audit runs as possible, not one per group file);
   5. severities looked up on OSV (no lock), then all audit results into the catalog with severities, due dates and waivers, and `Resolve-MaliciousPackage` (`MAL-*`, `AutoQuarantine`) (write lock). The share is never virus-scanned by this tool - the file server's antivirus does that; new wheels are scanned at intake, on-demand scans use hash-checked local copies (`Invoke-WheelhouseCopyScan`).
 
   It emits `Wheelhouse.AuditResult` and `Wheelhouse.Notice` objects and **sends no alerts**.

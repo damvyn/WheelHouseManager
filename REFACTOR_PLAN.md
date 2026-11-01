@@ -601,10 +601,12 @@ Denylist tabs and the package History).
 
 ### Phase 5 - Performance and hardening (S-M)
 
-**Done (2026-11-01):** quick integrity check for updates (cache of verified size/time/hash on the
+**Done (2026-11-01):** batched audits (`Invoke-PublishedAudit`: published versions packed into the
+fewest pip-audit runs instead of one per group file and service); quick integrity check for updates (cache of verified size/time/hash on the
 manager server; the weekly check stays full), Windows Event Log (IDs 1000-1004, optional), the
 update pipeline's change-only alerts, and - from Phase 4 - `index.html` on the share. No webhook
-notifier (D7). Still open: batched audits / cached PyPI metadata, signing `manifest.json` /
+notifier (D7). Still open: cached PyPI metadata (one request per published version per weekly check
+is cheap enough so far), signing `manifest.json` /
 `catalog.json`, splitting the test file.
 
 - Incremental integrity with a scheduled full check; batched audits and cached metadata.

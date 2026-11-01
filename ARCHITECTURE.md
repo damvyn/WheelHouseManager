@@ -387,7 +387,7 @@ and its heartbeat (`ScheduledCheckUtc`) with `Update-WheelhouseCatalog` (write l
 
 ### 7.6 `Test-WheelhousePackage.ps1`
 `-Package` pins (validated by regex, must be in the manifest) -> `Invoke-PackageAudit -Stage
-Manual` (report group `selection`); none -> `Invoke-GroupAudit -Stage Manual` per group. Emits
+Manual` (report group `selection`); none -> `Invoke-PublishedAudit -Stage Manual` (every published version, batched). Emits
 AuditResults, no alert, records the results (with severities, due dates and waivers) in the
 catalog. Exit 1 vulnerable, 2 audit error,
 abort, or results not recorded.
@@ -493,7 +493,9 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Get-VulnerableDependencyCount` | dependencies with vulns | int | `Invoke-PipAudit` |
 | `Invoke-PipAudit` | `python -m pip_audit -r <file> --no-deps --disable-pip --vulnerability-service <s> --format json --output <report>`; exit 0 -> `Passed`, non-zero with vulns -> `Vulnerable`, else `Error` | `Wheelhouse.AuditResult` | `Invoke-GroupAudit` |
 | `Show-PipAuditFixSuggestion` | `pip-audit --fix --dry-run`, informational | console | `Invoke-GroupAudit` |
-| `Invoke-GroupAudit` | one audit per service, fix suggestions if vulnerable | AuditResult[] (`-NoEnumerate`) | worker, checks, intake, `Invoke-PackageAudit` |
+| `Invoke-GroupAudit` | one audit per service, fix suggestions if vulnerable | AuditResult[] (`-NoEnumerate`) | intake, `Invoke-PackageAudit`, `Invoke-PublishedAudit` |
+| `Get-AuditChunk` | published versions packed into the fewest sets with one version per name (set n = every package's n-th version) | ordered hashtables (`-NoEnumerate`) | `Invoke-PublishedAudit` |
+| `Invoke-PublishedAudit` | write each set to `<reports>\audit-sets\<Stage>\published-<n>.txt` (kept: an `Error` result is recorded against the set's pins) and `Invoke-GroupAudit` it; results are per version, so the set does not matter | AuditResult[] (`-NoEnumerate`) | update run, weekly check, Test-WheelhousePackage |
 | `Get-PyPIReleaseInfo` | PyPI JSON API (TLS 1.2 on 5.1): files with sha256, upload time, yanked; release yanked flag; throws if unreadable/empty | `{Files; FirstUploadUtc; Yanked; YankedReason}` | `Test-PackageAge`, `Get-DeployedPackageNotice` |
 | `Test-PackageAge` | release first upload vs. minimum age; `-Expedite` names pass; results carry `EligibleUtc`, `Yanked`, `Release`; unreadable -> failed with `Error` | `@{ TooNew; Results }` | intake |
 | `Invoke-WheelhouseToolProbe` | version reported by `python --version`, `python -m pip_audit --version` or `uv --version`, run as a process with an empty stdin and a 15 s limit (the Store `python.exe` stub can block); `$null` if missing, failing or too slow (mock seam) | string / `$null` | `Get-WheelhouseToolStatus` |
@@ -765,7 +767,8 @@ C per group (existing first, then new by number):
                 Invoke-CandidateIntake (Expedite, RequireDefenderScan, StagingRoot)
    [write lock] Publish-CandidateIntake (9.1 steps 6-10) -> manifest refreshed
    [no lock]    rejections -> list (+ IntakeBlocked notice for integrity/defender; audit-error => incomplete)
-                if the group existed and lists pins: Invoke-GroupAudit -Stage Deployed
+   after all groups: Invoke-PublishedAudit -Stage Deployed over what was published before this
+                run (one set per "n-th version of a package", not one audit per group)
                 warn about unused -ExpeditePackage; write Report_Rejected_*
                 (B, if anything is added) Resolve-WheelhouseProposalForPublish -> refused: throw
                     (AwaitingApproval); a remediation proposal: its changed pins target the
@@ -793,7 +796,7 @@ if manifest not empty: Assert-WheelhouseIntegrity -AllowChangedFiles
     Move-UntrackedWheelFile (AutoQuarantine on: under the write lock, moved) -> Untracked notice
 Get-WheelhouseGroupFile (always - also with an empty manifest); Get-UndownloadedPin -> warnings
 Get-DeployedPackageNotice(published, denylist) -> Denylisted / Yanked notices, PyPI errors
-Invoke-GroupAudit -Stage Scheduled per group
+Invoke-PublishedAudit -Stage Scheduled (every published version, batched)
 Get-AuditResultSeverity                                   (no lock; OSV, cached)
 Update-WheelhouseCatalog { Update-CatalogAuditResult(Severity, DueDays, Waiver);
                            Update-CatalogPyPIResult(Checked); ScheduledCheckUtc = now }

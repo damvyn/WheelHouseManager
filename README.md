@@ -744,7 +744,7 @@ is deleted after `ReportRetentionMonths`.
 | File | Written by | Content |
 |---|---|---|
 | `Log_<ts>.txt`, `Log_Audit_<ts>.txt`, `Log_PackageAudit_<ts>.txt`, `Log_Scan_<ts>.txt` | Update-Wheelhouse, Test-Wheelhouse, Test-WheelhousePackage, Invoke-WheelhouseScan | Full console log of the run |
-| `Report_<Stage>-<group>-<OSV\|PYPI>_<ts>.json` | Every audit | pip-audit result. Stage: `PreDownload` (candidates), `Deployed` (Update-Wheelhouse), `Scheduled` (Test-Wheelhouse), `Manual` (Test-WheelhousePackage) |
+| `Report_<Stage>-<set>-<OSV\|PYPI>_<ts>.json` | Every audit | pip-audit result. Stage: `PreDownload` (candidates, set `<group>-candidates`), `Deployed` (Update-Wheelhouse), `Scheduled` (Test-Wheelhouse), `Manual` (Test-WheelhousePackage). Published packages are audited in as few runs as possible - set `published-1`, `published-2`, ... (one version per package each; the audited lists are in `reports\audit-sets\`) - not once per group file. |
 | `Report_PackageAge-<group>_<ts>.json` | Update-Wheelhouse | Cooldown/yanked data per candidate, with the eligible date |
 | `Report_Rejected_<ts>.json` | Update-Wheelhouse | Every rejected pin with category and reason |
 | `Report_Scan_<ts>.json` | Every Defender scan (intake and on-demand) | Status, scanned paths, detections |
