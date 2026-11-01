@@ -38,6 +38,8 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
+/* Below this size the layout stops shrinking and the browser window gets scrollbars instead. */
+html { overflow: auto; background: var(--bg); }
 /* Header, tabs, the scrolling page and the job panel stack in one window-high column: the job
    panel takes its own space at the bottom, so it never covers the page. */
 body {
@@ -45,6 +47,7 @@ body {
   background: var(--bg);
   color: var(--text);
   display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  min-width: 1000px; min-height: 560px;
 }
 .topbar, .tabs { flex: 0 0 auto; }
 .page { flex: 1 1 auto; min-height: 0; overflow: auto; padding-bottom: 24px; }
@@ -192,3 +195,18 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .job-indicator.bad .dot { background: var(--bad); }
 @keyframes job-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .25; transform: scale(.8); } }
 @media (prefers-reduced-motion: reduce) { .job-indicator.running .dot { animation: none; } }
+/* Packages tab: the toolbar stays put and only the table scrolls (its header row stays visible). */
+.page.fill { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 16px; }
+.page.fill main { flex: 1 1 auto; min-height: 0; width: 100%; display: flex; flex-direction: column; }
+.page.fill main > .banner { flex: 0 0 auto; }
+.page.fill #tab-packages { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#tab-packages > .toolbar, #tab-packages > .banner { flex: 0 0 auto; }
+#tab-packages > .banner { max-height: 120px; overflow: auto; }
+.page.fill #tab-packages > .table-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
+/* Add tab: the result of "Add and resolve" inside step 1, collapsible and scrolling on its own. */
+.add-result { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }
+.add-result-head { display: flex; gap: 6px; align-items: center; }
+.result-scroll { max-height: 260px; overflow: auto; margin-top: 8px; padding: 2px 10px 8px; border: 1px solid var(--line); border-radius: 8px; }
+.result-scroll > p { margin: 8px 0 0; }
+/* Jobs tab: what a job worked on, listed on demand. */
+.job-detail { max-height: 200px; overflow: auto; margin-top: 4px; }

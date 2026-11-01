@@ -862,7 +862,8 @@ Invoke-WheelhouseUiRequest: token from X-Wheelhouse-Token (API) or ?t= (page)
     Test-WheelhouseUiRequest (host, token, origin, content type, method) -> deny | continue
     /api/*: body <= 1 MB, JSON -> Invoke-WheelhouseUiApi -> ConvertTo-Json -Depth 8
     else: static whitelist (/, /app.js, /style.css)
-Jobs: Start-WheelhouseUiJob(steps) -> Start-WheelhouseUiJobStep: Start-Process <current host exe>
+Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it works on, steps)
+      -> Start-WheelhouseUiJobStep: Start-Process <current host exe>
       -NoProfile -File Jobs\<script> <validated args>, hidden, stdout/err -> logs\ui
       Sync: step exit 0 -> next step / Succeeded; 1 -> Attention; 3 -> Failed (busy); other -> Failed
       Cancel: taskkill /PID /T /F -> Cancelled. Shutdown cancels the running job.

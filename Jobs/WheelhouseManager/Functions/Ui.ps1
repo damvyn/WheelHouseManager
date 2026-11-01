@@ -248,6 +248,10 @@ function Start-WheelhouseUiJob {
         [Parameter(Mandatory)]
         [string]$Kind,
 
+        # What the job works on (package pins, file names): the UI shows the title alone
+        # and lists these on demand.
+        [string[]]$Detail = @(),
+
         [Parameter(Mandatory)]
         [object[]]$Steps,
 
@@ -268,6 +272,7 @@ function Start-WheelhouseUiJob {
         Id         = $script:UiJobCounter
         Title      = $Title
         Kind       = $Kind
+        Detail     = @($Detail)
         Status     = 'Running'
         StepIndex  = 0
         Steps      = [System.Collections.Generic.List[object]]::new()
@@ -407,6 +412,7 @@ function ConvertTo-WheelhouseUiJobSummary {
     $summary = [ordered]@{
         id          = $Job.Id
         title       = $Job.Title
+        detail      = @($Job.Detail | Where-Object { $_ })
         kind        = $Job.Kind
         status      = $Job.Status
         message     = $Job.Message
@@ -629,14 +635,14 @@ function Get-WheelhouseUiRoute {
             Handler    = {
                 param($Context, $Body, $Match)
                 if (Get-UiBodyValue -Body $Body -Name 'all') {
-                    $job = Start-WheelhouseUiJob -Title 'Audit: whole index' -Kind 'audit' -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @() })
+                    $job = Start-WheelhouseUiJob -Title 'Audit all packages' -Kind 'audit' -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @() })
                 }
                 else {
                     $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
                     $selection = Resolve-UiPackageSelection -Body $Body -Manifest $manifest
                     $list = ($selection | ForEach-Object { "$($_.Name)==$($_.Version)" }) -join ','
                     if ($list.Length -gt 20000) { throw [System.ArgumentException]::new('The selection is too large - use "Audit all" instead.') }
-                    $job = Start-WheelhouseUiJob -Title "Audit: $($selection.Count) selected package(s)" -Kind 'audit' -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @('-Package', $list) })
+                    $job = Start-WheelhouseUiJob -Title 'Audit packages' -Kind 'audit' -Detail @($selection | ForEach-Object { "$($_.Name)==$($_.Version)" }) -Context $Context -Steps @(@{ Script = 'Test-WheelhousePackage.ps1'; Arguments = @('-Package', $list) })
                 }
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
@@ -649,7 +655,7 @@ function Get-WheelhouseUiRoute {
             Handler    = {
                 param($Context, $Body, $Match)
                 if (Get-UiBodyValue -Body $Body -Name 'all') {
-                    $job = Start-WheelhouseUiJob -Title 'Defender scan: all published wheels (local copies)' -Kind 'scan' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @() })
+                    $job = Start-WheelhouseUiJob -Title 'Scan all packages' -Kind 'scan' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @() })
                 }
                 else {
                     $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
@@ -665,7 +671,7 @@ function Get-WheelhouseUiRoute {
                     if ($files.Count -eq 0) { throw [System.ArgumentException]::new('Select at least one package.') }
                     $list = $files -join ','
                     if ($list.Length -gt 20000) { throw [System.ArgumentException]::new('The selection is too large - use "Scan all" instead.') }
-                    $job = Start-WheelhouseUiJob -Title "Defender scan: $($files.Count) wheel(s) (local copies)" -Kind 'scan' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @('-File', $list) })
+                    $job = Start-WheelhouseUiJob -Title 'Scan packages' -Kind 'scan' -Detail $files.ToArray() -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseScan.ps1'; Arguments = @('-File', $list) })
                 }
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
@@ -689,8 +695,12 @@ function Get-WheelhouseUiRoute {
                     # By default the job stops at requirements.txt, so the resolved pins can
                     # be reviewed before anything is downloaded. "publish": true also runs
                     # Update-Wheelhouse.ps1 (audit, cooldown, download) straight away.
-                    if ((Get-UiBodyValue -Body $Body -Name 'publish') -eq $true) { $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() } }
-                    $job = Start-WheelhouseUiJob -Title "Add: $($addResult.Added -join ', ')" -Kind 'add' -Context $Context -Steps $steps
+                    $title = 'Add packages'
+                    if ((Get-UiBodyValue -Body $Body -Name 'publish') -eq $true) {
+                        $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() }
+                        $title = 'Add and publish packages'
+                    }
+                    $job = Start-WheelhouseUiJob -Title $title -Kind 'add' -Detail @($addResult.Added) -Context $Context -Steps $steps
                 }
                 return @{ Status = 200; Body = @{ added = @($addResult.Added); skipped = @($addResult.Skipped); job = $(if ($job) { ConvertTo-WheelhouseUiJobSummary -Job $job } else { $null }) } }
             }
@@ -840,7 +850,7 @@ function Get-WheelhouseUiRoute {
                     if ($reason -notmatch '^[A-Za-z0-9 .,:;()/#+_-]{5,200}$') { throw [System.ArgumentException]::new('Write the reason as a short sentence (5-200 letters, digits and . , : ; ( ) / # + _ -).') }
                     $arguments += @('-ExpediteReason', $reason)
                 }
-                $job = Start-WheelhouseUiJob -Title "Fix: $name==$version" -Kind 'remediate' -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseRemediation.ps1'; Arguments = $arguments })
+                $job = Start-WheelhouseUiJob -Title 'Fix package' -Kind 'remediate' -Detail @("$name==$version") -Context $Context -Steps @(@{ Script = 'Invoke-WheelhouseRemediation.ps1'; Arguments = $arguments })
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
         }
@@ -854,7 +864,7 @@ function Get-WheelhouseUiRoute {
                 if ((Get-UiBodyValue -Body $Body -Name 'confirm') -ne $true) {
                     throw [System.ArgumentException]::new('Publishing needs an explicit confirmation.')
                 }
-                $job = Start-WheelhouseUiJob -Title 'Publish: Update-Wheelhouse' -Kind 'update' -Context $Context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() })
+                $job = Start-WheelhouseUiJob -Title 'Publish packages' -Kind 'update' -Context $Context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() })
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
         }

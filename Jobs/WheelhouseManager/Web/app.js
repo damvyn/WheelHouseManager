@@ -171,6 +171,8 @@
       !window.confirm('Your settings changes are not saved yet. Leave the Settings tab and discard them?')) { return; }
     state.settingsDirty = false;
     state.currentTab = name;
+    // The Packages tab keeps its toolbar in place and scrolls the table alone.
+    $('page').classList.toggle('fill', name === 'packages');
     Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), function (b) {
       b.classList.toggle('active', b.getAttribute('data-tab') === name);
     });
@@ -618,19 +620,13 @@
     state.reviewFix = false;
     var specs = h('textarea', { placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
     var publishNow = h('input', { type: 'checkbox' });
-    var output = h('div', {});
+    var output = h('div', { class: 'add-result hidden' });
     var go = h('button', { class: 'btn primary', type: 'button' }, 'Add and resolve');
     go.addEventListener('click', function () {
       var list = specs.value.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(function (s) { return s && s.charAt(0) !== '#'; });
       if (list.length === 0) { toast('Enter at least one package.', 'bad'); return; }
       api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked }).then(function (data) {
-        clear(output);
-        if (data.added.length) {
-          output.append(h('p', {}, 'Added to requirements.in:'), h('ul', { class: 'result-list' }, data.added.map(function (a) { return h('li', { class: 'mono' }, a); })));
-        }
-        if (data.skipped.length) {
-          output.append(h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, data.skipped.map(function (s) { return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason); })));
-        }
+        renderAddResult(output, [].concat(data.added || []), [].concat(data.skipped || []));
         if (data.job) { specs.value = ''; watchJob(data.job.id, false); }
       }).catch(fail);
     });
@@ -640,12 +636,34 @@
         h('p', { class: 'muted' }, 'One requirement per line, for example numpy or pandas>=2.0. The names go into requirements.in, and Update-Requirement.ps1 resolves them (with the cooldown) into requirements.txt. Nothing is downloaded yet: review the result below first.'),
         specs,
         h('p', {}, h('label', {}, publishNow, ' Also publish right away (skips the review step)')),
-        h('div', { class: 'toolbar' }, go)),
-      output,
+        h('div', { class: 'toolbar' }, go),
+        output),
       h('div', { class: 'card', id: 'requirements-card' }),
       h('div', { class: 'card', id: 'rejected-card' }));
     loadRequirements(reviewFix ? 'fix' : false);
     loadRejected();
+  }
+
+  // The outcome of "Add and resolve", inside step 1: a summary line with a button to show or
+  // hide the lists, which scroll on their own when they are long.
+  function renderAddResult(output, added, skipped) {
+    clear(output);
+    output.classList.toggle('hidden', added.length + skipped.length === 0);
+    if (added.length + skipped.length === 0) { return; }
+    var lists = h('div', { class: 'result-scroll' },
+      added.length ? [h('p', {}, 'Added to requirements.in:'), h('ul', { class: 'result-list' }, added.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
+      skipped.length ? [h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, skipped.map(function (s) { return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason); }))] : null);
+    var toggle = h('button', { class: 'btn small', type: 'button' }, 'Hide list');
+    toggle.addEventListener('click', function () {
+      var hide = !lists.classList.contains('hidden');
+      lists.classList.toggle('hidden', hide);
+      toggle.textContent = hide ? 'Show list' : 'Hide list';
+    });
+    output.append(h('div', { class: 'add-result-head' },
+      h('strong', {}, 'Result:'), ' ',
+      added.length ? badge(added.length + ' added', 'ok') : null, ' ',
+      skipped.length ? badge(skipped.length + ' not added', 'bad') : null,
+      h('span', { class: 'spacer' }), toggle), lists);
   }
 
   function loadRequirements(showNextStep) {
@@ -1053,6 +1071,21 @@
     return badge(jobLabel(job.status), jobKind(job.status), job.message);
   }
 
+  // A job's action, and a small button that lists what it worked on (packages, files).
+  function jobTitleCell(job) {
+    var detail = [].concat(job.detail || []);
+    if (detail.length === 0) { return job.title; }
+    var list = h('ul', { class: 'result-list job-detail hidden' }, detail.map(function (d) { return h('li', { class: 'mono' }, d); }));
+    var more = h('button', { class: 'btn small ghost', type: 'button', 'aria-expanded': 'false' }, 'show ' + detail.length);
+    more.addEventListener('click', function () {
+      var show = list.classList.contains('hidden');
+      list.classList.toggle('hidden', !show);
+      more.textContent = (show ? 'hide ' : 'show ') + detail.length;
+      more.setAttribute('aria-expanded', show ? 'true' : 'false');
+    });
+    return h('div', {}, job.title, ' ', more, list);
+  }
+
   function loadJobs() {
     var root = $('tab-jobs');
     api('GET', '/api/jobs').then(function (data) {
@@ -1064,7 +1097,7 @@
       root.append(h('div', { class: 'table-wrap' }, h('table', {},
         h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Job'), h('th', {}, 'Status'), h('th', {}, 'Started'), h('th', {}, 'Ended'), h('th', {}, ''))),
         h('tbody', {}, data.jobs.map(function (j) {
-          return h('tr', {}, h('td', {}, j.id), h('td', {}, j.title), h('td', {}, jobBadge(j)), h('td', {}, fmtDate(j.started_utc)), h('td', {}, fmtDate(j.ended_utc)),
+          return h('tr', {}, h('td', {}, j.id), h('td', {}, jobTitleCell(j)), h('td', {}, jobBadge(j)), h('td', {}, fmtDate(j.started_utc)), h('td', {}, fmtDate(j.ended_utc)),
             h('td', {}, h('button', { class: 'btn small', type: 'button', onclick: function () { watchJob(j.id, true); } }, 'Open log')));
         })))));
     }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
