@@ -176,7 +176,7 @@ finally {
         # Stopped between the edit and the resolve result: put requirements.in back.
         try { [System.IO.File]::WriteAllText($cfg.RequirementsInPath, $originalIn, [System.Text.UTF8Encoding]::new($false)) } catch { Write-Log "Could not restore requirements.in: $($_.Exception.Message)" 'ERROR' }
     }
-    Stop-WheelhouseRun -Title $title -Outcome $outcome
+    Stop-WheelhouseRun -Title $title -Outcome $outcome -ExitCode $exitCode
 }
 
 exit $exitCode

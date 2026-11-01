@@ -148,13 +148,38 @@ if ($auditResults.Count -eq 0 -and $notices.Count -eq 0) {
     exit $wheelhouseExitCode
 }
 
-$alertParams = Get-VulnerabilityAlertParameter -AuditResult $auditResults -Notice $notices -AlertParameters $alertParams
+# Published packages are alerted like the weekly check does - only what is new, overdue,
+# reminded, unwaived or resolved (the catalog remembers what was alerted). Candidates this
+# run blocked are always reported. Without a readable catalog, every vulnerable audit is.
+$cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters -Name WheelhousePath, OverdueReminderDays
+$findingAlerts = $null
+try {
+    $findingAlerts = @(Get-CatalogFindingAlert -Catalog (Read-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath) -ReminderDays ([int]$cfg.OverdueReminderDays))
+}
+catch {
+    Write-Log "The package catalog could not be read ($($_.Exception.Message)) - alerting every vulnerable audit of this run." 'WARN'
+}
+$alertParamsIn = @{ AuditResult = $auditResults; Notice = $notices; AlertParameters = $alertParams }
+if ($null -ne $findingAlerts) { $alertParamsIn['Finding'] = $findingAlerts }
+$alertParams = Get-VulnerabilityAlertParameter @alertParamsIn
 $alertExitCode = 0
 if ($null -ne $alertParams) {
     Write-Log 'Running Send-VulnerabilityAlert.ps1...'
     & $SendAlertScriptPath @alertParams | Out-Host
     $alertExitCode = $LASTEXITCODE
     Write-Log "Send-VulnerabilityAlert.ps1 finished with exit code $alertExitCode."
+}
+if ($null -ne $findingAlerts -and $findingAlerts.Count -gt 0 -and $alertExitCode -eq 0) {
+    $alerted = $findingAlerts
+    try {
+        Update-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath -Update ({
+                param($catalog)
+                Set-CatalogFindingNotified -Catalog $catalog -Finding $alerted
+            }.GetNewClosure())
+    }
+    catch {
+        Write-Log "Could not record which findings were alerted ($($_.Exception.Message)); they are alerted again next time." 'WARN'
+    }
 }
 
 Write-Log '=== Wheelhouse pipeline finished ==='

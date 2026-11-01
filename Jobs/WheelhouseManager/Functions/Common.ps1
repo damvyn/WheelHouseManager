@@ -373,3 +373,87 @@ function ConvertTo-OptionalUtcDateTime {
     if ($null -eq $Value -or ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value))) { return $null }
     try { return ConvertTo-UtcDateTime -Value $Value } catch { return $null }
 }
+
+# --- Windows Event Log (optional, setting EventLog) ---------------------------------------
+# Event IDs: 1000 a run finished OK; 1001 a run needs attention; 1002 a run failed or a check
+# could not be completed; 1003 an automatic action was taken; 1004 a change was made by
+# someone (publish, quarantine, restore, approval).
+$script:EventLogSource = 'WheelhouseManager'
+$script:EventLogState = $null
+$script:CurrentRunLog = $null
+
+function Test-WheelhouseEventLogEnabled {
+    # $true when the EventLog setting is on and writing has not failed in this process. (No
+    # up-front check: without administrator rights Windows cannot even search for a missing
+    # source; Setup.ps1 -EnableEventLog creates it once.)
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if ($null -eq $script:EventLogState) {
+        $settings = Get-WheelhouseSetting
+        $script:EventLogState = [bool]($settings.ContainsKey('EventLog') -and (ConvertTo-WheelhouseBoolean $settings['EventLog']))
+    }
+    return [bool]$script:EventLogState
+}
+
+function Write-WheelhouseEventLogEntry {
+    # Writes one entry to the Application log (mock seam).
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [int]$Id,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Information', 'Warning', 'Error')]
+        [string]$Level,
+
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    if ($PSCmdlet.ShouldProcess($script:EventLogSource, "Event $Id")) {
+        [System.Diagnostics.EventLog]::WriteEntry($script:EventLogSource, $Message, [System.Diagnostics.EventLogEntryType]$Level, $Id)
+    }
+}
+
+function Write-WheelhouseEventLog {
+    # Writes an event when the Event Log is enabled; otherwise does nothing. A failure only
+    # warns - the Event Log is an extra channel, never a reason for a run to fail.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet(1000, 1001, 1002, 1003, 1004)]
+        [int]$Id,
+
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    if (-not (Test-WheelhouseEventLogEnabled)) { return }
+    $level = switch ($Id) { 1000 { 'Information' } 1004 { 'Information' } 1002 { 'Error' } default { 'Warning' } }
+    $user = if ($env:USERNAME) { "$env:USERDOMAIN\$env:USERNAME" } else { 'unknown' }
+    try {
+        Write-WheelhouseEventLogEntry -Id $Id -Level $level -Message "$Message`r`n`r`nUser: $user; computer: $env:COMPUTERNAME"
+    }
+    catch {
+        # Once is enough: stop trying for the rest of this run.
+        $script:EventLogState = $false
+        Write-Log "Could not write to the Event Log ($($_.Exception.Message)). Its source is created by Setup.ps1 -EnableEventLog, run once as administrator; the Event Log is skipped for the rest of this run." 'WARN'
+    }
+}
+
+function Register-WheelhouseEventSource {
+    # Creates the event source in the Application log (needs administrator rights). Returns
+    # $true if it exists afterwards.
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([bool])]
+    param()
+
+    # Run as administrator: then the search below can read every log.
+    if ([System.Diagnostics.EventLog]::SourceExists($script:EventLogSource)) { return $true }
+    if (-not $PSCmdlet.ShouldProcess($script:EventLogSource, 'Create event source')) { return $false }
+    [System.Diagnostics.EventLog]::CreateEventSource($script:EventLogSource, 'Application')
+    $script:EventLogState = $null
+    return $true
+}

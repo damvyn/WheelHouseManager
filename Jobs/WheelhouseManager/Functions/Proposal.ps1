@@ -114,6 +114,10 @@ function Save-WheelhouseProposal {
             action   = $Action
             proposal = $Proposal
         })
+    if ($Action -ne 'Proposed') {
+        $who = if ($Proposal.approved_by -and $Action -eq 'Approved') { " by $($Proposal.approved_by)" } elseif ($Proposal.rejected_by -and $Action -eq 'Rejected') { " by $($Proposal.rejected_by)" } else { '' }
+        Write-WheelhouseEventLog -Id 1004 -Message "Proposal $($Proposal.id) ($($Proposal.kind), requested by $($Proposal.requested_by)) $($Action.ToLowerInvariant())$who. $($Proposal.outcome)"
+    }
     $history = Join-Path $folder 'proposal-history.jsonl'
     try { [System.IO.File]::AppendAllText($history, $line + "`n", [System.Text.UTF8Encoding]::new($false)) }
     catch { Write-Log "Could not write the proposal history ($history): $($_.Exception.Message)" 'WARN' }

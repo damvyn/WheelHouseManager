@@ -73,6 +73,7 @@ function Start-WheelhouseRun {
     }
 
     $logFile = Join-Path $reportsFolder "$($LogPrefix)_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+    $script:CurrentRunLog = $logFile
     try {
         Start-Transcript -Path $logFile -Append -ErrorAction Stop | Out-Null
         Write-Log "Full console output for this run is also being saved to: $logFile"
@@ -89,18 +90,27 @@ function Start-WheelhouseRun {
 }
 
 function Stop-WheelhouseRun {
-    # Common end of every wheelhouse script: final log line and transcript stop.
-    # Safe to call even if the transcript never started.
+    # Common end of every wheelhouse script: final log line, transcript stop, and - with
+    # -ExitCode and the EventLog setting on - one Event Log entry (1000 OK, 1001 needs
+    # attention, 1002 failed or busy). Safe to call even if the transcript never started.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Title,
 
-        [string]$Outcome
+        [string]$Outcome,
+
+        [int]$ExitCode = -1
     )
 
     $suffix = if ($Outcome) { " ($Outcome)" } else { '' }
     Write-Log "=== $Title finished$suffix ==="
+    if ($ExitCode -ge 0) {
+        $id = switch ($ExitCode) { 0 { 1000 } 1 { 1001 } default { 1002 } }
+        $state = switch ($ExitCode) { 0 { 'finished OK' } 1 { 'finished - needs attention' } 3 { 'did not run - another operation held the lock' } default { 'failed or a check could not be completed' } }
+        $log = if ($script:CurrentRunLog) { "`r`nLog: $($script:CurrentRunLog)" } else { '' }
+        Write-WheelhouseEventLog -Id $id -Message "$Title $state$suffix (exit code $ExitCode).$log"
+    }
     if ($PSCmdlet.ShouldProcess('transcript', 'Stop')) {
         try { Stop-Transcript -ErrorAction Stop | Out-Null } catch { Write-Verbose 'No transcript was running.' }
     }

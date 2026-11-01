@@ -16,6 +16,9 @@ Describe 'WheelhouseManager' {
         # Proposals go to the test drive, never to the repository's Input folder.
         $global:WhmProposalPath = Join-Path $TestDrive 'proposal.json'
         Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseProposalPath -MockWith { $global:WhmProposalPath }
+        # The integrity cache too (it lives on the manager server, here the test drive).
+        $global:WhmStateDir = Join-Path $TestDrive 'state'
+        Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseIntegrityCachePath -MockWith { Join-Path $global:WhmStateDir ("integrity-" + [Math]::Abs($WheelhousePath.ToLowerInvariant().GetHashCode()) + '.json') }
 
         function Get-TestFolder {
             $path = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
@@ -173,7 +176,7 @@ Describe 'WheelhouseManager' {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
         Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded, WhmIntakeCandidates, WhmScanDetections, WhmUiJobSteps,
             WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI, WhmScannedPath,
-            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline, WhmProposalPath, WhmTask, WhmTaskRegistered, WhmTaskError, WhmTaskCalls -Scope Global -ErrorAction SilentlyContinue
+            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline, WhmProposalPath, WhmStateDir, WhmEventLog, WhmTask, WhmTaskRegistered, WhmTaskError, WhmTaskCalls -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -344,6 +347,35 @@ Describe 'WheelhouseManager' {
             $manifest = @([PSCustomObject]@{ name = 'b'; version = '1'; file = 'b-1-py3-none-any.whl'; sha256 = 'X' })
             { Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $wheelhouse -ReportsFolder $reports } | Should -Throw
             @(Get-ChildItem -Path $reports -Filter 'Report_Integrity_*.json').Count | Should -Be 1
+        }
+    }
+
+    Context 'Quick integrity check' {
+        It 'hashes only files changed since their last verification; the full check hashes all' {
+            $wheelhouse = Get-TestWheelhouse
+            $manifest = Read-WheelhouseManifest -WheelhousePath $wheelhouse
+            $cache = Join-Path (Get-TestFolder) 'integrity.json'
+            $stats = @{}
+            @(Get-WheelhouseIntegrityProblem -Manifest $manifest -WheelhousePath $wheelhouse -CachePath $cache -Quick -Statistics $stats).Count | Should -Be 0
+            $stats['Hashed'] | Should -Be 2
+            @(Get-WheelhouseIntegrityProblem -Manifest $manifest -WheelhousePath $wheelhouse -CachePath $cache -Quick -Statistics $stats).Count | Should -Be 0
+            "$($stats['Hashed'])/$($stats['Skipped'])" | Should -Be '0/2'
+
+            # A different size is noticed by the quick check.
+            $six = Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl'
+            Add-Content -Path $six -Value 'tampered'
+            $problems = @(Get-WheelhouseIntegrityProblem -Manifest $manifest -WheelhousePath $wheelhouse -CachePath $cache -Quick -Statistics $stats)
+            $problems[0].Kind | Should -Be 'Modified'
+
+            # Same size and a restored timestamp slip past the quick check - the full check
+            # (the weekly one) catches them.
+            $attrs = Get-Item -Path (Join-Path $wheelhouse 'attrs-23.1.0-py3-none-any.whl')
+            $stamp = $attrs.LastWriteTimeUtc
+            $bytes = [System.IO.File]::ReadAllBytes($attrs.FullName); $bytes[0] = $bytes[0] -bxor 1
+            [System.IO.File]::WriteAllBytes($attrs.FullName, $bytes)
+            (Get-Item -Path $attrs.FullName).LastWriteTimeUtc = $stamp
+            @(Get-WheelhouseIntegrityProblem -Manifest $manifest -WheelhousePath $wheelhouse -CachePath $cache -Quick | Where-Object { $_.Entry.name -eq 'attrs' }).Count | Should -Be 0
+            @(Get-WheelhouseIntegrityProblem -Manifest $manifest -WheelhousePath $wheelhouse -CachePath $cache | Where-Object { $_.Entry.name -eq 'attrs' })[0].Kind | Should -Be 'Modified'
         }
     }
 
@@ -1768,6 +1800,9 @@ Describe 'WheelhouseManager' {
             Get-VulnerabilityAlertParameter -AuditResult $vulnerable -Finding (Get-TestAlert -Catalog $catalog) | Should -BeNullOrEmpty
             # Without tracked findings the reports are alerted as before.
             (Get-VulnerabilityAlertParameter -AuditResult $vulnerable).ReportPaths | Should -Be 'r.json'
+            # Candidates blocked before publishing are always reported.
+            $candidate = @([PSCustomObject]@{ Status = 'Vulnerable'; Stage = 'PreDownload'; ReportPath = 'c.json'; Group = 'requirements-1'; Service = 'osv' })
+            (Get-VulnerabilityAlertParameter -AuditResult (@($vulnerable) + $candidate) -Finding (Get-TestAlert -Catalog $catalog)).ReportPaths | Should -Be 'c.json'
 
             $html = ConvertTo-VulnerabilityAlertHtml -Findings @($alerts) -WheelhousePath $catalog.WheelhousePath
             $html | Should -Match '<th>Severity</th>'
@@ -1948,6 +1983,45 @@ Describe 'WheelhouseManager' {
             $advisories = Get-Content -Path (Join-Path $wheelhouse 'advisories.json') -Raw | ConvertFrom-Json
             (@($advisories.packages) | Where-Object { $_.name -eq 'attrs' }).recommended | Should -Be '24.0'
             (@($advisories.packages) | Where-Object { $_.name -eq 'six' }).status | Should -Be 'quarantined'
+        }
+
+        It 'writes a static index.html for the people who install from the share' {
+            $wheelhouse = New-TestVulnerableWheelhouse
+            $html = Get-Content -Path (Join-Path $wheelhouse 'index.html') -Raw
+            $html | Should -Match 'Do not use \(1\)'
+            $html | Should -Match 'attrs==23\.1\.0'
+            $html | Should -Match 'GHSA-s'
+            $html | Should -Match 'requirements-1\.txt'
+            $html | Should -Match 'Packages \(2\)'
+            $html | Should -Not -Match '<script'
+            # Text from outside is escaped.
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $catalog.Records['six==1.16.0'].groups = @('<b>x</b>.txt')
+            Export-WheelhouseIndexPage -Catalog $catalog -Advisory @()
+            Get-Content -Path (Join-Path $wheelhouse 'index.html') -Raw | Should -Match '&lt;b&gt;x&lt;/b&gt;'
+        }
+
+        It 'writes Event Log entries only when enabled, and stops after a failure' {
+            $global:WhmEventLog = [System.Collections.Generic.List[string]]::new()
+            Mock -ModuleName WheelhouseManager -CommandName Write-WheelhouseEventLogEntry -MockWith { $global:WhmEventLog.Add("$Id $Level $Message") }
+            & (Get-Module WheelhouseManager) { $script:EventLogState = $false }
+            Stop-WheelhouseRun -Title 'Test run' -Outcome 'x' -ExitCode 1 -Confirm:$false
+            $global:WhmEventLog.Count | Should -Be 0
+
+            & (Get-Module WheelhouseManager) { $script:EventLogState = $true }
+            Stop-WheelhouseRun -Title 'Test run' -Outcome 'findings' -ExitCode 1 -Confirm:$false
+            Stop-WheelhouseRun -Title 'Test run' -ExitCode 0 -Confirm:$false
+            $wheelhouse = Get-TestWheelhouse
+            Set-WheelhouseCatalogState -WheelhousePath $wheelhouse -Change @([PSCustomObject]@{ Name = 'six'; Version = '1.16.0'; State = 'Quarantined'; Action = 'Quarantined'; Detail = 'by test' })
+            $global:WhmEventLog[0] | Should -Match '^1001 Warning Test run finished - needs attention'
+            $global:WhmEventLog[1] | Should -Match '^1000 Information'
+            $global:WhmEventLog[2] | Should -Match '^1004 Information Quarantined: six==1.16.0'
+
+            Mock -ModuleName WheelhouseManager -CommandName Write-WheelhouseEventLogEntry -MockWith { $global:WhmEventLog.Add('tried'); throw 'source missing' }
+            Write-WheelhouseEventLog -Id 1002 -Message 'one'
+            Write-WheelhouseEventLog -Id 1002 -Message 'two'
+            @($global:WhmEventLog | Where-Object { $_ -eq 'tried' }).Count | Should -Be 1
+            & (Get-Module WheelhouseManager) { $script:EventLogState = $null }
         }
 
         It 'checks the installation and says how to fix each problem' {

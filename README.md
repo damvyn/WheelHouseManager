@@ -308,6 +308,12 @@ versions your project needs (a second version of a package lives in a different 
 wheelhouse, so such an install never fails for a missing file. A package that is later
 quarantined or deleted is removed from its group file too.
 
+**What is in the wheelhouse - for everyone.** The manager keeps a read-only page on the share,
+`\\server\share\wheelhouse\index.html`, up to date: every available package and version and the
+group files that list it, the versions **not to use** (vulnerable, overdue, yanked, quarantined)
+with the version to install instead, how to install, and when the wheelhouse was last checked.
+It is plain HTML without scripts, so it opens straight from the share; send your users the link.
+
 **Optional - check an environment on a client.** `Client Install\Test-PythonEnvironment.ps1`
 (a separate script; `Startup_UV.ps1` is unchanged) tells a user whether anything installed in an
 environment has since been found vulnerable, yanked, quarantined or removed, and what to install
@@ -350,6 +356,7 @@ settings file** > **the built-in default**. A key missing from the file uses its
 | `WaiverMaxDays` | `90` | Longest allowed waiver. |
 | `AuditFreshnessDays` | `8` | A published version without a completed audit for this long is alerted as *Unverified*; the UI warns when the weekly check has not completed for this long. |
 | `OverdueReminderDays` | `7` | How often an overdue vulnerability is alerted again. |
+| `EventLog` | `$false` | Also write run results and actions to the Windows Event Log (Application, source `WheelhouseManager`) - see [8](#8-alerts-reports-and-logs). Turn on with `Setup.ps1 -EnableEventLog` (as administrator, once). |
 | `ApprovalMode` | `SamePersonAllowed` | Who may approve a resolved `requirements.txt` or a fix before it is published. `SamePersonAllowed`: anyone, also the requester (publishing approves; recorded). `SeparateApprover`: another account than the requester. |
 
 Example:
@@ -581,8 +588,11 @@ cd C:\WheelHouseManager
 .\Invoke-WheelhousePipeline.ps1 -SmtpServer 10.0.0.25
 ```
 
-Runs `Update-Wheelhouse.ps1`, then sends one alert for exactly this run's findings. It takes the
-same parameters as `Update-Wheelhouse.ps1` plus the alert ones.
+Runs `Update-Wheelhouse.ps1`, then sends one alert. Like the weekly check, it alerts published
+packages only when there is something new to say (new, overdue, waiver ended, resolved), so a
+known, already-alerted finding does not mail you on every update; candidates this run blocked
+before publishing, notices and failed checks are always included. It takes the same parameters as
+`Update-Wheelhouse.ps1` plus the alert ones.
 
 ### 5.10 Only retry what is pending, without merging anything new
 
@@ -709,7 +719,23 @@ already running" - just try again a moment later.
 ## 8. Alerts, reports and logs
 
 Alerts are emailed when `SmtpServer` is set, otherwise saved as
-`<wheelhouse>\reports\Alert_<timestamp>.html`. Everything below is in `<wheelhouse>\reports\` and
+`<wheelhouse>\reports\Alert_<timestamp>.html`.
+
+**Windows Event Log (optional).** With `EventLog` on (`Setup.ps1 -EnableEventLog`, run once as
+administrator - it creates the event source), every script also writes to the manager server's
+*Application* log, source `WheelhouseManager`, so your central monitoring (SCOM, Splunk, Sentinel,
+Windows Event Forwarding) can pick it up:
+
+| Event ID | Level | When |
+|---|---|---|
+| 1000 | Information | A run finished OK |
+| 1001 | Warning | A run needs attention (findings, rejected packages) |
+| 1002 | Error | A run failed, a check could not be completed, or the alert could not be sent |
+| 1003 | Warning | An automatic action: a wheel missing or changed on the share taken out, a malicious package quarantined, untracked wheels moved |
+| 1004 | Information | A change by someone: published, quarantined, deleted, restored, proposal approved / rejected / published |
+
+Each entry names the run's log file and the user. If writing fails (the source was never
+created), the run warns once and carries on without the Event Log. Everything below is in `<wheelhouse>\reports\` and
 is deleted after `ReportRetentionMonths`.
 
 | File | Written by | Content |
@@ -720,6 +746,12 @@ is deleted after `ReportRetentionMonths`.
 | `Report_Rejected_<ts>.json` | Update-Wheelhouse | Every rejected pin with category and reason |
 | `Report_Scan_<ts>.json` | Every Defender scan (intake and on-demand) | Status, scanned paths, detections |
 | `Report_Integrity_<ts>.json` | Integrity check | What did not match the manifest |
+
+**Integrity check speed.** The weekly check hashes every wheel. An update only hashes wheels
+whose size or modification time changed since they were last verified (kept in
+`C:\WheelHouseManager\state\`, not on the share), so it holds the write lock for seconds even
+for a large wheelhouse; a missing wheel is always noticed. A change that keeps size and timestamp
+is caught by the next weekly check.
 | `Alert_<ts>.html` | Send-VulnerabilityAlert | Saved alert (no SMTP server) |
 
 Next to `reports\`, the wheelhouse holds `catalog.json` (current state, latest check results and
@@ -809,8 +841,7 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
   nobody published are acted on automatically (`AutoQuarantine`).
 - The share is not virus-scanned by this tool; that is the file server antivirus' job.
 - Severities come from OSV. An advisory rated only with CVSS 4 and no database rating counts as
-  High. `Update-Wheelhouse.ps1` / the pipeline still alert every vulnerable deployed audit; only
-  the weekly check's alerts are stateful.
+  High.
 - Email uses `Send-MailMessage` (no SMTP authentication).
 - Planned improvements are listed in [REFACTOR_PLAN.md](REFACTOR_PLAN.md).
 

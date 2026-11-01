@@ -134,7 +134,7 @@ catch {
     $outcome = 'ABORTED'
 }
 finally {
-    Stop-WheelhouseRun -Title $title -Outcome $outcome
+    Stop-WheelhouseRun -Title $title -Outcome $outcome -ExitCode $exitCode
 }
 
 $auditResults.ToArray()

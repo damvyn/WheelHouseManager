@@ -335,8 +335,9 @@ function Get-VulnerabilityAlertParameter {
         [string[]]$CheckError = @(),
 
         # Tracked findings (Get-CatalogFindingAlert). When given, they replace the
-        # Vulnerable audit reports: an alert is due only for findings with an AlertReason,
-        # and then lists every open finding.
+        # Vulnerable reports of published packages: an alert is due only for findings with
+        # an AlertReason, and then lists every open finding. Vulnerable candidate audits
+        # (Stage PreDownload - blocked before publishing) are still reported as reports.
         [AllowEmptyCollection()]
         [object[]]$Finding,
 
@@ -351,7 +352,7 @@ function Get-VulnerabilityAlertParameter {
     $useFindings = $PSBoundParameters.ContainsKey('Finding')
     $alertFindings = @()
     if ($useFindings) {
-        $vulnerable = @()
+        $vulnerable = @($vulnerable | Where-Object { $_.Stage -eq 'PreDownload' })
         if (@($Finding | Where-Object { $_ -and $_.AlertReason }).Count -gt 0) {
             $alertFindings = @($Finding | Where-Object { $_ -and ($_.AlertReason -or $_.Status -in 'Open', 'Overdue') })
         }

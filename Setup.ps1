@@ -41,6 +41,11 @@
 .PARAMETER TaskTime
     Local time of day, HH:mm (default 02:00).
 
+.PARAMETER EnableEventLog
+    Turn on the Windows Event Log (setting EventLog) and create its event source,
+    'WheelhouseManager' in the Application log. Creating the source needs an elevated
+    (Run as administrator) PowerShell; it is done once.
+
 .PARAMETER SkipDoctor
     Do not run the installation check ("whm doctor") at the end.
 
@@ -77,6 +82,8 @@ param(
 
     [ValidatePattern('^([01]\d|2[0-3]):[0-5]\d$')]
     [string]$TaskTime = '02:00',
+
+    [switch]$EnableEventLog,
 
     [switch]$SkipDoctor
 )
@@ -153,6 +160,8 @@ else {
     }
 }
 
+$setupFailed = $false
+
 # ---------------------------------------------------------------------------
 # Step 3: Input\ (created once - requirements.in/.txt are user data, never overwritten)
 # ---------------------------------------------------------------------------
@@ -170,10 +179,25 @@ Initialize-ManagerFile -Path (Join-Path $inputPath "requirements.in") -DefaultCo
 Initialize-ManagerFile -Path (Join-Path $inputPath "requirements.txt") -DefaultContent ""
 
 # ---------------------------------------------------------------------------
+# Step 3b (optional): the Windows Event Log
+# ---------------------------------------------------------------------------
+
+if ($EnableEventLog) {
+    try {
+        [void](Register-WheelhouseEventSource)
+        Set-WheelhouseSetting -SettingsPath $settingsPath -Updates @{ EventLog = $true }
+        Write-Log "Event Log enabled: Application log, source WheelhouseManager (IDs 1000-1004)." 'OK'
+    }
+    catch {
+        Write-Log "The event source could not be created ($($_.Exception.Message)). Run Setup.ps1 -EnableEventLog once from an elevated PowerShell." 'ERROR'
+        $setupFailed = $true
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Step 4 (optional): the weekly check's Scheduled Task
 # ---------------------------------------------------------------------------
 
-$setupFailed = $false
 if ($RegisterScheduledTask) {
     if (-not $TaskCredential) {
         $TaskCredential = Get-Credential -Message 'Account for the weekly check (needs read/write access to the wheelhouse share)' -UserName ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)

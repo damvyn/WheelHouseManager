@@ -115,7 +115,10 @@ function Invoke-WheelhouseSync {
             # Wheels removed or changed outside the manager (typically by the file server's
             # antivirus): with AutoQuarantine they are taken out here, so the rest keeps
             # working; without it they stop the run like any other integrity problem.
-            $changed = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $WheelhousePath -ReportsFolder $ReportsFolder -AllowChangedFiles:$AutoQuarantine)
+            # Quick: under the write lock, only files changed since their last verification are
+            # hashed; the weekly check hashes everything.
+            $integrityParams = @{ Manifest = $manifest; WheelhousePath = $WheelhousePath; ReportsFolder = $ReportsFolder; AllowChangedFiles = $AutoQuarantine; Quick = $true; CachePath = (Get-WheelhouseIntegrityCachePath -WheelhousePath $WheelhousePath) }
+            $changed = @(Assert-WheelhouseIntegrity @integrityParams)
             if ($changed.Count -gt 0) {
                 foreach ($notice in @(Resolve-WheelhouseIntegrityProblem -WheelhousePath $WheelhousePath -Problem $changed -AutoQuarantine -DenylistPath $DenylistPath)) {
                     $notices.Add($notice)

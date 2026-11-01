@@ -35,6 +35,7 @@ function Get-WheelhouseDefaultSetting {
         AuditFreshnessDays           = 8
         OverdueReminderDays          = 7
         ApprovalMode                 = 'SamePersonAllowed'
+        EventLog                     = $false
     }
 }
 
@@ -262,6 +263,7 @@ function Get-WheelhouseSettingSchema {
         @{ Key = 'DueDaysLow'; Type = 'int'; Label = 'Fix within (days): Low'; Min = 1; Max = 365; Help = 'How long a Low vulnerability may stay open.' }
         @{ Key = 'WaiverMaxDays'; Type = 'int'; Label = 'Longest waiver (days)'; Min = 1; Max = 365; Help = 'An accepted risk must be reviewed again after at most this many days.' }
         @{ Key = 'AuditFreshnessDays'; Type = 'int'; Label = 'Audit freshness (days)'; Min = 1; Max = 365; Help = 'A published version without a completed audit for this long is Unverified and alerted; the UI warns when the scheduled check has not run for this long.' }
+        @{ Key = 'EventLog'; Type = 'bool'; Label = 'Write to the Windows Event Log'; Help = 'On: run results (IDs 1000 OK, 1001 needs attention, 1002 failed), automatic actions (1003) and changes by people (1004) also go to the Application log, source WheelhouseManager, for central monitoring. The source is created by Setup.ps1 -EnableEventLog, run once as administrator.' }
         @{ Key = 'ApprovalMode'; Type = 'choice'; Label = 'Approval of changes'; Options = @('SamePersonAllowed', 'SeparateApprover'); Help = 'Who may approve a resolved requirements.txt (or a fix) before it is published. SamePersonAllowed: anyone, also whoever requested it - publishing counts as approving; who did it is recorded. SeparateApprover: another account than the requester must approve it first.' }
         @{ Key = 'OverdueReminderDays'; Type = 'int'; Label = 'Overdue reminder (days)'; Min = 1; Max = 365; Help = 'An overdue vulnerability is alerted again after this many days. New, overdue and resolved findings are alerted once.' }
     )

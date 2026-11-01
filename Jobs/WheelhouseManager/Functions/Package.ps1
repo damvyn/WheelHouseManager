@@ -695,6 +695,7 @@ function Resolve-WheelhouseIntegrityProblem {
                     $action = "Check the file server's antivirus log and quarantine for this file. If it was a false positive, remove the version from the denylist and run Update-Wheelhouse.ps1 to download a verified copy; otherwise keep it blocked and pin another version."
                 }
                 Write-Log "${key}: $message" 'ERROR'
+                Write-WheelhouseEventLog -Id 1003 -Message "${key}: $message"
             }
             catch {
                 $message = "The published wheel was $(if ($modified) { 'changed' } else { 'removed' }) outside the manager, and it could not be taken out automatically: $($_.Exception.Message)"
@@ -752,6 +753,7 @@ function Move-UntrackedWheelFile {
             }
         }
         if ($moved.Count -gt 0) {
+            Write-WheelhouseEventLog -Id 1003 -Message "$($moved.Count) wheel(s) not published by the manager were moved out of the index to ${folder}: $($moved -join ', ')"
             Write-WheelhouseEvent -WheelhousePath $WheelhousePath -Action 'UntrackedMoved' -Detail "$($moved.Count) wheel(s) not in the manifest moved to $folder`: $($moved -join ', ')"
         }
     }
@@ -804,6 +806,7 @@ function Resolve-MaliciousPackage {
                 }
                 $done = Remove-WheelhousePackage @removeParams
                 $message = "OSV lists this version as a malicious package ($ids). It was quarantined, taken out of $(@($done.Groups).Count) group file(s) and denylisted."
+                Write-WheelhouseEventLog -Id 1003 -Message "${key}: $message"
                 $action = 'Find out which clients installed it (uv pip list) and treat those machines as compromised. Do not restore it unless the advisory is withdrawn.'
             }
             catch {

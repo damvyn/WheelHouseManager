@@ -89,6 +89,11 @@ function Get-WheelhouseIntegrityProblem {
     #   Modified   - the file's SHA256 differs from the one recorded when it was published
     #   Unreadable - the file could not be read to check it (network, permissions)
     #   Malformed  - the manifest record itself is broken
+    # -CachePath keeps, on the manager server (never on the share), the size, time and hash
+    # of every file verified; with -Quick a file whose size and modification time are what was
+    # verified last time is not hashed again (the update run). Without -Quick every file is
+    # hashed (the weekly check) - a timestamp can be forged, a full check catches that.
+    # -Statistics (a hashtable) receives Hashed and Skipped counts.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -96,8 +101,26 @@ function Get-WheelhouseIntegrityProblem {
         [object[]]$Manifest,
 
         [Parameter(Mandatory)]
-        [string]$WheelhousePath
+        [string]$WheelhousePath,
+
+        [string]$CachePath,
+
+        [switch]$Quick,
+
+        [hashtable]$Statistics = @{}
     )
+
+    $cache = @{}
+    if ($CachePath -and (Test-Path -LiteralPath $CachePath)) {
+        try {
+            $parsed = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $CachePath -Raw -ErrorAction Stop) -ErrorAction Stop
+            foreach ($property in $parsed.PSObject.Properties) { $cache[$property.Name] = $property.Value }
+        }
+        catch { Write-Log "The integrity cache could not be read and is rebuilt ($($_.Exception.Message))." 'WARN' }
+    }
+    $verified = [ordered]@{}
+    $Statistics['Hashed'] = 0
+    $Statistics['Skipped'] = 0
 
     foreach ($entry in $Manifest) {
         $label = "$($entry.name)==$($entry.version)"
@@ -113,7 +136,18 @@ function Get-WheelhouseIntegrityProblem {
             continue
         }
         try {
+            $item = Get-Item -LiteralPath $filePath -ErrorAction Stop
+            $known = $cache[[string]$fileValue]
+            if ($Quick -and $known -and [long]$known.length -eq $item.Length -and [long]$known.ticks -eq $item.LastWriteTimeUtc.Ticks -and [string]$known.sha256 -eq [string]$entry.sha256) {
+                $Statistics['Skipped']++
+                $verified[[string]$fileValue] = $known
+                continue
+            }
             $currentHash = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256 -ErrorAction Stop).Hash
+            $Statistics['Hashed']++
+            if ($currentHash -eq $entry.sha256) {
+                $verified[[string]$fileValue] = [ordered]@{ length = $item.Length; ticks = $item.LastWriteTimeUtc.Ticks; sha256 = $currentHash }
+            }
         }
         catch {
             [PSCustomObject]@{ Kind = 'Unreadable'; Entry = $entry; Message = "${label}: could not read '$fileValue' to verify its hash ($($_.Exception.Message))." }
@@ -123,6 +157,34 @@ function Get-WheelhouseIntegrityProblem {
             [PSCustomObject]@{ Kind = 'Modified'; Entry = $entry; Message = "${label}: file '$fileValue' hash MISMATCH (expected $($entry.sha256), got $currentHash)." }
         }
     }
+
+    if ($CachePath) {
+        try {
+            $folder = Split-Path -Path $CachePath -Parent
+            if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+            Write-JsonFile -Path $CachePath -InputObject $verified -Depth 3
+        }
+        catch { Write-Log "The integrity cache could not be saved ($($_.Exception.Message))." 'WARN' }
+    }
+}
+
+function Get-WheelhouseIntegrityCachePath {
+    # <manager root>\state\integrity-<hash of the wheelhouse path>.json - on the manager
+    # server, so whoever can write to the share cannot also vouch for a changed file.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [string]$ManagerRoot = $script:ManagerRoot
+    )
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([System.IO.Path]::GetFullPath($WheelhousePath).TrimEnd('\').ToLowerInvariant())) }
+    finally { $sha.Dispose() }
+    $id = -join ($bytes[0..7] | ForEach-Object { $_.ToString('x2') })
+    return Join-Path (Join-Path $ManagerRoot 'state') "integrity-$id.json"
 }
 
 function Test-ManifestIntegrity {
@@ -186,13 +248,21 @@ function Assert-WheelhouseIntegrity {
         [Parameter(Mandatory)]
         [string]$ReportsFolder,
 
-        [switch]$AllowChangedFiles
+        [switch]$AllowChangedFiles,
+
+        # See Get-WheelhouseIntegrityProblem.
+        [string]$CachePath,
+
+        [switch]$Quick
     )
 
     if ($Manifest.Count -eq 0) { return }
 
-    Write-Log 'Verifying wheelhouse integrity against manifest...'
-    $problems = @(Get-WheelhouseIntegrityProblem -Manifest $Manifest -WheelhousePath $WheelhousePath)
+    Write-Log "Verifying wheelhouse integrity against manifest$(if ($Quick) { ' (quick: files unchanged since they were last verified are not hashed again)' })..."
+    $statistics = @{}
+    $problemParams = @{ Manifest = $Manifest; WheelhousePath = $WheelhousePath; CachePath = $CachePath; Quick = $Quick; Statistics = $statistics }
+    $problems = @(Get-WheelhouseIntegrityProblem @problemParams)
+    Write-Log "$($statistics['Hashed']) file(s) hashed, $($statistics['Skipped']) unchanged since they were last verified."
 
     if ($problems.Count -gt 0) {
         $reportFile = Join-Path $ReportsFolder "Report_Integrity_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"

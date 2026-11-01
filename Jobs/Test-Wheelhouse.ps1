@@ -145,7 +145,9 @@ try {
         Write-Log 'Manifest is empty - no published wheels to verify. Group files are still audited.' 'OK'
     }
     else {
-        $changed = @(Assert-WheelhouseIntegrity -Manifest $manifest -WheelhousePath $cfg.WheelhousePath -ReportsFolder $reportsFolder -AllowChangedFiles)
+        # Full check (every file hashed); it refreshes what the updates' quick check relies on.
+        $integrityParams = @{ Manifest = $manifest; WheelhousePath = $cfg.WheelhousePath; ReportsFolder = $reportsFolder; AllowChangedFiles = $true; CachePath = (Get-WheelhouseIntegrityCachePath -WheelhousePath $cfg.WheelhousePath) }
+        $changed = @(Assert-WheelhouseIntegrity @integrityParams)
         if ($changed.Count -gt 0) {
             if ($takeOutChangedWheels) {
                 # Taking them out changes the manifest and group files: write lock, waiting
@@ -381,7 +383,7 @@ catch {
     $outcome = 'ABORTED'
 }
 finally {
-    Stop-WheelhouseRun -Title $title -Outcome $outcome
+    Stop-WheelhouseRun -Title $title -Outcome $outcome -ExitCode $exitCode
 }
 
 exit $exitCode

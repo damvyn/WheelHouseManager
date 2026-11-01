@@ -601,6 +601,12 @@ Denylist tabs and the package History).
 
 ### Phase 5 - Performance and hardening (S-M)
 
+**Done (2026-11-01):** quick integrity check for updates (cache of verified size/time/hash on the
+manager server; the weekly check stays full), Windows Event Log (IDs 1000-1004, optional), the
+update pipeline's change-only alerts, and - from Phase 4 - `index.html` on the share. No webhook
+notifier (D7). Still open: batched audits / cached PyPI metadata, signing `manifest.json` /
+`catalog.json`, splitting the test file.
+
 - Incremental integrity with a scheduled full check; batched audits and cached metadata.
 - Event Log output and a webhook notifier.
 - Optional: sign or HMAC `manifest.json`/`catalog.json`, with the key or a copy of the hash kept on the
@@ -639,5 +645,5 @@ depends on the catalog. After that, 3, 4 and 5 can be reordered by priority.
 | D4 | Can the manager server reach `api.osv.dev` (for severity) as well as `pypi.org`? | **Answered: yes.** Severities are looked up per advisory ID and cached; if OSV is unreachable in a run, cached answers are used and unknown ones count as High (Phase 2). |
 | D5 | Should a scheduled task re-scan the wheelhouse with Defender? | **Answered: no.** Virus scanning of the share is the file server antivirus' job and out of scope. Defender scanning a share also runs as the computer account and may skip network files, so such scans were removed. The tool scans new downloads locally at intake, offers on-demand scans of hash-checked local copies, and detects wheels the file server's antivirus removed or changed (integrity check -> `FileMissing`/`FileModified`, taken out with `AutoQuarantine`). |
 | D6 | Does uv's flat index ignore subfolders (needed for `_staging`, `_untracked`, `_quarantine`)? Today's `_quarantine` already relies on this. | Verify with the deployed uv version before Phase 0. |
-| D7 | Should alerts also go to Teams/Slack or the Event Log? | Webhook + Event Log in Phase 5. |
+| D7 | Should alerts also go to Teams/Slack or the Event Log? | **Answered:** Event Log yes (optional setting, done); no Teams/Slack webhooks. |
 | D8 | Should the CLI be one `whm.ps1` dispatcher, module cmdlets only, or both? | Both: cmdlets for scripting, `whm` for people. |

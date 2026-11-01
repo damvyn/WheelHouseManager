@@ -225,7 +225,7 @@ catch {
     $outcome = $(if ($exitCode -eq 3) { 'BUSY' } elseif ($_.Exception.Data['WheelhouseAwaitingApproval']) { 'WAITING FOR APPROVAL - nothing was published' } else { 'ABORTED' })
 }
 finally {
-    Stop-WheelhouseRun -Title $title -Outcome $outcome
+    Stop-WheelhouseRun -Title $title -Outcome $outcome -ExitCode $exitCode
 }
 
 if ($result) {

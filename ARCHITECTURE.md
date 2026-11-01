@@ -110,6 +110,7 @@ is the repo root; tests pass explicit paths (`-ManagerRoot`, `-StagingRoot`, `-S
 | `Input\requirements.txt` | Update-Requirement.ps1 (move of the candidate file) | uv output, exact pins | Unsupported lines are skipped with a warning |
 | `Input\requirements.candidate.txt` / `.rejected.txt` / `.constraints.tmp` | Update-Requirement.ps1 | transient / last rejected result / denylist as `!=` constraints | - |
 | `staging\<guid>\` | `Invoke-CandidateIntake` | downloads of one intake call; deleted in `finally` | - |
+| `state\integrity-<id>.json` | `Get-WheelhouseIntegrityProblem -CachePath` | size, timestamp and sha256 of every wheel last verified, per wheelhouse; on the manager server so the share's writers cannot vouch for a file | Warning, rebuilt |
 | `logs\ui\job<N>-step<M>.out.txt` / `.err.txt` | `Start-WheelhouseUiJobStep` | child stdout/stderr | - |
 
 ### 3.2 Wheelhouse (`WheelhousePath`)
@@ -242,6 +243,11 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
 28. **A fix replaces in place.** A remediation proposal's changed pins go into the group files that
     list the vulnerable version (swap, never a second group), and the vulnerable version is
     quarantined only when no group lists it any more and its replacement is published.
+
+29. **The weekly check hashes every wheel; updates may skip unchanged ones.** `Invoke-WheelhouseSync`
+    runs `Assert-WheelhouseIntegrity -Quick` (a file whose size and modification time match its
+    last verification is not hashed; missing files always count); `Test-Wheelhouse.ps1` hashes
+    everything and refreshes the cache. The cache never lives on the share.
 
 ---
 
@@ -611,12 +617,27 @@ request), `Get-WheelhouseUiToolStatus` (`Get-WheelhouseToolStatus` cached for 30
 |---|---|---|
 | `Invoke-WheelhouseSync` | the update run (section 9.2); returns `{Outcome Ok/Attention/Error; AuditResults; Notices; Rejected; Published}`; throws when it cannot start | Update-Wheelhouse.ps1 |
 
+### 8.21 Event Log and integrity cache
+
+| Function | File | Purpose |
+|---|---|---|
+| `Test-WheelhouseEventLogEnabled` | Common | setting `EventLog` on and no write failure in this process (no up-front `SourceExists`: without admin rights Windows cannot search for a missing source) |
+| `Write-WheelhouseEventLog` / `Write-WheelhouseEventLogEntry` | Common | write event 1000-1004 (level from the ID) when enabled; a failure warns once and disables it for the run / the mock seam around `EventLog.WriteEntry` |
+| `Register-WheelhouseEventSource` | Common | create source `WheelhouseManager` in Application (admin; `Setup.ps1 -EnableEventLog`) |
+| `Get-WheelhouseIntegrityCachePath` | Manifest | `<root>\state\integrity-<16 hex of sha256(wheelhouse path)>.json` |
+
+Writers of events: `Stop-WheelhouseRun -ExitCode` (1000/1001/1002, every script passes its exit
+code), `Resolve-WheelhouseIntegrityProblem`, `Resolve-MaliciousPackage`, `Move-UntrackedWheelFile`
+(1003), `Set-WheelhouseCatalogState`, `Save-WheelhouseProposal` (1004).
+
 ### 8.20 `Status.ps1`
 
 | Function | Purpose | Callers |
 |---|---|---|
 | `Get-WheelhouseStatus` | counts (published, open/overdue/waived findings, yanked, quarantined, unverified, untracked), last weekly check, current proposal, and `Attention[] {Level; Text; Target}` worst first (`Target` = UI tab or `packages:<filter>`); counts from the manifest while no catalog exists; read only | `whm status`, UI overview, doctor |
 | `Export-WheelhouseAdvisory` | `<wh>\advisories.json`: every version with an open/waived vulnerability or a yank, every quarantined/removed one, each with `status` and `recommended` (highest problem-free published version that is newer) | `Save-WheelhouseCatalog` (every save; a failure only warns) |
+| `Get-WheelhouseAdvisoryItem` | the versions to warn about, with `status` and `recommended` - shared by advisories.json and index.html | `Export-WheelhouseAdvisory` |
+| `Export-WheelhouseIndexPage` | `<wh>\index.html`: static page (no script) - available packages and versions, group files with install lines, "do not use" list, last weekly check; all text HTML-encoded | `Export-WheelhouseAdvisory` |
 | `Test-WheelhouseHealth` | doctor: settings, wheelhouse reachable + writable, mapped drive, tools, PyPI/OSV (unless `-Offline`), data files, journals, weekly check freshness, Scheduled Task, SMTP; `{Name; Level; Message; Fix}`; never throws | `whm doctor`, Setup.ps1 |
 
 `whm.ps1` (repo root, deployed by Setup.ps1 next to `Jobs\`) is a script, not module code: it
@@ -793,8 +814,8 @@ every other finding is reported and acting on it is an administrator decision.
 `Get-VulnerabilityAlertParameter` maps: `Vulnerable` -> `ReportPaths` (or, with `-Finding`, the
 tracked findings -> `Findings`, only when at least one has an `AlertReason`); `Error` +
 `CheckError` -> `AuditErrors` (`"<group> / <SERVICE>: <message>"`); notices -> `Notices`. The
-update pipeline still alerts from the reports (every Vulnerable deployed audit); only the weekly
-check is stateful.
+pipeline is stateful too: it passes `Get-CatalogFindingAlert` as `-Finding` and marks them after
+delivery; with `-Finding`, Vulnerable reports are kept only for `PreDownload` (blocked candidates).
 `Send-VulnerabilityAlert.ps1` -> `Get-VulnerabilityFinding` (group from the report name,
 `-candidates` suffix => blocked before download) -> HTML: notices table, findings table (deployed:
 line to remove + exact wheel files from the manifest; blocked: change `requirements.in`), errors
@@ -1206,9 +1227,8 @@ Which code runs for each user scenario (user steps are in the README):
 Known gaps (tracked in `REFACTOR_PLAN.md`): the catalog states are `Published`/`Quarantined`/`Removed`
 - flagged, waived, overdue and unverified are derived from the findings and audit times rather
 than stored states, and there is no `Pending` (cooldown) state; CVSS 4-only advisories without a
-database rating count as Unknown (= High); the update pipeline's alert is not stateful (only the
-weekly check is); no `advisories.json` for clients yet; integrity re-hashes every file every run (and
-does so under the write lock); `Send-MailMessage` has no authentication; expedite does not reach the
+database rating count as Unknown (= High); a change that keeps a wheel's size and timestamp is only
+caught by the weekly (full) integrity check; `Send-MailMessage` has no authentication; expedite does not reach the
 resolver (`Update-Requirement.ps1` still needs `-MinimumPackageAgeDays 0` for a too-new fix).
 
 | Term | Meaning |

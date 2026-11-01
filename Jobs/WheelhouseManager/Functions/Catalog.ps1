@@ -1086,6 +1086,7 @@ function Set-WheelhouseCatalogState {
         foreach ($item in $Change) {
             $name = Get-NormalizedPackageName $item.Name
             Write-WheelhouseEvent -WheelhousePath $WheelhousePath -Action $item.Action -Package $name -Version $item.Version -Detail $item.Detail
+            Write-WheelhouseEventLog -Id 1004 -Message "$($item.Action): $name==$($item.Version) - $($item.Detail)"
             $key = "$name==$($item.Version)"
             $record = $catalog.Records[$key]
             if (-not $record) {
