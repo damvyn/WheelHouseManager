@@ -888,49 +888,69 @@
   };
   function loadAudits() {
     var root = $('tab-audit');
+    state.auditOpen = state.auditOpen || {};
     return api('GET', '/api/audits').then(function (data) {
       clear(root);
       var reports = [].concat(data.reports || []);
       var onlyVulnerable = h('input', { type: 'checkbox', checked: !!state.auditOnlyVulnerable });
       onlyVulnerable.addEventListener('change', function () { state.auditOnlyVulnerable = onlyVulnerable.checked; loadAudits(); });
       root.append(h('div', { class: 'card' }, h('h2', {}, 'Audit reports'),
-        h('p', { class: 'muted' }, 'Every pip-audit run saves a report in ' + data.folder + '. They are kept for the report retention set in Settings. Open a report to see what it found.'),
+        h('p', { class: 'muted' }, 'Every pip-audit run saves a report in ' + data.folder + '. They are kept for the report retention set in Settings. Click a report to show or hide what it found.'),
         h('div', { class: 'toolbar' }, h('label', {}, onlyVulnerable, ' Only reports with vulnerabilities'),
           h('button', { class: 'btn', type: 'button', onclick: loadAudits }, 'Refresh'),
           h('span', { class: 'muted' }, reports.length + ' report(s)'))));
       var shown = state.auditOnlyVulnerable ? reports.filter(function (r) { return r.vulnerable > 0 || r.error; }) : reports;
-      var detail = h('div', { id: 'audit-detail' });
       if (shown.length === 0) {
         root.append(h('div', { class: 'table-wrap' }, h('div', { class: 'empty' }, reports.length ? 'No report found a vulnerability.' : 'No audit report yet. Audits run when packages are published, by the weekly check and from the Packages tab.')));
         return;
       }
-      root.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Run'), h('th', {}, 'Group'), h('th', {}, 'Service'), h('th', {}, 'Packages'), h('th', {}, 'Result'), h('th', {}, ''))),
-        h('tbody', {}, shown.map(function (r) {
-          var result = r.error ? badge('unreadable', 'bad', r.error)
-            : r.vulnerable > 0 ? badge(r.vulnerable + ' vulnerable (' + r.advisories + ' advisories)', 'bad') : badge('clean', 'ok');
-          return h('tr', { class: state.auditOpen === r.file ? 'selected' : '' },
-            h('td', {}, fmtDate(r.time)), h('td', {}, stageNames[r.stage] || r.stage), h('td', {}, r.group || h('span', { class: 'muted' }, '-')),
-            h('td', {}, r.service), h('td', { class: 'num' }, r.packages + (r.skipped ? ' (+' + r.skipped + ' skipped)' : '')), h('td', {}, result),
-            h('td', {}, h('button', { class: 'btn small', type: 'button', disabled: !!r.error, onclick: function () { state.auditOpen = r.file; loadAudits(); } }, 'Open')));
-        })))), detail);
-      if (state.auditOpen && shown.some(function (r) { return r.file === state.auditOpen; })) { showAuditReport(state.auditOpen, detail); }
+      var body = h('tbody', {});
+      shown.forEach(function (r) {
+        var result = r.error ? badge('unreadable', 'bad', r.error)
+          : r.vulnerable > 0 ? badge(r.vulnerable + ' vulnerable (' + r.advisories + ' advisories)', 'bad') : badge('clean', 'ok');
+        var caret = h('span', { class: 'caret' }, '▸');
+        var row = h('tr', { class: 'report-row', tabindex: '0', role: 'button', 'aria-expanded': 'false', title: 'Show or hide this report' },
+          h('td', {}, caret, ' ', fmtDate(r.time)), h('td', {}, stageNames[r.stage] || r.stage), h('td', {}, r.group || h('span', { class: 'muted' }, '-')),
+          h('td', {}, r.service), h('td', { class: 'num' }, r.packages + (r.skipped ? ' (+' + r.skipped + ' skipped)' : '')), h('td', {}, result));
+        var cell = h('td', { colspan: '6', class: 'report-detail' });
+        var detailRow = h('tr', { class: 'hidden' }, cell);
+        var loaded = false;
+        var toggle = function () {
+          var open = detailRow.classList.contains('hidden');
+          detailRow.classList.toggle('hidden', !open);
+          row.classList.toggle('selected', open);
+          row.setAttribute('aria-expanded', open ? 'true' : 'false');
+          caret.textContent = open ? '▾' : '▸';
+          if (open) { state.auditOpen[r.file] = true; } else { delete state.auditOpen[r.file]; }
+          if (open && !loaded) {
+            loaded = true;
+            if (r.error) { cell.append(h('p', { class: 'bad' }, r.error)); } else { showAuditReport(r.file, cell); }
+          }
+        };
+        row.addEventListener('click', toggle);
+        row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+        body.append(row, detailRow);
+        if (state.auditOpen[r.file]) { toggle(); }
+      });
+      root.append(h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Run'), h('th', {}, 'Group'), h('th', {}, 'Service'), h('th', {}, 'Packages'), h('th', {}, 'Result'))),
+        body)));
     }).catch(function (err) { clear(root); root.append(h('div', { class: 'empty' }, err.message)); });
   }
 
+  // What one report found, inside its expanded row: vulnerable packages with their advisories,
+  // then (folded) the clean and the skipped packages.
   function showAuditReport(file, box) {
+    box.append(h('p', { class: 'muted' }, 'Loading...'));
     api('GET', '/api/audits/' + encodeURIComponent(file)).then(function (r) {
       clear(box);
       var deps = [].concat(r.dependencies || []);
       var vulnerable = deps.filter(function (d) { return [].concat(d.vulns || []).length > 0; });
       var clean = deps.filter(function (d) { return [].concat(d.vulns || []).length === 0 && !d.skipped; });
       var skipped = deps.filter(function (d) { return d.skipped; });
-      var card = h('div', { class: 'card' },
-        h('div', { class: 'add-result-head' }, h('h2', {}, (stageNames[r.stage] || r.stage) + (r.group ? ' - ' + r.group : '') + ' (' + r.service + ')'),
-          h('span', { class: 'spacer' }), h('button', { class: 'btn small', type: 'button', onclick: function () { state.auditOpen = null; loadAudits(); } }, 'Close')),
-        h('p', { class: 'muted' }, fmtDate(r.time) + ' - ' + r.file));
+      box.append(h('p', { class: 'muted mono' }, r.file));
       if (vulnerable.length === 0) {
-        card.append(h('p', {}, badge('clean', 'ok'), ' No known vulnerability in the ' + r.packages + ' audited package(s).'));
+        box.append(h('p', {}, badge('clean', 'ok'), ' No known vulnerability in the ' + r.packages + ' audited package(s).'));
       } else {
         var rows = [];
         vulnerable.forEach(function (d) {
@@ -942,22 +962,20 @@
               h('td', { class: 'audit-desc' }, (v.description || '').replace(/#+\s*/g, '').replace(/\s+/g, ' ').trim())));
           });
         });
-        card.append(h('p', {}, badge(vulnerable.length + ' vulnerable', 'bad'), ' of ' + r.packages + ' audited package(s). Fix them from the package\'s History on the Packages tab.'),
+        box.append(h('p', {}, badge(vulnerable.length + ' vulnerable', 'bad'), ' of ' + r.packages + ' audited package(s). Fix them from the package\'s History on the Packages tab.'),
           h('div', { class: 'table-wrap scroll-list' }, h('table', {},
             h('thead', {}, h('tr', {}, h('th', {}, 'Package'), h('th', {}, 'Advisory'), h('th', {}, 'Fixed in'), h('th', {}, 'Description'))),
             h('tbody', {}, rows))));
       }
       if (clean.length) {
-        card.append(h('details', {}, h('summary', {}, 'Show the ' + clean.length + ' package(s) without findings'),
+        box.append(h('details', {}, h('summary', {}, 'Show the ' + clean.length + ' package(s) without findings'),
           h('ul', { class: 'result-list scroll-box' }, clean.map(function (d) { return h('li', { class: 'mono' }, d.name + '==' + d.version); }))));
       }
       if (skipped.length) {
-        card.append(h('details', {}, h('summary', {}, 'Show the ' + skipped.length + ' skipped package(s)'),
+        box.append(h('details', {}, h('summary', {}, 'Show the ' + skipped.length + ' skipped package(s)'),
           h('ul', { class: 'result-list scroll-box' }, skipped.map(function (d) { return h('li', {}, h('span', { class: 'mono' }, d.name + (d.version ? '==' + d.version : '')), ' - ', d.skipped); }))));
       }
-      box.append(card);
-      setTimeout(function () { card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 50);
-    }).catch(function (err) { clear(box); box.append(h('div', { class: 'empty' }, err.message)); });
+    }).catch(function (err) { clear(box); box.append(h('p', { class: 'bad' }, err.message)); });
   }
 
   // ---------------------------------------------------------------- quarantine tab

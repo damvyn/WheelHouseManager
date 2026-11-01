@@ -216,7 +216,13 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 /* A job is running: buttons that would start another one look disabled (their clicks are blocked). */
 body.job-running [data-idle] { opacity: .45; cursor: not-allowed; }
 /* Audit tab */
-#tab-audit .table-wrap.scroll-list { max-height: 360px; margin-bottom: 14px; }
+#tab-audit .table-wrap.scroll-list { max-height: 360px; margin: 8px 0; }
+.report-row { cursor: pointer; }
+.report-row:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.report-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.report-row .caret { display: inline-block; width: 1em; color: var(--muted); }
+td.report-detail { background: var(--bg); padding: 10px 16px 14px; }
+td.report-detail > p:first-child { margin-top: 0; }
 .audit-desc { max-width: 520px; color: var(--muted); font-size: 12.5px; }
 .scroll-box { max-height: 220px; overflow: auto; }
 /* Top bar pill while a job runs: a spinner and a light sweeping across, so it is clear work is going on. */
