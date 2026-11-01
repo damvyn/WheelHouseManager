@@ -296,3 +296,92 @@ function Test-RequirementWheelAvailability {
         Error       = $result.Error
     }
 }
+
+function ConvertTo-PackageVersionKey {
+    # A PEP 440 version split into comparable parts: epoch, release numbers, and a rank for
+    # dev < pre-release (a < b < rc) < final < post. Local versions (+...) are ignored.
+    # Returns $null for text that is not a version.
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Version
+    )
+
+    $text = $Version.Trim().ToLowerInvariant() -replace '^v', '' -replace '\+.*$', ''
+    $pattern = '^(?:(?<epoch>\d+)!)?(?<release>\d+(?:\.\d+)*)(?:[-_.]?(?<pre>a|alpha|b|beta|rc|c|pre|preview)[-_.]?(?<pren>\d*))?(?:(?:[-_.]?(?:post|rev|r)[-_.]?(?<post>\d*))|(?:-(?<post2>\d+)))?(?:[-_.]?dev[-_.]?(?<dev>\d*))?$'
+    if ($text -notmatch $pattern) { return $null }
+    $pre = switch ($Matches['pre']) {
+        { $_ -in 'a', 'alpha' } { 1 }
+        { $_ -in 'b', 'beta' } { 2 }
+        { $_ -in 'rc', 'c', 'pre', 'preview' } { 3 }
+        default { 4 }
+    }
+    $hasPost = [bool]($Matches['post'] -or $Matches['post2'] -or $text -match '(post|rev|r)\d*$')
+    $hasDev = $text -match 'dev\d*$'
+    return [PSCustomObject]@{
+        Epoch   = $(if ($Matches['epoch']) { [long]$Matches['epoch'] } else { 0 })
+        Release = [long[]]@($Matches['release'] -split '\.' | ForEach-Object { [long]$_ })
+        # A dev release of a final version sorts before its pre-releases.
+        Phase   = $(if ($hasDev -and $pre -eq 4 -and -not $hasPost) { 0 } else { $pre })
+        PhaseN  = $(if ($Matches['pren']) { [long]$Matches['pren'] } else { 0 })
+        Post    = $(if ($hasPost) { 1 + $(if ($Matches['post']) { [long]$Matches['post'] } elseif ($Matches['post2']) { [long]$Matches['post2'] } else { 0 }) } else { 0 })
+        Dev     = $(if ($hasDev) { $(if ($Matches['dev']) { [long]$Matches['dev'] } else { 0 }) } else { [long]::MaxValue })
+    }
+}
+
+function Compare-PackageVersion {
+    # -1, 0 or 1 like a comparer, for two PEP 440 versions. Throws for text that is not a
+    # version.
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Left,
+
+        [Parameter(Mandatory)]
+        [string]$Right
+    )
+
+    $a = ConvertTo-PackageVersionKey -Version $Left
+    $b = ConvertTo-PackageVersionKey -Version $Right
+    if ($null -eq $a) { throw [System.ArgumentException]::new("Not a version: '$Left'.") }
+    if ($null -eq $b) { throw [System.ArgumentException]::new("Not a version: '$Right'.") }
+    if ($a.Epoch -ne $b.Epoch) { return [math]::Sign($a.Epoch - $b.Epoch) }
+    $length = [math]::Max($a.Release.Count, $b.Release.Count)
+    for ($i = 0; $i -lt $length; $i++) {
+        $x = if ($i -lt $a.Release.Count) { $a.Release[$i] } else { 0 }
+        $y = if ($i -lt $b.Release.Count) { $b.Release[$i] } else { 0 }
+        if ($x -ne $y) { return [math]::Sign($x - $y) }
+    }
+    foreach ($part in 'Phase', 'PhaseN', 'Post') {
+        if ($a.$part -ne $b.$part) { return [math]::Sign($a.$part - $b.$part) }
+    }
+    if ($a.Dev -ne $b.Dev) { return $(if ($a.Dev -lt $b.Dev) { -1 } else { 1 }) }
+    return 0
+}
+
+function Set-RequirementInGroupFile {
+    # Replaces the pin of -Name in a group file with name==-Version (or adds it if the file
+    # does not list the name). Used when a remediation swaps a vulnerable version for its
+    # fix in the groups clients install from, instead of adding a second group.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$GroupFile,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$Version
+    )
+
+    $normalized = Get-NormalizedPackageName $Name
+    if (-not $PSCmdlet.ShouldProcess($GroupFile, "Set $normalized==$Version")) { return }
+    $listed = if (Test-Path -Path $GroupFile) { Read-RequirementFile -FilePath $GroupFile } else { @{} }
+    if ($listed[$normalized] -eq $Version) { return }
+    if ($listed.ContainsKey($normalized)) {
+        [void](Remove-RequirementFromGroupFile -GroupFile $GroupFile -Name $normalized -Version $listed[$normalized])
+    }
+    Add-RequirementToGroupFile -GroupFile $GroupFile -Name $normalized -Version $Version
+}

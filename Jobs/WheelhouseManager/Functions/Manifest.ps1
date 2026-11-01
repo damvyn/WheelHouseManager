@@ -82,6 +82,111 @@ function Save-WheelhouseManifest {
     }
 }
 
+function Get-WheelhouseIntegrityProblem {
+    # Compares every manifest entry with the file in the wheelhouse. Returns one object per
+    # problem: { Kind; Entry; Message } with Kind
+    #   Missing    - the file is gone (e.g. the file server's antivirus removed it)
+    #   Modified   - the file's SHA256 differs from the one recorded when it was published
+    #   Unreadable - the file could not be read to check it (network, permissions)
+    #   Malformed  - the manifest record itself is broken
+    # -CachePath keeps, on the manager server (never on the share), the size, time and hash
+    # of every file verified; with -Quick a file whose size and modification time are what was
+    # verified last time is not hashed again (the update run). Without -Quick every file is
+    # hashed (the weekly check) - a timestamp can be forged, a full check catches that.
+    # -Statistics (a hashtable) receives Hashed and Skipped counts.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Manifest,
+
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [string]$CachePath,
+
+        [switch]$Quick,
+
+        [hashtable]$Statistics = @{}
+    )
+
+    $cache = @{}
+    if ($CachePath -and (Test-Path -LiteralPath $CachePath)) {
+        try {
+            $parsed = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $CachePath -Raw -ErrorAction Stop) -ErrorAction Stop
+            foreach ($property in $parsed.PSObject.Properties) { $cache[$property.Name] = $property.Value }
+        }
+        catch { Write-Log "The integrity cache could not be read and is rebuilt ($($_.Exception.Message))." 'WARN' }
+    }
+    $verified = [ordered]@{}
+    $Statistics['Hashed'] = 0
+    $Statistics['Skipped'] = 0
+
+    foreach ($entry in $Manifest) {
+        $label = "$($entry.name)==$($entry.version)"
+        # Guard against a malformed 'file' field (should be plain text).
+        $fileValue = $entry.file
+        if ($fileValue -is [array]) {
+            [PSCustomObject]@{ Kind = 'Malformed'; Entry = $entry; Message = "${label}: manifest record has a malformed 'file' field (expected text, got a list: $($fileValue -join ', ')). Investigate manifest.json manually." }
+            continue
+        }
+        $filePath = Join-Path $WheelhousePath $fileValue
+        if (-not (Test-Path -LiteralPath $filePath)) {
+            [PSCustomObject]@{ Kind = 'Missing'; Entry = $entry; Message = "${label}: recorded file '$fileValue' is missing from the wheelhouse." }
+            continue
+        }
+        try {
+            $item = Get-Item -LiteralPath $filePath -ErrorAction Stop
+            $known = $cache[[string]$fileValue]
+            if ($Quick -and $known -and [long]$known.length -eq $item.Length -and [long]$known.ticks -eq $item.LastWriteTimeUtc.Ticks -and [string]$known.sha256 -eq [string]$entry.sha256) {
+                $Statistics['Skipped']++
+                $verified[[string]$fileValue] = $known
+                continue
+            }
+            $currentHash = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256 -ErrorAction Stop).Hash
+            $Statistics['Hashed']++
+            if ($currentHash -eq $entry.sha256) {
+                $verified[[string]$fileValue] = [ordered]@{ length = $item.Length; ticks = $item.LastWriteTimeUtc.Ticks; sha256 = $currentHash }
+            }
+        }
+        catch {
+            [PSCustomObject]@{ Kind = 'Unreadable'; Entry = $entry; Message = "${label}: could not read '$fileValue' to verify its hash ($($_.Exception.Message))." }
+            continue
+        }
+        if ($currentHash -ne $entry.sha256) {
+            [PSCustomObject]@{ Kind = 'Modified'; Entry = $entry; Message = "${label}: file '$fileValue' hash MISMATCH (expected $($entry.sha256), got $currentHash)." }
+        }
+    }
+
+    if ($CachePath) {
+        try {
+            $folder = Split-Path -Path $CachePath -Parent
+            if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+            Write-JsonFile -Path $CachePath -InputObject $verified -Depth 3
+        }
+        catch { Write-Log "The integrity cache could not be saved ($($_.Exception.Message))." 'WARN' }
+    }
+}
+
+function Get-WheelhouseIntegrityCachePath {
+    # <manager root>\state\integrity-<hash of the wheelhouse path>.json - on the manager
+    # server, so whoever can write to the share cannot also vouch for a changed file.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [string]$ManagerRoot = $script:ManagerRoot
+    )
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([System.IO.Path]::GetFullPath($WheelhousePath).TrimEnd('\').ToLowerInvariant())) }
+    finally { $sha.Dispose() }
+    $id = -join ($bytes[0..7] | ForEach-Object { $_.ToString('x2') })
+    return Join-Path (Join-Path $ManagerRoot 'state') "integrity-$id.json"
+}
+
 function Test-ManifestIntegrity {
     # Verifies every manifest file still exists and matches its recorded SHA256 hash.
     # Returns a list of problem descriptions (empty if everything matches).
@@ -96,32 +201,8 @@ function Test-ManifestIntegrity {
         [string]$WheelhousePath
     )
 
-    $problems = [System.Collections.Generic.List[string]]::new()
-    foreach ($entry in $Manifest) {
-        $label = "$($entry.name)==$($entry.version)"
-        # Guard against a malformed 'file' field (should be plain text).
-        $fileValue = $entry.file
-        if ($fileValue -is [array]) {
-            $problems.Add("${label}: manifest record has a malformed 'file' field (expected text, got a list: $($fileValue -join ', ')). Investigate manifest.json manually.")
-            continue
-        }
-        $filePath = Join-Path $WheelhousePath $fileValue
-        if (-not (Test-Path -Path $filePath)) {
-            $problems.Add("${label}: recorded file '$fileValue' is missing from the wheelhouse.")
-            continue
-        }
-        try {
-            $currentHash = (Get-FileHash -Path $filePath -Algorithm SHA256 -ErrorAction Stop).Hash
-        }
-        catch {
-            $problems.Add("${label}: could not read '$fileValue' to verify its hash ($($_.Exception.Message)).")
-            continue
-        }
-        if ($currentHash -ne $entry.sha256) {
-            $problems.Add("${label}: file '$fileValue' hash MISMATCH (expected $($entry.sha256), got $currentHash).")
-        }
-    }
-    Write-Output -NoEnumerate $problems.ToArray()
+    $problems = @(Get-WheelhouseIntegrityProblem -Manifest $Manifest -WheelhousePath $WheelhousePath | ForEach-Object { $_.Message })
+    Write-Output -NoEnumerate ([string[]]$problems)
 }
 
 function Get-UntrackedWheelFile {
@@ -147,9 +228,14 @@ function Get-UntrackedWheelFile {
 }
 
 function Assert-WheelhouseIntegrity {
-    # Verifies the wheelhouse against its manifest. On any mismatch: writes
-    # Report_Integrity_<timestamp>.json, logs every problem, and throws.
-    # Untracked wheel files are reported as a warning only.
+    # Verifies the wheelhouse against its manifest. Writes Report_Integrity_<timestamp>.json
+    # and logs every problem it finds. Untracked wheel files are reported as a warning only.
+    #
+    # Without -AllowChangedFiles any problem throws. With it, wheels that were removed
+    # (Missing) or changed (Modified) outside the manager - typically by the file server's
+    # antivirus - are returned as { Kind; Entry; Message } for the caller to deal with
+    # (Resolve-WheelhouseIntegrityProblem); only Unreadable and Malformed entries still throw,
+    # because nothing can be said about those files.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -160,26 +246,42 @@ function Assert-WheelhouseIntegrity {
         [string]$WheelhousePath,
 
         [Parameter(Mandatory)]
-        [string]$ReportsFolder
+        [string]$ReportsFolder,
+
+        [switch]$AllowChangedFiles,
+
+        # See Get-WheelhouseIntegrityProblem.
+        [string]$CachePath,
+
+        [switch]$Quick
     )
 
     if ($Manifest.Count -eq 0) { return }
 
-    Write-Log 'Verifying wheelhouse integrity against manifest...'
-    $problems = Test-ManifestIntegrity -Manifest $Manifest -WheelhousePath $WheelhousePath
+    Write-Log "Verifying wheelhouse integrity against manifest$(if ($Quick) { ' (quick: files unchanged since they were last verified are not hashed again)' })..."
+    $statistics = @{}
+    $problemParams = @{ Manifest = $Manifest; WheelhousePath = $WheelhousePath; CachePath = $CachePath; Quick = $Quick; Statistics = $statistics }
+    $problems = @(Get-WheelhouseIntegrityProblem @problemParams)
+    Write-Log "$($statistics['Hashed']) file(s) hashed, $($statistics['Skipped']) unchanged since they were last verified."
 
     if ($problems.Count -gt 0) {
         $reportFile = Join-Path $ReportsFolder "Report_Integrity_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-        Write-JsonFile -Path $reportFile -InputObject @($problems) -Depth 3
-
-        Write-Log 'WHEELHOUSE INTEGRITY CHECK FAILED. The following problem(s) were found:' 'ERROR'
+        Write-JsonFile -Path $reportFile -InputObject @($problems | ForEach-Object { [ordered]@{ kind = $_.Kind; package = "$($_.Entry.name)==$($_.Entry.version)"; file = [string]$_.Entry.file; message = $_.Message } }) -Depth 3
+        Write-Log 'WHEELHOUSE INTEGRITY CHECK found problem(s):' 'ERROR'
         foreach ($item in $problems) {
-            Write-Log "  - $item" 'ERROR'
+            Write-Log "  - [$($item.Kind)] $($item.Message)" 'ERROR'
         }
         Write-Log "Integrity report saved to: $reportFile" 'ERROR'
-        throw 'Wheelhouse integrity check failed - refusing to continue until this is investigated manually.'
+
+        $blocking = @($problems | Where-Object { -not $AllowChangedFiles -or $_.Kind -in 'Unreadable', 'Malformed' })
+        if ($blocking.Count -gt 0) {
+            throw 'Wheelhouse integrity check failed - refusing to continue until this is investigated manually.'
+        }
+        Write-Log "$($problems.Count) wheel(s) were removed or changed outside the manager (e.g. by the file server's antivirus); every other tracked file matches its recorded hash." 'WARN'
     }
-    Write-Log 'Wheelhouse integrity check passed. All tracked files match their recorded hash.' 'OK'
+    else {
+        Write-Log 'Wheelhouse integrity check passed. All tracked files match their recorded hash.' 'OK'
+    }
 
     $untracked = Get-UntrackedWheelFile -Manifest $Manifest -WheelhousePath $WheelhousePath
     if ($untracked.Count -gt 0) {
@@ -187,8 +289,10 @@ function Assert-WheelhouseIntegrity {
         foreach ($name in $untracked) {
             Write-Log "  - $name" 'WARN'
         }
-        Write-Log 'These are never added to the manifest automatically. Remove them and let Update-Wheelhouse.ps1 download them again if they are needed.' 'WARN'
+        Write-Log 'They are never added to the manifest automatically. With AutoQuarantine on they are moved to the _untracked folder; publish the packages you need through Update-Wheelhouse.ps1.' 'WARN'
     }
+
+    if ($AllowChangedFiles) { $problems }
 }
 
 function Merge-WheelhouseManifest {

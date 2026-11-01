@@ -289,9 +289,57 @@ function Invoke-GroupAudit {
     Write-Output -NoEnumerate $results
 }
 
+function Get-PyPIReleaseInfo {
+    # Reads one release from the PyPI JSON API (https://pypi.org/pypi/<name>/<version>/json):
+    # every file with its sha256 digest, upload time and yanked flag, plus whether the
+    # release itself is yanked. An exact pin still installs a yanked release (PEP 592), so
+    # callers must check that themselves. Throws if PyPI cannot be read or lists no files.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$Version
+    )
+
+    # Windows PowerShell 5.1 on older .NET Framework defaults to TLS 1.0/1.1, which
+    # pypi.org rejects - every check would then fail closed.
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+
+    $response = Invoke-RestMethod -Uri "https://pypi.org/pypi/$Name/$Version/json" -ErrorAction Stop
+    $files = @(foreach ($url in @($response.urls)) {
+            if ($null -eq $url) { continue }
+            [PSCustomObject]@{
+                FileName      = [string]$url.filename
+                Sha256        = [string]$url.digests.sha256
+                UploadTimeUtc = ConvertTo-UtcDateTime -Value $url.upload_time_iso_8601
+                Yanked        = [bool]$url.yanked
+                YankedReason  = [string]$url.yanked_reason
+            }
+        })
+    if ($files.Count -eq 0) {
+        throw 'No release files found for this version.'
+    }
+
+    return [PSCustomObject]@{
+        Name           = $Name
+        Version        = $Version
+        Files          = $files
+        FirstUploadUtc = ($files | Sort-Object UploadTimeUtc | Select-Object -First 1).UploadTimeUtc
+        Yanked         = [bool]$response.info.yanked
+        YankedReason   = [string]$response.info.yanked_reason
+    }
+}
+
 function Test-PackageAge {
-    # Checks each package's PyPI publish date against the minimum age. Unresolvable
-    # packages fail closed.
+    # Reads each package's PyPI release (Get-PyPIReleaseInfo) and checks its publish date
+    # - the first upload of the release - against the minimum age. Packages named in
+    # -Expedite skip the age requirement (urgent fixes); their result says so.
+    # Unresolvable packages fail closed. Each result also carries the release (files,
+    # digests, yanked), which the checks after the download need.
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -299,46 +347,48 @@ function Test-PackageAge {
         [hashtable]$Packages,
 
         [Parameter(Mandatory)]
-        [int]$MinimumAgeDays
+        [int]$MinimumAgeDays,
+
+        [AllowEmptyCollection()]
+        [string[]]$Expedite = @()
     )
 
     $tooNew = [System.Collections.Generic.List[string]]::new()
     $results = [System.Collections.Generic.List[object]]::new()
     $nowUtc = (Get-Date).ToUniversalTime()
 
-    # Windows PowerShell 5.1 on older .NET Framework defaults to TLS 1.0/1.1, which
-    # pypi.org rejects - every age check would then fail closed.
-    if ($PSVersionTable.PSEdition -ne 'Core') {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    }
-
     foreach ($name in ($Packages.Keys | Sort-Object)) {
         $version = $Packages[$name]
         try {
-            $response = Invoke-RestMethod -Uri "https://pypi.org/pypi/$name/$version/json" -ErrorAction Stop
-
-            if (-not $response.urls -or @($response.urls).Count -eq 0) {
-                throw 'No release files found for this version.'
-            }
-
-            $uploadTimeUtc = [DateTimeOffset]::Parse($response.urls[0].upload_time_iso_8601).UtcDateTime
+            $release = Get-PyPIReleaseInfo -Name $name -Version $version
+            $uploadTimeUtc = $release.FirstUploadUtc
             $ageDays = [math]::Floor(($nowUtc - $uploadTimeUtc).TotalDays)
-            $passed = $ageDays -ge $MinimumAgeDays
+            $expedited = $Expedite -contains $name
+            $passed = $expedited -or ($ageDays -ge $MinimumAgeDays)
+            $eligibleUtc = $uploadTimeUtc.AddDays($MinimumAgeDays)
 
             $results.Add([PSCustomObject]@{
                     Package             = $name
                     Version             = $version
-                    UploadDateUtc       = $uploadTimeUtc
+                    UploadDateUtc       = $uploadTimeUtc.ToString('o')
                     AgeDays             = $ageDays
                     MinimumRequiredDays = $MinimumAgeDays
+                    EligibleUtc         = $eligibleUtc.ToString('o')
+                    Expedited           = $expedited
                     Passed              = $passed
+                    Yanked              = $release.Yanked
+                    YankedReason        = $release.YankedReason
+                    Release             = $release
                 })
 
-            if ($passed) {
+            if ($expedited -and $ageDays -lt $MinimumAgeDays) {
+                Write-Log "Age check SKIPPED (expedited): $name==$version was published $ageDays day(s) ago (normally requires $MinimumAgeDays)." 'WARN'
+            }
+            elseif ($passed) {
                 Write-Log "Age check OK: $name==$version was published $ageDays day(s) ago (>= $MinimumAgeDays)." 'OK'
             }
             else {
-                Write-Log "Age check FAILED: $name==$version was published only $ageDays day(s) ago (requires $MinimumAgeDays)." 'WARN'
+                Write-Log "Age check FAILED: $name==$version was published only $ageDays day(s) ago (requires $MinimumAgeDays, eligible $($eligibleUtc.ToString('yyyy-MM-dd')))." 'WARN'
                 $tooNew.Add("$name==$version (published $ageDays day(s) ago, requires $MinimumAgeDays)")
             }
         }
@@ -350,7 +400,12 @@ function Test-PackageAge {
                     UploadDateUtc       = $null
                     AgeDays             = $null
                     MinimumRequiredDays = $MinimumAgeDays
+                    EligibleUtc         = $null
+                    Expedited           = $false
                     Passed              = $false
+                    Yanked              = $null
+                    YankedReason        = $null
+                    Release             = $null
                     Error               = $_.Exception.Message
                 })
             $tooNew.Add("$name==$version (could not verify publish date)")
@@ -358,4 +413,253 @@ function Test-PackageAge {
     }
 
     return @{ TooNew = $tooNew.ToArray(); Results = $results.ToArray() }
+}
+
+function Get-DeployedPackageNotice {
+    # Re-checks what is already published against conditions that can change after
+    # intake: the denylist (an entry added later) and PyPI's yanked flag (the release or
+    # one of the deployed files). Returns @{ Notices = Wheelhouse.Notice, ...; Errors =
+    # string, ...; Checked = { Package; Version; Yanked; Reason }, ... (every version whose
+    # PyPI data was read) }. A release whose PyPI data cannot be read is an error, never
+    # "not yanked".
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Manifest,
+
+        [AllowEmptyCollection()]
+        [object[]]$Denylist = @(),
+
+        [switch]$SkipYanked
+    )
+
+    $notices = [System.Collections.Generic.List[object]]::new()
+    $unreadable = [System.Collections.Generic.List[string]]::new()
+    $checked = [System.Collections.Generic.List[object]]::new()
+
+    $pins = [ordered]@{}
+    foreach ($entry in ($Manifest | Sort-Object name, version)) {
+        $key = "$($entry.name)==$($entry.version)"
+        if (-not $pins.Contains($key)) { $pins[$key] = [System.Collections.Generic.List[string]]::new() }
+        $pins[$key].Add([string]$entry.file)
+    }
+    if ($pins.Count -gt 0 -and -not $SkipYanked) {
+        Write-Log "Checking $($pins.Count) published package version(s) against the denylist and PyPI's yanked flag..."
+    }
+
+    foreach ($key in $pins.Keys) {
+        $name, $version = $key -split '==', 2
+        $files = $pins[$key].ToArray()
+
+        $blocked = Get-DenylistMatch -Name $name -Version $version -Denylist $Denylist
+        if ($blocked) {
+            $why = if ($blocked.reason) { ": $($blocked.reason)" } else { '' }
+            $notices.Add((New-WheelhouseNotice -Kind 'Denylisted' -Package $name -Version $version -File $files -Message "Blocked by the denylist ($($blocked.version), $($blocked.source))$why, but still published."))
+        }
+
+        if ($SkipYanked) { continue }
+        try {
+            $release = Get-PyPIReleaseInfo -Name $name -Version $version
+        }
+        catch {
+            $unreadable.Add("$key ($($_.Exception.Message))")
+            continue
+        }
+        $yankedFiles = @($release.Files | Where-Object { $_.Yanked -and $files -contains $_.FileName })
+        $isYanked = $release.Yanked -or $yankedFiles.Count -gt 0
+        $reason = ''
+        if ($isYanked) {
+            $reason = [string](@($release.YankedReason) + @($yankedFiles | ForEach-Object { $_.YankedReason }) | Where-Object { $_ } | Select-Object -First 1)
+            $text = if ($reason) { "Yanked on PyPI: $reason" } else { 'Yanked on PyPI (no reason given).' }
+            $notices.Add((New-WheelhouseNotice -Kind 'Yanked' -Package $name -Version $version -File $files -Message $text))
+        }
+        $checked.Add([PSCustomObject]@{ Package = $name; Version = $version; Yanked = $isYanked; Reason = $reason })
+    }
+
+    foreach ($notice in $notices) {
+        Write-Log "  $($notice.Kind): $($notice.Package)==$($notice.Version) - $($notice.Message)" 'WARN'
+    }
+    $errors = @()
+    if ($unreadable.Count -gt 0) {
+        $errors = @("PyPI yanked check could not be completed for $($unreadable.Count) package(s): $($unreadable -join '; ')")
+        Write-Log $errors[0] 'ERROR'
+    }
+    return @{ Notices = $notices.ToArray(); Errors = [string[]]$errors; Checked = $checked.ToArray() }
+}
+
+function Invoke-WheelhouseToolProbe {
+    # The version a tool reports, or $null if it is missing, fails or does not answer within
+    # 15 seconds (e.g. the Microsoft Store "python.exe" stub waiting for the Store). Mock seam
+    # for Get-WheelhouseToolStatus.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('python', 'pip-audit', 'uv')]
+        [string]$Name
+    )
+
+    $command = Get-Command $(if ($Name -eq 'uv') { 'uv' } else { 'python' }) -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { return $null }
+    $arguments = if ($Name -eq 'pip-audit') { '-m pip_audit --version' } else { '--version' }
+    $process = $null
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new($command.Source, $arguments)
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        # An inherited stdin that never closes (a background job, the UI's host) can keep a
+        # child waiting; give it an empty one.
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.CreateNoWindow = $true
+        $process = [System.Diagnostics.Process]::Start($startInfo)
+        $process.StandardInput.Close()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(15000)) {
+            try { $process.Kill() } catch { Write-Verbose "Could not stop $($command.Source): $($_.Exception.Message)" }
+            return $null
+        }
+        if ($process.ExitCode -ne 0) { return $null }
+        $text = (($stdout.Result + "`n" + $stderr.Result) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($text -match '(\d+(\.\d+)+)') { return $Matches[1] }
+        return [string]$text
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($process) { $process.Dispose() }
+    }
+}
+
+function Get-WheelhouseToolStatus {
+    # Whether the tools the scripts need are usable by the account running the UI:
+    # python (every audit, download and check), pip-audit (installed by the first run if
+    # missing) and uv (resolving requirements.in). One { name; available; version; level
+    # ok|warn|bad; message } per tool.
+    [CmdletBinding()]
+    param()
+
+    $python = Invoke-WheelhouseToolProbe -Name 'python'
+    $pipAudit = if ($python) { Invoke-WheelhouseToolProbe -Name 'pip-audit' } else { $null }
+    $uv = Invoke-WheelhouseToolProbe -Name 'uv'
+
+    [PSCustomObject]@{
+        name      = 'python'
+        available = [bool]$python
+        version   = [string]$python
+        level     = $(if ($python) { 'ok' } else { 'bad' })
+        message   = $(if ($python) { '' } else { 'Python was not found on the PATH of the account running the UI. Audits, publishing, scans of new downloads and the weekly check cannot run. Install Python on this server and restart the UI.' })
+    }
+    [PSCustomObject]@{
+        name      = 'pip-audit'
+        available = [bool]$pipAudit
+        version   = [string]$pipAudit
+        level     = $(if ($pipAudit) { 'ok' } elseif ($python) { 'warn' } else { 'bad' })
+        message   = $(if ($pipAudit) { '' } elseif ($python) { 'pip-audit is not installed for this Python. The first audit or update installs it (needs access to PyPI).' } else { 'pip-audit cannot run without Python.' })
+    }
+    [PSCustomObject]@{
+        name      = 'uv'
+        available = [bool]$uv
+        version   = [string]$uv
+        level     = $(if ($uv) { 'ok' } else { 'bad' })
+        message   = $(if ($uv) { '' } else { 'uv was not found on the PATH of the account running the UI. Adding packages (resolving requirements.in with Update-Requirement.ps1) does not work. Install uv on this server and restart the UI.' })
+    }
+}
+
+function Get-PyPIProjectRelease {
+    # Every release of a project on PyPI (https://pypi.org/pypi/<name>/json): { Version;
+    # FirstUploadUtc; Yanked } - Yanked when every file of the release is yanked. Releases
+    # without files are left out. Throws if PyPI cannot be read.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+    $response = Invoke-RestMethod -Uri "https://pypi.org/pypi/$([uri]::EscapeDataString($Name))/json" -TimeoutSec 60 -ErrorAction Stop
+    foreach ($property in $response.releases.PSObject.Properties) {
+        $files = @(@($property.Value) | Where-Object { $_ })
+        if ($files.Count -eq 0) { continue }
+        $times = @($files | ForEach-Object { ConvertTo-OptionalUtcDateTime -Value $_.upload_time_iso_8601 } | Where-Object { $_ } | Sort-Object)
+        [PSCustomObject]@{
+            Version        = [string]$property.Name
+            FirstUploadUtc = $(if ($times.Count -gt 0) { $times[0] } else { $null })
+            Yanked         = (@($files | Where-Object { -not $_.yanked }).Count -eq 0)
+        }
+    }
+}
+
+function Get-AuditChunk {
+    # The published versions packed into the fewest requirement sets pip-audit accepts: one
+    # version per package name per set, so set 1 holds every package's first version, set 2
+    # every second version, and so on. Returns ordered name -> version hashtables.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Manifest
+    )
+
+    $versions = [ordered]@{}
+    # Name and version, so the sets are the same on every run (5.1's sort is not stable).
+    foreach ($entry in ($Manifest | Sort-Object name, version)) {
+        $name = Get-NormalizedPackageName ([string]$entry.name)
+        if (-not $versions.Contains($name)) { $versions[$name] = [System.Collections.Generic.List[string]]::new() }
+        if (-not $versions[$name].Contains([string]$entry.version)) { $versions[$name].Add([string]$entry.version) }
+    }
+    $chunks = [System.Collections.Generic.List[object]]::new()
+    foreach ($name in $versions.Keys) {
+        for ($i = 0; $i -lt $versions[$name].Count; $i++) {
+            if ($chunks.Count -le $i) { $chunks.Add([ordered]@{}) }
+            $chunks[$i][$name] = $versions[$name][$i]
+        }
+    }
+    Write-Output -NoEnumerate $chunks.ToArray()
+}
+
+function Invoke-PublishedAudit {
+    # Audits published versions in as few pip-audit runs as possible: Get-AuditChunk packs
+    # them into sets (usually one or two, whatever the number of group files), each written to
+    # <reports>\audit-sets\<Stage>\published-<n>.txt and audited against every service with
+    # Invoke-GroupAudit. Results are per package version (Update-CatalogAuditResult), so it
+    # does not matter which set a version was in. Returns AuditResults (-NoEnumerate).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Manifest,
+
+        [Parameter(Mandatory)]
+        [string[]]$Services,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z]+$')]
+        [string]$Stage,
+
+        [Parameter(Mandatory)]
+        [string]$ReportsFolder
+    )
+
+    $chunks = Get-AuditChunk -Manifest $Manifest
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($chunks.Count -eq 0) {
+        Write-Output -NoEnumerate $results.ToArray()
+        return
+    }
+    $folder = Join-Path (Join-Path $ReportsFolder 'audit-sets') $Stage
+    if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $count = @($chunks | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+    Write-Log "Auditing $count published version(s) in $($chunks.Count) set(s) x $($Services.Count) service(s)..."
+    for ($i = 0; $i -lt $chunks.Count; $i++) {
+        $file = Join-Path $folder "published-$($i + 1).txt"
+        Write-TextFileAtomic -Path $file -Content (($chunks[$i].Keys | ForEach-Object { "$_==$($chunks[$i][$_])" }) -join "`r`n")
+        foreach ($result in (Invoke-GroupAudit -GroupFile $file -Services $Services -Stage $Stage -ReportsFolder $ReportsFolder)) { $results.Add($result) }
+    }
+    Write-Output -NoEnumerate $results.ToArray()
 }

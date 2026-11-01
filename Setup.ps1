@@ -5,8 +5,10 @@
 
 .DESCRIPTION
     Copies Jobs\ (the WheelhouseManager module, Update-Wheelhouse.ps1,
-    Update-Requirement.ps1, Test-Wheelhouse.ps1, Send-VulnerabilityAlert.ps1) and
-    Invoke-WheelhousePipeline.ps1 (deployed to the destination root, not Jobs\)
+    Update-Requirement.ps1, Test-Wheelhouse.ps1, Test-WheelhousePackage.ps1,
+    Invoke-WheelhouseScan.ps1, Start-WheelhouseUI.ps1, Send-VulnerabilityAlert.ps1; the module
+    folder includes the UI's Web\ files) and
+    whm.ps1 (deployed to the destination root, not Jobs\)
     from next to this script into -DestinationPath, creates config\settings.psd1
     if it doesn't exist yet, and creates an empty Input\requirements.in and
     Input\requirements.txt if they don't exist yet.
@@ -24,8 +26,35 @@
     config\settings.psd1 as the default for the other scripts. Optional on a
     re-run if it's already set - omit it to leave the existing value untouched.
 
+.PARAMETER RegisterScheduledTask
+    Also register (or replace) the weekly check's Scheduled Task, 'Wheelhouse Weekly Check',
+    running the deployed Jobs\Test-Wheelhouse.ps1 as -TaskCredential (asked for if omitted).
+    The account needs read/write access to the share and network access to PyPI and OSV;
+    its password is handed to Task Scheduler only.
+
+.PARAMETER TaskCredential
+    The account the weekly check runs as (DOMAIN\user and password).
+
+.PARAMETER TaskDays
+    Days of the week for the weekly check (default Sunday).
+
+.PARAMETER TaskTime
+    Local time of day, HH:mm (default 02:00).
+
+.PARAMETER EnableEventLog
+    Turn on the Windows Event Log (setting EventLog) and create its event source,
+    'WheelhouseManager' in the Application log. Creating the source needs an elevated
+    (Run as administrator) PowerShell; it is done once.
+
+.PARAMETER SkipDoctor
+    Do not run the installation check ("whm doctor") at the end.
+
 .EXAMPLE
     .\Setup.ps1 -WheelhousePath "\\server\share\wheelhouse"
+
+.EXAMPLE
+    # Deploy and schedule the weekly check (asks for the account's password)
+    .\Setup.ps1 -WheelhousePath "\\server\share\wheelhouse" -RegisterScheduledTask -TaskDays Sunday, Wednesday
 
 .EXAMPLE
     # Custom destination folder
@@ -42,7 +71,21 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$DestinationPath = "C:\WheelHouseManager",
 
-    [string]$WheelhousePath
+    [string]$WheelhousePath,
+
+    [switch]$RegisterScheduledTask,
+
+    [System.Management.Automation.PSCredential]$TaskCredential,
+
+    [ValidateSet('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')]
+    [string[]]$TaskDays = @('Sunday'),
+
+    [ValidatePattern('^([01]\d|2[0-3]):[0-5]\d$')]
+    [string]$TaskTime = '02:00',
+
+    [switch]$EnableEventLog,
+
+    [switch]$SkipDoctor
 )
 
 $sourceJobsPath = Join-Path $PSScriptRoot 'Jobs'
@@ -77,13 +120,22 @@ else {
 }
 Write-Log "Deployed Jobs\ scripts and the WheelhouseManager module to: $destJobsPath" "OK"
 
-$sourceOrchestratorPath = Join-Path $PSScriptRoot "Invoke-WheelhousePipeline.ps1"
-if (Test-Path -Path $sourceOrchestratorPath) {
-    Copy-Item -Path $sourceOrchestratorPath -Destination $DestinationPath -Force
-    Write-Log "Deployed Invoke-WheelhousePipeline.ps1 to: $DestinationPath" "OK"
+# Invoke-WheelhousePipeline.ps1 now lives in Jobs\ - remove the copy older versions put in the root.
+$oldPipeline = Join-Path $DestinationPath 'Invoke-WheelhousePipeline.ps1'
+if (-not $isSameFolder -and (Test-Path -LiteralPath $oldPipeline)) {
+    Remove-Item -LiteralPath $oldPipeline -Force
+    Write-Log "Removed the old $oldPipeline - it is in Jobs\ now; update any Scheduled Task that runs it." 'WARN'
 }
-else {
-    Write-Log "Invoke-WheelhousePipeline.ps1 not found next to Setup.ps1 - skipped." "WARN"
+
+foreach ($rootScript in @('whm.ps1')) {
+    $source = Join-Path $PSScriptRoot $rootScript
+    if (-not (Test-Path -Path $source)) {
+        Write-Log "$rootScript not found next to Setup.ps1 - skipped." "WARN"
+    }
+    elseif (-not $isSameFolder) {
+        Copy-Item -Path $source -Destination $DestinationPath -Force
+        Write-Log "Deployed $rootScript to: $DestinationPath" "OK"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -115,6 +167,8 @@ else {
     }
 }
 
+$setupFailed = $false
+
 # ---------------------------------------------------------------------------
 # Step 3: Input\ (created once - requirements.in/.txt are user data, never overwritten)
 # ---------------------------------------------------------------------------
@@ -131,5 +185,65 @@ $requirementsInDefault = @"
 Initialize-ManagerFile -Path (Join-Path $inputPath "requirements.in") -DefaultContent $requirementsInDefault
 Initialize-ManagerFile -Path (Join-Path $inputPath "requirements.txt") -DefaultContent ""
 
+# ---------------------------------------------------------------------------
+# Step 3b (optional): the Windows Event Log
+# ---------------------------------------------------------------------------
+
+if ($EnableEventLog) {
+    try {
+        [void](Register-WheelhouseEventSource)
+        Set-WheelhouseSetting -SettingsPath $settingsPath -Updates @{ EventLog = $true }
+        Write-Log "Event Log enabled: Application log, source WheelhouseManager (IDs 1000-1004)." 'OK'
+    }
+    catch {
+        Write-Log "The event source could not be created ($($_.Exception.Message)). Run Setup.ps1 -EnableEventLog once from an elevated PowerShell." 'ERROR'
+        $setupFailed = $true
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Step 4 (optional): the weekly check's Scheduled Task
+# ---------------------------------------------------------------------------
+
+if ($RegisterScheduledTask) {
+    if (-not $TaskCredential) {
+        $TaskCredential = Get-Credential -Message 'Account for the weekly check (needs read/write access to the wheelhouse share)' -UserName ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    }
+    if (-not $TaskCredential) {
+        Write-Log 'No account given - the Scheduled Task was not registered.' 'WARN'
+    }
+    else {
+        try {
+            $taskParams = @{
+                DayOfWeek   = $TaskDays
+                At          = $TaskTime
+                User        = $TaskCredential.UserName
+                Password    = $TaskCredential.Password
+                ManagerRoot = $DestinationPath
+            }
+            $task = Register-WheelhouseScheduledCheck @taskParams
+            Write-Log "Weekly check registered: $($TaskDays -join ', ') at $TaskTime as $($TaskCredential.UserName); next run $($task.NextRunTime)." 'OK'
+        }
+        catch {
+            Write-Log "The Scheduled Task could not be registered: $($_.Exception.Message)" 'ERROR'
+            $setupFailed = $true
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Step 5: check the installation ("whm doctor")
+# ---------------------------------------------------------------------------
+
+if (-not $SkipDoctor) {
+    Write-Log 'Checking the installation (whm doctor)...'
+    foreach ($check in @(Test-WheelhouseHealth -ManagerRoot $DestinationPath)) {
+        $level = switch ($check.Level) { 'ok' { 'OK' } 'warn' { 'WARN' } default { 'ERROR' } }
+        Write-Log ("{0,-24} {1}" -f $check.Name, $check.Message) $level
+        if ($check.Fix -and $check.Level -ne 'ok') { Write-Log "    -> $($check.Fix)" $level }
+    }
+}
+
 Write-Log "=== Wheelhouse manager setup finished ==="
-Write-Log "Next step: edit $(Join-Path $inputPath 'requirements.in'), then run Update-Requirement.ps1."
+Write-Log "Next step: edit $(Join-Path $inputPath 'requirements.in'), then run: $(Join-Path $DestinationPath 'whm.ps1') resolve   (whm help lists every command)"
+if ($setupFailed) { exit 2 }

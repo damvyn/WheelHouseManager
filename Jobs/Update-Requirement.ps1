@@ -20,6 +20,10 @@
     existing requirements.txt is left untouched, the rejected result is saved next to
     it as requirements.rejected.txt, and every unavailable package is listed.
 
+    Exit codes: 0 written; 1 the result was rejected (uv could not resolve it, or a
+    package has no usable wheel) - change requirements.in and run again; 2 the input
+    file, python or the platform mapping is missing.
+
     If called with no path parameters, both default to the Input\ folder next to
     this script's deployment (WheelHouseManager\Input\requirements.in / .txt) -
     the same files Setup.ps1 creates.
@@ -36,6 +40,15 @@
 
 .PARAMETER Platform
     Target wheel platform tag (default: settings.psd1's Platform, else win_amd64).
+
+.PARAMETER PreferCurrent
+    Keep the versions of the current requirements.txt wherever they still fit, so only what
+    has to change changes (uv prefers the pins of an existing output file). Used by
+    Invoke-WheelhouseRemediation.ps1: a fix should not upgrade unrelated packages.
+
+.PARAMETER NoProposal
+    Do not record a proposal for the result (Invoke-WheelhouseRemediation.ps1 records its
+    own, with what to replace and retire).
 
 .PARAMETER MinimumPackageAgeDays
     Cooldown window passed to `uv pip compile --exclude-newer`. Defaults to the value
@@ -69,7 +82,11 @@ param(
     [string]$Platform,
 
     [ValidateRange(0, 3650)]
-    [int]$MinimumPackageAgeDays
+    [int]$MinimumPackageAgeDays,
+
+    [switch]$PreferCurrent,
+
+    [switch]$NoProposal
 )
 
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
@@ -90,11 +107,15 @@ Write-Log "Target Python: $($cfg.PythonVersion) / $($cfg.Platform) | Cooldown: $
 if (-not (Test-Path -Path $cfg.RequirementsInPath)) {
     Write-Log "requirements.in not found: $($cfg.RequirementsInPath)" "ERROR"
     Write-Log "Run Setup.ps1 first, or pass -RequirementsInPath explicitly." "ERROR"
-    exit 1
+    exit 2
 }
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     Write-Log "Python was not found on this machine - it is needed to verify the resolved packages." "ERROR"
-    exit 1
+    exit 2
+}
+if (-not (Get-Command uv -CommandType Application -ErrorAction SilentlyContinue)) {
+    Write-Log "uv was not found on the PATH of this account - it resolves requirements.in. Install uv (https://docs.astral.sh/uv/) on this server; requirements.txt was not changed." "ERROR"
+    exit 2
 }
 
 try {
@@ -102,7 +123,7 @@ try {
 }
 catch {
     Write-Log $_.Exception.Message "ERROR"
-    exit 1
+    exit 2
 }
 
 # Resolve into a temporary file first - the real requirements.txt is only replaced
@@ -121,8 +142,24 @@ $compileArgs = @(
     "-o", $candidatePath
 )
 
+# Steer the resolver away from versions on the denylist (config\denylist.json).
+# Intake rejects them anyway; this lets uv pick a different version where one fits.
+$constraintsPath = Join-Path $targetFolder "requirements.constraints.tmp"
+[string[]]$constraintLines = Get-DenylistConstraintLine -Denylist @(Read-WheelhouseDenylist)
+if ($constraintLines.Count -gt 0) {
+    Set-Content -Path $constraintsPath -Value $constraintLines -Encoding ascii
+    $compileArgs += @("--constraints", $constraintsPath)
+    Write-Log "Excluding $($constraintLines.Count) denylisted version(s) from resolution."
+}
+
+if ($PreferCurrent -and (Test-Path -LiteralPath $cfg.RequirementsTxtPath)) {
+    # uv keeps the pins of an existing output file where they still satisfy requirements.in.
+    Copy-Item -LiteralPath $cfg.RequirementsTxtPath -Destination $candidatePath -Force
+    Write-Log 'Keeping the current versions wherever they still fit (only what has to change changes).'
+}
 Write-Log "Resolving with uv (binary wheels only, $($cfg.PythonVersion) / $uvPlatform)..."
 Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs
+Remove-Item -Path $constraintsPath -Force -ErrorAction SilentlyContinue
 
 if ($LASTEXITCODE -ne 0) {
     Write-Log "uv pip compile FAILED (exit code $LASTEXITCODE). Review the output above." "ERROR"
@@ -154,6 +191,14 @@ Move-Item -Path $candidatePath -Destination $cfg.RequirementsTxtPath -Force
 Remove-Item -Path $rejectedPath -Force -ErrorAction SilentlyContinue
 
 Write-Log "requirements.txt written successfully: $($cfg.RequirementsTxtPath)" "OK"
-Write-Log "Review it, get it approved, then run Update-Wheelhouse.ps1 to merge it into the central wheelhouse."
+if (-not $NoProposal) {
+    try {
+        [void](New-WheelhouseProposal -RequirementsPath $cfg.RequirementsTxtPath -Kind 'resolve')
+    }
+    catch {
+        Write-Log "The proposal could not be recorded ($($_.Exception.Message)); publishing will propose the file itself." 'WARN'
+    }
+}
+Write-Log "Review it, get it approved (UI: Add packages tab), then run Update-Wheelhouse.ps1 to merge it into the central wheelhouse."
 Write-Log "=== Update-Requirement finished ==="
 exit 0

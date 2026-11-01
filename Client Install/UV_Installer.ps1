@@ -14,6 +14,7 @@ $PkgName = 'Astral-uv-0.12.16'
 $ErrorActionPreference = 'Stop'
 
 function Start-ProductInstall {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param()
 

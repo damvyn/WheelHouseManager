@@ -80,7 +80,7 @@ jobs:
 
       - name: PSScriptAnalyzer
         run: |
-          $paths = 'Jobs', 'Tests', 'Setup.ps1', 'Invoke-WheelhousePipeline.ps1'
+          $paths = 'Jobs', 'Tests', 'Setup.ps1', 'whm.ps1'
           $findings = $paths | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurse -Settings ./PSScriptAnalyzerSettings.psd1 -Severity Warning, Error }
           $findings | Format-Table RuleName, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 200
           if ($findings) { exit 1 }
