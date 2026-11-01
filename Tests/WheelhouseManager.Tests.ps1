@@ -3003,7 +3003,8 @@ Describe 'WheelhouseManager' {
 
             # Nothing listed is waiting any more: refused.
             Set-Content -Path $txt -Value @('six==1.16.0', 'urllib3==2.5.0')
-            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/clear' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')).Status | Should -Be 409
+            $none = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/clear' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')
+            "$($none.Status) $($none.Body.error)" | Should -Match '^409 Nothing to clear'
 
             # Clearing the last requirement empties requirements.txt instead of resolving nothing.
             $global:WhmUiJobSteps = $null
