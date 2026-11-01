@@ -205,7 +205,7 @@ try {
                     param($catalog)
                     [void](Add-WheelhouseWaiver @waiverParams)
                     Set-CatalogFindingWaiver -Catalog $catalog -Waiver @(Read-WheelhouseWaiver)
-                }.GetNewClosure())
+                })
             Write-WhmLine "$($positional[1]) accepted for $($pin.Name)==$($pin.Version) for $($positional[2]) day(s)." 'ok'
         }
         'unwaive' {
@@ -217,7 +217,7 @@ try {
                     param($catalog)
                     $result.Removed = Remove-WheelhouseWaiver -Name $pin.Name -Version $pin.Version -Id $id
                     Set-CatalogFindingWaiver -Catalog $catalog -Waiver @(Read-WheelhouseWaiver)
-                }.GetNewClosure())
+                })
             if (-not $result.Removed) { throw 'No such waiver.' }
             Write-WhmLine "Waiver removed - $id is alerted again." 'ok'
         }

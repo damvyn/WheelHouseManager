@@ -255,7 +255,7 @@ try {
                 Update-CatalogPyPIResult -Catalog $catalog -Checked $catalogChecked
                 # The heartbeat the UI and Update-Wheelhouse.ps1 check.
                 $catalog.ScheduledCheckUtc = (Get-Date).ToUniversalTime().ToString('o')
-            }.GetNewClosure())
+            })
         $catalogRecorded = $true
     }
     catch {
@@ -349,7 +349,7 @@ try {
             Update-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath -Update ({
                     param($catalog)
                     Set-CatalogFindingNotified -Catalog $catalog -Finding $alerted
-                }.GetNewClosure())
+                })
         }
         catch {
             Write-Log "Could not record which findings were alerted ($($_.Exception.Message)); they are alerted again next run." 'WARN'

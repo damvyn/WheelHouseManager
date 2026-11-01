@@ -1392,6 +1392,21 @@ Describe 'WheelhouseManager' {
             }
             @($offenders) | Should -BeNullOrEmpty
         }
+
+        It 'never makes a closure in a script (Windows PowerShell 5.1 re-validates unbound parameters)' {
+            # Regression: the Scheduled Task runs Test-Wheelhouse.ps1 without -WheelhousePath;
+            # in 5.1 "{ ... }.GetNewClosure()" copied the empty [ValidateNotNullOrEmpty()]
+            # parameter into the closure, failed, and no result reached the catalog. A script
+            # block from a script sees the script's variables without a closure.
+            $root = Split-Path -Path $PSScriptRoot -Parent
+            $scripts = @(Get-ChildItem -Path (Join-Path $root 'Jobs') -Filter '*.ps1') + @(Get-ChildItem -Path $root -Filter '*.ps1')
+            $offenders = foreach ($file in $scripts) {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+                $calls = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Member.Value -eq 'GetNewClosure' }, $true)
+                foreach ($call in $calls) { "$($file.Name):$($call.Extent.StartLineNumber)" }
+            }
+            @($offenders) | Should -BeNullOrEmpty
+        }
     }
 
     Context 'Shared validation' {

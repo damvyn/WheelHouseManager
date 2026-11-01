@@ -1081,6 +1081,10 @@ codes in `Sync-WheelhouseUiJob`. When a check cannot run, report it (AuditResult
 - **A one-element array inside `$(if ...)` unrolls to a scalar** and serializes as a string - build
   lists with plain assignments before putting them in objects for JSON.
 - **`$PSBoundParameters.ContainsKey()`, not `.Contains()`.**
+- **No `.GetNewClosure()` in scripts.** 5.1 re-validates every copied variable, so an unbound
+  `[ValidateNotNullOrEmpty()]` parameter makes it throw (the weekly check's Scheduled Task runs
+  without `-WheelhousePath`). Script blocks passed to `Update-WheelhouseCatalog -Update` see the
+  script's variables anyway. Enforced by a test (Script hygiene).
 - **Splat from a variable** (`$p = ...; Cmd @p`); `Cmd @(expr)` passes an array argument, not a splat.
 - **With `$ErrorActionPreference = 'Stop'`, 5.1 turns a native stderr line into an error** -
   `Invoke-NativeCommand` sets `Continue` locally.

@@ -103,7 +103,7 @@ try {
                     Waiver      = $waivers
                 }
                 Update-CatalogAuditResult @recordParams
-            }.GetNewClosure())
+            })
     }
     catch {
         Write-Log "The results could not be recorded in the package catalog: $($_.Exception.Message)" 'ERROR'

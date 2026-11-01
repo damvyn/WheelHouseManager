@@ -175,7 +175,7 @@ if ($null -ne $findingAlerts -and $findingAlerts.Count -gt 0 -and $alertExitCode
         Update-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath -Update ({
                 param($catalog)
                 Set-CatalogFindingNotified -Catalog $catalog -Finding $alerted
-            }.GetNewClosure())
+            })
     }
     catch {
         Write-Log "Could not record which findings were alerted ($($_.Exception.Message)); they are alerted again next time." 'WARN'

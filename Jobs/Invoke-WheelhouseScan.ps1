@@ -71,7 +71,7 @@ try {
         Update-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath -Update ({
                 param($catalog)
                 Update-CatalogScanResult -Catalog $catalog -ScanResult $catalogScan
-            }.GetNewClosure())
+            })
     }
     catch {
         Write-Log "The result could not be recorded in the package catalog: $($_.Exception.Message)" 'ERROR'
