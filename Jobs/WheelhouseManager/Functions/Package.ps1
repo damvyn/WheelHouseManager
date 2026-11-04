@@ -1082,56 +1082,159 @@ function Set-RequirementInText {
     return @{ Problems = $problems.ToArray(); Requirements = $requirements.ToArray() }
 }
 
-function Remove-PublishedRequirementInLine {
-    # After an update run: takes out of requirements.in every requirement whose package is now
-    # in the wheelhouse at the version requirements.txt pins, so requirements.in only lists what
-    # is still waiting (new, rejected or in the cooldown). Comments stay. Nothing is removed
-    # when requirements.in changed after requirements.txt was resolved - the pins would not
-    # describe it. Returns the removed lines.
+function Get-RequirementTxtSource {
+    # Reads the "# via" annotations uv writes under each pin of requirements.txt: a hashtable
+    # normalized name -> string[] of what requires it ("-r <file>" for a requirement listed in
+    # the input, otherwise package names, normalized). A pin without an annotation gets an
+    # empty list.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $sources = @{}
+    $current = $null
+    $inList = $false
+    foreach ($raw in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $line = [string]$raw
+        if ($line -match '^(?<name>[A-Za-z0-9][A-Za-z0-9_.\-]*)\s*(\[[^\]]*\])?\s*==') {
+            $current = Get-NormalizedPackageName $Matches['name']
+            $sources[$current] = [System.Collections.Generic.List[string]]::new()
+            $inList = $false
+            continue
+        }
+        if (-not $current -or $line -notmatch '^\s+#\s*(?<text>.*)$') { $current = $null; $inList = $false; continue }
+        $text = $Matches['text'].Trim()
+        if ($text -eq 'via') { $inList = $true; continue }
+        if ($text -match '^via\s+(?<what>.+)$') { $text = $Matches['what'].Trim(); $inList = $false }
+        elseif (-not $inList) { continue }
+        if ($text -match '^-r\s') { $sources[$current].Add($text) }
+        elseif ($text -match '^(?<dep>[A-Za-z0-9][A-Za-z0-9_.\-]*)') { $sources[$current].Add((Get-NormalizedPackageName $Matches['dep'])) }
+    }
+    $result = @{}
+    foreach ($key in $sources.Keys) { $result[$key] = [string[]]$sources[$key].ToArray() }
+    return $result
+}
+
+function Test-RequirementTxtDirect {
+    # Whether a pin of requirements.txt was asked for (listed in the input) rather than only
+    # pulled in by another package. Without an annotation it counts as asked for.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Source
+    )
+    return ($Source.Count -eq 0) -or [bool](@($Source | Where-Object { $_ -match '^-r\s' }).Count)
+}
+
+function Remove-RequirementTxtPin {
+    # Takes pins out of requirements.txt (with their annotation lines), and then every pin that
+    # only the removed ones needed (from the "# via" annotations; a pin asked for directly is
+    # kept). Throws, before writing, when a name is not pinned. Returns the removed names.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path,
 
         [Parameter(Mandatory)]
-        [string]$RequirementsTxtPath,
+        [string[]]$Name
+    )
+
+    $sources = Get-RequirementTxtSource -Path $Path
+    $drop = @{}
+    foreach ($item in $Name) {
+        $normalized = Get-NormalizedPackageName $item
+        if (-not $sources.ContainsKey($normalized)) { throw [System.Collections.Generic.KeyNotFoundException]::new("'$normalized' is not pinned in requirements.txt.") }
+        $drop[$normalized] = $true
+    }
+    do {
+        $more = $false
+        foreach ($key in @($sources.Keys)) {
+            if ($drop.ContainsKey($key)) { continue }
+            $from = @($sources[$key])
+            if ($from.Count -eq 0 -or (Test-RequirementTxtDirect -Source $from)) { continue }
+            if (@($from | Where-Object { -not $drop.ContainsKey($_) }).Count -eq 0) { $drop[$key] = $true; $more = $true }
+        }
+    } while ($more)
+
+    $kept = [System.Collections.Generic.List[string]]::new()
+    $skipping = $false
+    foreach ($raw in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $line = [string]$raw
+        if ($line -match '^(?<name>[A-Za-z0-9][A-Za-z0-9_.\-]*)\s*(\[[^\]]*\])?\s*==') { $skipping = $drop.ContainsKey((Get-NormalizedPackageName $Matches['name'])) }
+        elseif ($line -notmatch '^\s+#') { $skipping = $false }
+        if (-not $skipping) { $kept.Add($line) }
+    }
+    if ($PSCmdlet.ShouldProcess($Path, "Remove $($drop.Count) pin(s)")) {
+        Write-TextFileAtomic -Path $Path -Content ($kept -join "`r`n")
+    }
+    Write-Output -NoEnumerate ([string[]]@($drop.Keys | Sort-Object))
+}
+
+function Get-RequirementCarryOver {
+    # The pins of the current requirements.txt that are still waiting to be published (not in
+    # the manifest), as "name==version" lines to resolve again together with requirements.in -
+    # which is emptied after every resolve, so they would otherwise drop out of requirements.txt.
+    # Left out: names requirements.in lists itself, and versions the denylist blocks. Without
+    # a reachable wheelhouse every pin counts as waiting.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RequirementsInPath,
 
         [Parameter(Mandatory)]
-        [string]$WheelhousePath
+        [string]$RequirementsTxtPath,
+
+        [AllowEmptyString()]
+        [string]$WheelhousePath,
+
+        [AllowEmptyCollection()]
+        [object[]]$Denylist = @()
     )
 
     $none = [string[]]@()
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or -not (Test-Path -LiteralPath $RequirementsTxtPath -PathType Leaf)) { Write-Output -NoEnumerate $none; return }
-    if ((Get-Item -LiteralPath $Path).LastWriteTimeUtc -gt (Get-Item -LiteralPath $RequirementsTxtPath).LastWriteTimeUtc) {
-        Write-Log 'requirements.in changed after requirements.txt was resolved - its published lines are left in place.' 'WARN'
-        Write-Output -NoEnumerate $none
-        return
-    }
-    $pins = @{}
-    if (([System.IO.File]::ReadAllText($RequirementsTxtPath)).Trim()) { $pins = Read-RequirementFile -FilePath $RequirementsTxtPath }
-    $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+    if (-not (Test-Path -LiteralPath $RequirementsTxtPath -PathType Leaf) -or -not ([System.IO.File]::ReadAllText($RequirementsTxtPath)).Trim()) { Write-Output -NoEnumerate $none; return }
+    $pins = Read-RequirementFile -FilePath $RequirementsTxtPath
     $published = @{}
-    foreach ($entry in $manifest) { $published["$(Get-NormalizedPackageName ([string]$entry.name))==$($entry.version)"] = $true }
+    if ($WheelhousePath -and (Test-Path -LiteralPath $WheelhousePath -PathType Container)) {
+        $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+        foreach ($entry in $manifest) { $published["$(Get-NormalizedPackageName ([string]$entry.name))==$($entry.version)"] = $true }
+    }
+    $inLines = @()
+    if (Test-Path -LiteralPath $RequirementsInPath -PathType Leaf) { $inLines = @(Get-Content -LiteralPath $RequirementsInPath) }
+    $carry = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in ($pins.Keys | Sort-Object)) {
+        $version = [string]$pins[$name]
+        if ($published.ContainsKey("$name==$version")) { continue }
+        if (Get-RequirementInLine -Lines ([string[]]$inLines) -Name $name) { continue }
+        if (Get-DenylistMatch -Name $name -Version $version -Denylist $Denylist) { continue }
+        $carry.Add("$name==$version")
+    }
+    Write-Output -NoEnumerate $carry.ToArray()
+}
+
+function Clear-RequirementInFile {
+    # After a successful resolve: requirements.in keeps only its comment lines (the header), so
+    # it lists just what is asked for next. Returns the requirement lines taken out.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
 
     $kept = [System.Collections.Generic.List[string]]::new()
     $removed = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
-        $spec = ([string]$line -replace '(^|\s)#.*$', '').Trim()
-        if ($spec -match '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)') {
-            $name = Get-NormalizedPackageName $Matches['name']
-            if ($pins.ContainsKey($name) -and $published.ContainsKey("$name==$($pins[$name])")) {
-                $removed.Add($spec)
-                continue
-            }
-        }
-        $kept.Add([string]$line)
+    foreach ($raw in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $line = [string]$raw
+        $spec = ($line -replace '(^|\s)#.*$', '').Trim()
+        if ($spec) { $removed.Add($spec) } elseif ($line.Trim()) { $kept.Add($line) }
     }
-    if ($removed.Count -gt 0 -and $PSCmdlet.ShouldProcess($Path, "Remove $($removed.Count) published requirement(s)")) {
-        $resolvedUtc = (Get-Item -LiteralPath $RequirementsTxtPath).LastWriteTimeUtc
+    if ($removed.Count -gt 0 -and $PSCmdlet.ShouldProcess($Path, "Clear $($removed.Count) requirement(s)")) {
         Write-TextFileAtomic -Path $Path -Content ($kept -join "`r`n")
-        # Taking out published lines does not make requirements.txt stale: keep the file's time
-        # at the resolve, so the next run still trusts the pins for the lines left.
-        (Get-Item -LiteralPath $Path).LastWriteTimeUtc = $resolvedUtc
     }
     Write-Output -NoEnumerate $removed.ToArray()
 }

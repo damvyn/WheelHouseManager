@@ -643,14 +643,14 @@
         renderProblems(output);
         if (!data.saved) { return; }
         state.add.draft = null;
-        if (data.job) { watchJob(data.job.id, false); } else { toast('requirements.in has no package left - nothing waits to be published.'); loadRequirements(); }
+        if (data.job) { watchJob(data.job.id, false); } else { toast('requirements.in saved. It lists no package, so there is nothing new to resolve.'); loadRequirements(); }
         loadRequirementsIn();
       }).catch(fail);
     });
     root.append(
       h('div', { class: 'card' },
         h('h2', {}, '1. Add packages'),
-        h('p', { class: 'muted' }, 'This is requirements.in: one requirement per line, for example numpy or pandas>=2.0. Edit it here and click Save and resolve: Update-Requirement.ps1 resolves it (with the cooldown) into requirements.txt. Nothing is downloaded yet: review the result below first. Once a package is published, its line is taken out of requirements.in, so this box lists only what is still waiting.'),
+        h('p', { class: 'muted' }, 'This is requirements.in: one requirement per line, for example numpy or pandas>=2.0. Edit it here and click Save and resolve: Update-Requirement.ps1 resolves it (with the cooldown) together with the pins still waiting below into requirements.txt. Nothing is downloaded yet: review the result below first. When the resolve succeeds, requirements.in is emptied - its packages are then listed below. When it fails, the box keeps the lines so you can fix them.'),
         specs,
         h('p', {}, h('label', {}, publishNow, ' Also publish right away (skips the review step)')),
         h('div', { class: 'toolbar' }, go, undo, info),
@@ -728,13 +728,13 @@
       card.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
         h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'), rejectedCount ? h('th', {}, '') : null)),
         h('tbody', {}, pending.map(function (p) {
-          // Only a pin the latest publish rejected can be taken out of requirements.in here; a
+          // Only a pin the latest publish rejected can be taken out of requirements.txt here; a
           // dependency of another requirement goes away only with that requirement.
           var action = null;
           if (p.rejected) {
             action = p.direct
-              ? h('button', { class: 'btn small danger', type: 'button', 'data-idle': true, title: 'Remove ' + p.name + ' from requirements.in and resolve again', onclick: function () { removeRequirement(p); } }, 'Remove')
-              : h('span', { class: 'muted', title: 'Not listed in requirements.in: another requirement depends on it' }, 'dependency');
+              ? h('button', { class: 'btn small danger', type: 'button', 'data-idle': true, title: 'Take ' + p.name + ' (and what only it needs) out of requirements.txt', onclick: function () { removeRequirement(p); } }, 'Remove')
+              : h('span', { class: 'muted', title: 'Not asked for: another package depends on it' }, 'dependency');
           }
           var status = !p.rejected ? badge('new', 'ok')
             : p.retryable ? [badge('waiting for cooldown', 'warn'), ' ', p.rejected] : [badge('rejected', 'bad'), ' ', p.rejected];
@@ -747,21 +747,21 @@
       var blocked = pending.filter(function (p) { return p.rejected && !p.retryable; }).length;
       var waiting = rejectedCount - blocked;
       if (blocked > 0) {
-        card.append(h('p', { class: 'muted' }, blocked + ' pin(s) were rejected by the latest publish for the reason shown and are not counted for publishing. Click Remove to take them out of requirements.in.'));
+        card.append(h('p', { class: 'muted' }, blocked + ' pin(s) were rejected by the latest publish for the reason shown and are not counted for publishing. Click Remove to take them out of requirements.txt.'));
       }
       if (waiting > 0) {
         card.append(h('p', { class: 'muted' }, waiting + ' pin(s) are newer than the cooldown. Publishing again adds them once the cooldown has passed; Remove takes them out if you do not want to wait.'));
       }
-      var clearable = pending.some(function (p) { return p.direct; });
+      var clearable = pending.length > 0;
       card.append(renderApproval(data.approval, publishable, clearable), whole);
     }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
   }
 
-  // Takes a package out of requirements.in and resolves requirements.txt again (a job).
+  // Takes a pin (and the pins only it needed) out of requirements.txt.
   function removeRequirement(p) {
     confirmDialog('Remove ' + p.name + '?', h('div', {},
-      h('p', {}, h('span', { class: 'mono' }, p.name), ' is taken out of requirements.in and requirements.txt is resolved again, so ', h('span', { class: 'mono' }, p.name + '==' + p.version), ' is no longer waiting to be published.'),
-      h('p', { class: 'muted' }, 'Nothing in the wheelhouse changes. If another requirement still depends on it, the resolver keeps a version of it.')), 'Remove', true).then(function (ok) {
+      h('p', {}, h('span', { class: 'mono' }, p.name + '==' + p.version), ' is taken out of requirements.txt, together with the dependencies only it needed, so it is no longer waiting to be published.'),
+      h('p', { class: 'muted' }, 'Nothing in the wheelhouse changes.')), 'Remove', true).then(function (ok) {
       if (!ok) { return; }
       api('POST', '/api/requirements/remove', { name: p.name }).then(function (data) {
         if (data.job) { watchJob(data.job.id, false); } else { toast(p.name + ' removed.'); loadRequirements(); }
@@ -844,11 +844,10 @@
     });
     buttons.append(publish);
     if (clearable) {
-      var clearList = h('button', { class: 'btn danger', type: 'button', 'data-idle': true, title: 'Take every package waiting here out of requirements.in' }, 'Clear list');
+      var clearList = h('button', { class: 'btn danger', type: 'button', 'data-idle': true, title: 'Take every package waiting here out of requirements.txt' }, 'Clear list');
       clearList.addEventListener('click', function () {
         confirmDialog('Clear the list?', h('div', {},
-          h('p', {}, 'Every package waiting here is taken out of requirements.in and requirements.txt is resolved again. Nothing in the wheelhouse changes.'),
-          h('p', { class: 'muted' }, 'Packages that are only dependencies of published packages stay, because those packages need them.')), 'Clear list', true).then(function (ok) {
+          h('p', {}, 'requirements.txt is emptied, so nothing waits to be published any more. Nothing in the wheelhouse changes.')), 'Clear list', true).then(function (ok) {
           if (!ok) { return; }
           api('POST', '/api/requirements/clear', {}).then(function (data) {
             if (data.job) { watchJob(data.job.id, false); } else { toast('The list is cleared.'); loadRequirements(); }
@@ -869,7 +868,7 @@
       card.append(h('h2', {}, 'Latest rejected packages'));
       if (state.highlightRejected) {
         state.highlightRejected = false;
-        card.append(h('p', { class: 'next-hint' }, 'These packages were not published. Each reason says what to change; fix it in requirements.in (step 1) and resolve again, or wait for the date given.'));
+        card.append(h('p', { class: 'next-hint' }, 'These packages were not published. Each reason says what to change: Remove them in step 2 and add a fitting requirement in step 1, or wait for the date given.'));
         highlight(card);
       } else {
         card.classList.remove('next-step');

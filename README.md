@@ -411,19 +411,21 @@ cd C:\WheelHouseManager
 ### 5.1 Add packages (the normal workflow)
 
 1. **Ask for packages.** Add one requirement per line to `Input\requirements.in` - a name
-   (`numpy`) or a range (`pandas>=2.0`). The file lists what is still to be published: after a
-   publish (`Update-Wheelhouse.ps1` with the configured `requirements.txt`), every line whose
-   package is now in the wheelhouse is taken out. Lines that were rejected or wait for the
-   cooldown stay. Each resolve therefore checks the new packages against each other, not against
-   everything already published.
+   (`numpy`) or a range (`pandas>=2.0`). List only what is new: after every successful resolve of
+   the configured file, `requirements.in` is emptied down to its comment lines - its packages
+   are then in `requirements.txt`.
 2. **Resolve them.**
    ```powershell
    .\Update-Requirement.ps1
    ```
-   This writes `Input\requirements.txt` with exact pins for every package and dependency. If a
-   package has no wheel for your Python/platform, nothing is changed: the problem packages are
-   listed, the attempt is saved as `Input\requirements.rejected.txt`, and you fix
-   `requirements.in` (remove the package or constrain its version) and run it again.
+   This writes `Input\requirements.txt` with exact pins for every package and dependency. The
+   pins of the old `requirements.txt` that are not published yet (and not denylisted) are
+   resolved again together with `requirements.in`, so nothing waiting is lost. Pins that are
+   already published are not, so a resolve checks the new packages against what is waiting, not
+   against everything in the wheelhouse. If the resolve fails (a version conflict, a package that
+   does not exist, no wheel for your Python/platform), nothing is changed and `requirements.in`
+   keeps its lines: the problem packages are listed, a wheel-check failure is saved as
+   `Input\requirements.rejected.txt`, and you fix `requirements.in` and run it again.
 3. **Review and approve.** Resolving records a **proposal** for exactly this `requirements.txt`
    (who requested it, when; `Input\proposal.json`, history in `Input\proposal-history.jsonl`).
    Only an approved proposal is published. Who may approve depends on `ApprovalMode`:
@@ -724,8 +726,8 @@ downloaded yet.
   or blocked by the denylist); the lines to fix are listed under the box.
 - An edit you have not saved yet stays in the box when you switch tabs (*Not saved yet*);
   **Discard changes** shows the file as it is again.
-- After a publish, the lines of packages that reached the wheelhouse are taken out of
-  `requirements.in`, so the box lists only what is still waiting.
+- When the resolve succeeds, `requirements.in` is emptied and the box with it: the packages are
+  now in step 2. When it fails, the lines stay in the box so you can fix them.
 - *Also publish right away* resolves and publishes in one go, skipping the review step.
 
 **2. Review and publish.** Lists only the resolved pins that are **not yet in the wheelhouse**
@@ -737,11 +739,11 @@ succeeds, the page scrolls to step 2 and highlights it.
   the latest publish rejected is not counted, except one rejected only for the cooldown (*waiting
   for cooldown*), which publishing adds once the cooldown has passed. When only rejected pins are
   left, the button reads *Nothing to publish*.
-- **Remove** on a rejected pin (when it is listed in `requirements.in`) takes it out of
-  `requirements.in` and resolves again. A rejected pin marked *dependency* is needed by another
-  requirement and goes away only with it.
-- **Clear list** takes every waiting package out of `requirements.in` at once (the wheelhouse
-  does not change). Clearing the last requirement empties `requirements.txt`.
+- **Remove** on a rejected pin takes it out of `requirements.txt`, together with the pins only it
+  needed (from the `# via` lines uv writes). A rejected pin marked *dependency* is needed by
+  another package and goes away only with it.
+- **Clear list** empties `requirements.txt`, so nothing waits any more (the wheelhouse does not
+  change).
 - With the default approval mode there is no separate Approve step - publishing records who
   published. With `ApprovalMode = SeparateApprover` the **Approve** / **Reject** buttons appear
   for the second person.
