@@ -15,8 +15,8 @@ function Invoke-WheelhouseSync {
     #   C. Invoke-CandidateIntake for every group (no lock); then every verified package
     #      that needs a rejected pin (requirements.txt's "# via" annotations,
     #      Get-DependentRejection) is held back; then Publish-CandidateIntake per group (write
-    #      lock for the seconds the publish takes); then one batched audit of everything
-    #      published before this run (Invoke-PublishedAudit);
+    #      lock for the seconds the publish takes). Only the candidates are audited and
+    #      scanned - published versions are the weekly check's job;
     #   R. remediation: quarantine the vulnerable version once no group lists it any more
     #      and its replacement is published (write lock);
     #   D. first-time setup only: adopt the wheels the folder already held (write lock);
@@ -60,6 +60,9 @@ function Invoke-WheelhouseSync {
         [string]$ExpediteReason = '',
 
         [switch]$RequireDefenderScan,
+
+        # No Defender scan of new downloads (setting DefenderScanAtIntake off).
+        [switch]$SkipDefenderScan,
 
         # Take out wheels removed or changed outside the manager instead of stopping.
         [bool]$AutoQuarantine = $true,
@@ -305,6 +308,7 @@ function Invoke-WheelhouseSync {
                     Denylist            = $denylist
                     Expedite            = $Expedite
                     RequireDefenderScan = [bool]$RequireDefenderScan
+                    SkipDefenderScan    = [bool]$SkipDefenderScan
                     StagingRoot         = $StagingRoot
                 }
                 $intake = Invoke-CandidateIntake @intakeParams
@@ -402,21 +406,9 @@ function Invoke-WheelhouseSync {
             }
         }
 
-        # Audit what was published before this run, in as few pip-audit runs as possible
-        # (whatever the number of group files). What this run published was just audited
-        # as a candidate.
-        $justPublished = @{}
-        foreach ($entry in $publishedAll) { $justPublished["$($entry.name)==$($entry.version)"] = $true }
-        $deployedManifest = @($manifest | Where-Object { -not $justPublished.ContainsKey("$($_.name)==$($_.version)") })
-        if ($deployedManifest.Count -gt 0) {
-            $deployedResults = Invoke-PublishedAudit -Manifest $deployedManifest -Services $Services -Stage 'Deployed' -ReportsFolder $ReportsFolder
-            foreach ($result in $deployedResults) { $auditResults.Add($result) }
-            if ($deployedResults | Where-Object { $_.Status -ne 'Passed' }) {
-                Write-Log 'Published packages have known vulnerabilities (or an incomplete audit).' 'ERROR'
-                $overallPassed = $false
-            }
-            if ($deployedResults | Where-Object { $_.Status -eq 'Error' }) { $auditIncomplete = $true }
-        }
+        # Only this run's candidates were audited and scanned. What was published before is
+        # re-audited by the weekly check (Test-Wheelhouse.ps1), and by the background audit
+        # whm and the UI start when the last one is older than AuditMaxAgeDays.
 
         foreach ($name in ($Expedite.Keys | Sort-Object)) {
             if (-not $expediteUsed.ContainsKey($name)) {

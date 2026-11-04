@@ -974,6 +974,18 @@ Describe 'WheelhouseManager' {
             $required.Accepted.Count | Should -Be 0
             (Get-RejectReason -Result $required)['clean'] | Should -Match '^\[defender\] the Defender scan could not be completed'
             @(Get-ChildItem -Path $strict -Filter '*.whl').Count | Should -Be 0
+
+            # Turned off (setting DefenderScanAtIntake): no scan at all, published - also
+            # when a scan would find something.
+            $global:WhmScanStatus = 'Threat'
+            $global:WhmThreatPackage = 'clean'
+            $off = Get-TestFolder
+            $params = Get-IntakeParam -Folder $off -Packages @{ clean = '1.0' }
+            $params['SkipDefenderScan'] = $true
+            $params['RequireDefenderScan'] = $true
+            $skipped = Invoke-TestIntake -Params $params
+            $skipped.Accepted.Count | Should -Be 1
+            $skipped.Intake.Scan | Should -BeNullOrEmpty
         }
 
         It 'fails closed when PyPI release data is unavailable' {
@@ -2116,6 +2128,41 @@ Describe 'WheelhouseManager' {
             }
         }
 
+        It 'tells when the audits of published versions are too old, and starts one audit at a time' {
+            $wheelhouse = New-TestVulnerableWheelhouse
+            $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
+            $now = (Get-Date).ToUniversalTime()
+            $age = Get-WheelhouseAuditAge -Catalog $catalog -MaxAgeDays 7 -NowUtc $now
+            $age.Stale | Should -Be $false
+            $age.Published | Should -Be 2
+            (Get-WheelhouseAuditAge -Catalog $catalog -MaxAgeDays 7 -NowUtc $now.AddDays(8)).Stale | Should -Be $true
+            (Get-WheelhouseAuditAge -Catalog $catalog -MaxAgeDays 7 -NowUtc $now.AddDays(8)).Message | Should -Match 'more than 7 day'
+            $catalog.Records['six==1.16.0'].checks.audit = $null
+            $never = Get-WheelhouseAuditAge -Catalog $catalog -MaxAgeDays 7 -NowUtc $now
+            $never.Stale | Should -Be $true
+            $never.Never | Should -Be 1
+            (Get-WheelhouseStatus -WheelhousePath $wheelhouse -AuditMaxAgeDays 7 -ProposalPath (Join-Path (Get-TestFolder) 'none.json')).AuditStale | Should -Be $false
+
+            # The background audit: one process at a time, remembered in state\.
+            $root = Get-TestFolder
+            New-Item -ItemType Directory -Path (Join-Path $root 'Jobs') | Out-Null
+            Set-Content -Path (Join-Path (Join-Path $root 'Jobs') 'Test-WheelhousePackage.ps1') -Value 'Start-Sleep -Seconds 20'
+            $first = Start-WheelhouseBackgroundAudit -WheelhousePath $wheelhouse -ManagerRoot $root
+            try {
+                $first.Started | Should -Be $true
+                $second = Start-WheelhouseBackgroundAudit -WheelhousePath $wheelhouse -ManagerRoot $root
+                $second.Started | Should -Be $false
+                $second.Message | Should -Match 'already running'
+                (Get-Content -Path (Join-Path (Join-Path $root 'state') 'background-audit.json') -Raw | ConvertFrom-Json).pid | Should -Be $first.ProcessId
+            }
+            finally { Stop-Process -Id $first.ProcessId -Force -ErrorAction SilentlyContinue }
+
+            # The freshness check starts nothing while the audits are recent.
+            $fresh = Invoke-WheelhouseAuditFreshnessCheck -WheelhousePath $wheelhouse -MaxAgeDays 7 -ManagerRoot $root
+            $fresh.Stale | Should -Be $false
+            $fresh.Started | Should -Be $false
+        }
+
         It 'summarizes what needs attention' {
             $wheelhouse = New-TestVulnerableWheelhouse
             $status = Get-WheelhouseStatus -WheelhousePath $wheelhouse -ProposalPath (Join-Path (Get-TestFolder) 'none.json')
@@ -2361,7 +2408,9 @@ Describe 'WheelhouseManager' {
             @($manifest | ForEach-Object { "$($_.name)==$($_.version)" } | Sort-Object) -join ',' |
                 Should -Be 'attrs==23.1.0,attrs==24.0,newpkg==1.0,six==1.16.0'
             @($result.Published).Count | Should -Be 2
-            @($result.AuditResults | Where-Object { $_.Stage -eq 'Deployed' }).Count | Should -Be 1
+            # Only the candidates are audited; what was published before is the weekly check's job.
+            @($result.AuditResults | Where-Object { $_.Stage -eq 'Deployed' }).Count | Should -Be 0
+            @($result.AuditResults | Where-Object { $_.Stage -eq 'PreDownload' }).Count | Should -BeGreaterThan 0
 
             $catalog = Read-WheelhouseCatalog -WheelhousePath $wheelhouse
             $catalog.Records['attrs==24.0'].state | Should -Be 'Published'

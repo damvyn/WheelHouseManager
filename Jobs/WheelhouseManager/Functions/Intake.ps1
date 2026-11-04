@@ -62,6 +62,10 @@ function Invoke-CandidateIntake {
         # publishing them with a warning.
         [switch]$RequireDefenderScan,
 
+        # Skip the Defender scan of the downloads (setting DefenderScanAtIntake off - test
+        # setups). Wins over -RequireDefenderScan.
+        [switch]$SkipDefenderScan,
+
         # Downloads wait here (one subfolder per run) until they passed every check. Kept
         # off the wheelhouse share, and off %TEMP%, whose 8.3 short names would not match
         # the long paths in Defender's detections.
@@ -239,7 +243,10 @@ function Invoke-CandidateIntake {
         }
 
         # --- 5. Defender scan of the staged files -------------------------------------
-        if ($filesByName.Count -gt 0) {
+        if ($filesByName.Count -gt 0 -and $SkipDefenderScan) {
+            Write-Log "The Defender scan at intake is turned off (setting DefenderScanAtIntake): $($filesByName.Count) package(s) are published without it." 'WARN'
+        }
+        elseif ($filesByName.Count -gt 0) {
             $scan = Invoke-WheelhouseDefenderScan -Path @($staging) -ReportsFolder $ReportsFolder
             if ($scan.Status -eq 'Threat') {
                 $threats = @($scan.Threats)

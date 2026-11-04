@@ -381,11 +381,11 @@ Exit: 0 written; 1 uv or the pip check rejected the result; 2 missing input / py
 Parameters: `WheelhousePath`, `LocalRequirementsPath` (`""` = no merge), `PythonVersion`,
 `Platform`, `MinimumPackageAgeDays`, `VulnerabilityServices`, `ExpeditePackage` (`name==ver`,
 array or comma string, parsed by `ConvertTo-WheelhousePin`), `ExpediteReason` (required with it).
-Also resolves `ReportRetentionMonths`, `RequireDefenderScanAtIntake`, `DueDays*`,
+Also resolves `ReportRetentionMonths`, `DefenderScanAtIntake` (off -> `-SkipDefenderScan`), `RequireDefenderScanAtIntake`, `DueDays*`,
 `AuditFreshnessDays`. The script only frames the
 run (transcript, `Confirm-PythonAndTooling`, exit code); `Invoke-WheelhouseSync` does the work -
 sequence in [9.2](#92-the-update-run-invoke-wheelhousesync). Output: AuditResults then Notices. Exit: 0; 1
-rejection / vulnerable deployed audit / wheel taken out because it was missing or changed on the share;
+rejection / wheel taken out because it was missing or changed on the share;
 2 aborted (including a missing/changed wheel with `-AutoQuarantine Off`) or any audit `Error`; 3 lock
 busy. `-AutoQuarantine On|Off` overrides the setting for the run.
 
@@ -666,7 +666,7 @@ code), `Resolve-WheelhouseIntegrityProblem`, `Resolve-MaliciousPackage`, `Move-U
 
 | Function | Purpose | Callers |
 |---|---|---|
-| `Get-WheelhouseStatus` | counts (published, open/overdue/waived findings, yanked, quarantined, unverified, untracked), last weekly check, current proposal, and `Attention[] {Level; Text; Target}` worst first (`Target` = UI tab or `packages:<filter>`); counts from the manifest while no catalog exists; read only | `whm status`, UI overview, doctor |
+| `Get-WheelhouseStatus` | counts (published, open/overdue/waived findings, yanked, quarantined, unverified, untracked), last weekly check, `AuditStale`/`OldestAuditUtc` (`-AuditMaxAgeDays`), current proposal, and `Attention[] {Level; Text; Target}` worst first (`Target` = UI tab or `packages:<filter>`); counts from the manifest while no catalog exists; read only | `whm status`, UI overview, doctor |
 | `Export-WheelhouseAdvisory` | `<wh>\advisories.json`: every version with an open/waived vulnerability or a yank, every quarantined/removed one, each with `status` and `recommended` (highest problem-free published version that is newer) | `Save-WheelhouseCatalog` (every save; a failure only warns) |
 | `Get-WheelhouseAdvisoryItem` | the versions to warn about, with `status` and `recommended` - shared by advisories.json and index.html | `Export-WheelhouseAdvisory` |
 | `Export-WheelhouseIndexPage` | `<wh>\index.html`: static page (no script) - available packages and versions, group files with install lines, "do not use" list, last weekly check; all text HTML-encoded | `Export-WheelhouseAdvisory` |
@@ -759,7 +759,7 @@ previous ones; `$reject` moves a package from `$remaining` to `Rejected` with a 
 | 2 | `Test-PackageAge` (PyPI release data) | `pypi-metadata`, `yanked`, `cooldown` (with eligible date) | `-Expedite` pins skip cooldown; `Report_PackageAge-*` (without the `Release` objects) |
 | 3 | `pip download -d <staging> --no-deps --only-binary=:all: --python-version --platform --implementation cp` via `Invoke-PipPinRetry` | `no-wheel`, `download` | staging = `<StagingRoot>\<guid>` |
 | 4 | Each staged file vs. the release's PyPI file list: listed, sha256 equal, not yanked, own upload date vs. cooldown (unless expedited) | `integrity`, `yanked`, `cooldown`, `pypi-metadata` | files claimed by no package are discarded |
-| 5 | `Invoke-WheelhouseDefenderScan` of the staging folder | `defender` | `Threat`: reject the package whose file path the detection names; an unmatched detection rejects all staged; `Error`: reject all with `-RequireDefenderScan`, else warn; a file that vanished during the scan is rejected |
+| 5 | `Invoke-WheelhouseDefenderScan` of the staging folder (skipped with `-SkipDefenderScan`, setting `DefenderScanAtIntake` off: WARN, no scan result recorded) | `defender` | `Threat`: reject the package whose file path the detection names; an unmatched detection rejects all staged; `Error`: reject all with `-RequireDefenderScan`, else warn; a file that vanished during the scan is rejected |
 
 `Invoke-CandidateIntake` stops here: it returns the verified staged files and leaves the staging
 folder for `Publish-CandidateIntake`, which runs under the write lock:
@@ -801,8 +801,8 @@ C [no lock]     Read-RequirementDependent(local)  (no annotations -> warning, no
    [write lock] Publish-CandidateIntake (9.1 steps 6-10) -> manifest refreshed
    [no lock]    rejections -> list (+ IntakeBlocked notice for integrity/defender; audit-error => incomplete)
   finally       staging folders of groups not published (a throw in between) are deleted
-   after all groups: Invoke-PublishedAudit -Stage Deployed over what was published before this
-                run (one set per "n-th version of a package", not one audit per group)
+   after all groups: (no audit of what was published before - the weekly check and the
+                background audit of 9.3a do that; only candidates were audited and scanned)
                 warn about unused -ExpeditePackage; write Report_Rejected_*
                 (B, if anything is added) Resolve-WheelhouseProposalForPublish -> refused: throw
                     (AwaitingApproval); a remediation proposal: its changed pins target the
@@ -848,6 +848,18 @@ exit: incomplete or alert failed -> 2; open (unwaived) findings or notices -> 1;
 
 It changes the wheelhouse only for the automatic actions of invariant 26 (with `AutoQuarantine`);
 every other finding is reported and acting on it is an administrator decision.
+
+### 9.3a Audit age check (`whm`, web UI start)
+
+Updates audit and scan only their candidates. `Invoke-WheelhouseStartupAuditCheck` (whm before
+every command except help/audit/check/ui/doctor; `Start-WheelhouseUiServer` on start) reads
+`WheelhousePath` and `AuditMaxAgeDays` from the settings -> `Invoke-WheelhouseAuditFreshnessCheck`
+-> `Get-WheelhouseAuditAge` (stale when a Published record's `checks.audit.last_run` is missing or
+older than the limit) -> `Start-WheelhouseBackgroundAudit`: `Test-WheelhousePackage.ps1` (every
+published version, results into the catalog, no alert) as a hidden child process of the same
+PowerShell; `<manager root>\state\background-audit.json` (`pid`, `started_utc`) keeps it to one at
+a time (at most 6 h). Never throws; logs a WARN. `Get-WheelhouseStatus` adds the same message as an
+Attention item (Overview tab, `whm status`).
 
 ### 9.4 Alerting
 

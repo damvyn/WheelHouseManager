@@ -692,7 +692,7 @@ function Get-WheelhouseUiRoute {
             Wheelhouse = $true
             Handler    = {
                 param($Context, $Body, $Match)
-                $status = Get-WheelhouseStatus -WheelhousePath $Context.WheelhousePath -FreshnessDays ([int]$Context.Settings.AuditFreshnessDays) -ProposalPath $Context.ProposalPath
+                $status = Get-WheelhouseStatus -WheelhousePath $Context.WheelhousePath -FreshnessDays ([int]$Context.Settings.AuditFreshnessDays) -AuditMaxAgeDays ([int]$Context.Settings.AuditMaxAgeDays) -ProposalPath $Context.ProposalPath
                 $task = $null
                 try { $task = Get-WheelhouseScheduledCheck -ManagerRoot $Context.ManagerRoot } catch { Write-Verbose "Task Scheduler unreadable: $($_.Exception.Message)" }
                 # Plain assignment: one-element lists must stay lists in the JSON.
@@ -1610,6 +1610,9 @@ function Start-WheelhouseUiServer {
     $url = "http://localhost:$Port/?t=$Token"
     Write-Log "Wheelhouse UI is running. Open: $url" 'OK'
     Write-Log 'It accepts connections from this computer only. Press Ctrl+C here, or use the Stop button in the page, to stop it.'
+    # Audits older than AuditMaxAgeDays: say so and start one in the background (the
+    # Overview tab lists it too).
+    [void](Invoke-WheelhouseStartupAuditCheck -ManagerRoot $ManagerRoot)
     if (-not $NoBrowser) {
         try { Start-Process -FilePath $url } catch { Write-Log "Could not open the browser automatically: $($_.Exception.Message)" 'WARN' }
     }
