@@ -10,12 +10,43 @@
   } catch (e) { /* storage blocked: the token stays in memory only */ }
   if (params.has('t')) { history.replaceState(null, '', location.pathname + location.hash); }
 
+  // Busy feedback for every request: a bar sweeps under the top bar while one is in flight
+  // (after a short delay, so quick reads do not flicker), and the button whose click sent a
+  // change spins until the answer comes. Job polling does not count - the top bar pill and
+  // setJobRunning show a running job.
+  var busy = { count: 0, timer: null, button: null, buttonTime: 0 };
+  document.addEventListener('click', function (e) {
+    var b = e.target && e.target.closest ? e.target.closest('button') : null;
+    if (b) { busy.button = b; busy.buttonTime = Date.now(); }
+  }, true);
+  function showBusy() {
+    var bar = document.getElementById('busybar');
+    if (bar) { bar.classList.toggle('active', busy.count > 0 || document.body.classList.contains('job-running')); }
+  }
+  function busyStart(method, path) {
+    if (/^\/api\/jobs/.test(path)) { return null; }
+    busy.count++;
+    if (!busy.timer) { busy.timer = setTimeout(function () { busy.timer = null; showBusy(); }, method === 'GET' ? 250 : 0); }
+    // The clicked button spins only for a change sent right after the click (or a dialog's OK).
+    var b = method !== 'GET' && busy.button && Date.now() - busy.buttonTime < 2000 && busy.button.isConnected ? busy.button : null;
+    if (b) { b.classList.add('loading'); b.setAttribute('aria-busy', 'true'); }
+    busy.button = null;
+    return function () {
+      busy.count = Math.max(0, busy.count - 1);
+      if (b) { b.classList.remove('loading'); b.removeAttribute('aria-busy'); }
+      if (busy.count === 0 && busy.timer) { clearTimeout(busy.timer); busy.timer = null; }
+      showBusy();
+    };
+  }
+
   function api(method, path, body) {
     var opts = { method: method, headers: { 'X-Wheelhouse-Token': token || '' } };
     if (method !== 'GET') {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body || {});
     }
+    var done = busyStart(method, path);
+    var finish = function (value) { if (done) { done(); done = null; } return value; };
     return fetch(path, opts).then(function (res) {
       return res.text().then(function (text) {
         var data = null;
@@ -27,7 +58,7 @@
         }
         return data;
       });
-    });
+    }).then(finish, function (err) { finish(); throw err; });
   }
 
   // ---------------------------------------------------------------- helpers
@@ -1370,6 +1401,7 @@
     // While a job runs, requirements.in cannot be edited either (step 1 of the Add tab).
     var box = $('requirements-in');
     if (box) { box.readOnly = !!running; }
+    showBusy();
   }
   document.addEventListener('click', function (e) {
     if (!document.body.classList.contains('job-running')) { return; }

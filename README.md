@@ -676,6 +676,10 @@ C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -Port 9000 -NoBrowser
 C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -KeepInput         # keep Input\requirements.*
 ```
 
+While the UI works on something - a request such as removing a package or editing the denylist,
+or a job such as an audit - a bar sweeps under the top bar, and the button you clicked shows a
+spinner until the server answers. A running job also shows in the pill at the top right.
+
 Every start empties `Input\requirements.in` (down to its comment header) and
 `Input\requirements.txt`, so the Add packages tab starts fresh. Use `-KeepInput` when a
 `requirements.txt` waits for a second person's approval (`ApprovalMode = SeparateApprover`).
