@@ -921,7 +921,8 @@ function Add-RequirementInLine {
     # the denylist blocks outright, and names that are already listed - unless -Replace,
     # which then swaps the listed line for the new spec (to change a version range that
     # makes the resolve fail). Returns @{ Added = string[]; Replaced = string[];
-    # Skipped = [{Spec; Reason; Replaceable}] }; nothing is written if nothing changes.
+    # Skipped = [{Spec; Reason; Replaceable; AlreadyListed}] }; AlreadyListed marks a spec
+    # that is in requirements.in exactly as entered. Nothing is written if nothing changes.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -951,7 +952,7 @@ function Add-RequirementInLine {
     foreach ($raw in $Spec) {
         $item = ([string]$raw).Trim()
         if (-not (Test-PackageSpec -Spec $item)) {
-            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = 'not a valid requirement (use a name with an optional version, e.g. numpy or pandas>=2.0)'; Replaceable = $false })
+            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = 'not a valid requirement (use a name with an optional version, e.g. numpy or pandas>=2.0)'; Replaceable = $false; AlreadyListed = $false })
             continue
         }
         $null = $item -match '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(?<rest>.*)$'
@@ -963,14 +964,14 @@ function Add-RequirementInLine {
             $listed = ($current.Line -replace '(^|\s)#.*$', '').Trim()
             $same = $listed.Replace(' ', '') -eq $item.Replace(' ', '')
             if ($same -or -not $Replace) {
-                $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "'$name' is already listed in requirements.in as '$listed'"; Replaceable = (-not $same) })
+                $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "'$name' is already listed in requirements.in as '$listed'"; Replaceable = (-not $same); AlreadyListed = $same })
                 continue
             }
         }
         $pinned = if ($rest -match '^==(?<v>[^,*]+)$') { $Matches['v'] } else { $null }
         $blocked = if ($pinned) { Get-DenylistMatch -Name $name -Version $pinned -Denylist $Denylist } else { Get-DenylistMatch -Name $name -Version '*' -Denylist @($Denylist | Where-Object { $_.version -eq '*' }) }
         if ($blocked) {
-            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "blocked by the denylist ($($blocked.version)): $($blocked.reason)"; Replaceable = $false })
+            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "blocked by the denylist ($($blocked.version)): $($blocked.reason)"; Replaceable = $false; AlreadyListed = $false })
             continue
         }
 

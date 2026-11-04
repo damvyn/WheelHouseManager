@@ -2587,6 +2587,8 @@ Describe 'WheelhouseManager' {
             @($offer.Added).Count + @($offer.Replaced).Count | Should -Be 0
             ($offer.Skipped | Where-Object { $_.Spec -eq 'huggingface_hub~=1.5' }).Replaceable | Should -Be $true
             ($offer.Skipped | Where-Object { $_.Spec -eq 'numpy' }).Replaceable | Should -Be $false
+            ($offer.Skipped | Where-Object { $_.Spec -eq 'numpy' }).AlreadyListed | Should -Be $true
+            ($offer.Skipped | Where-Object { $_.Spec -eq 'huggingface_hub~=1.5' }).AlreadyListed | Should -Be $false
 
             $result = Add-RequirementInLine -Path $path -Spec @('huggingface_hub~=1.5', 'numpy', 'pandas') -Replace
             $result.Replaced -join '|' | Should -Be 'huggingface_hub~=1.5'

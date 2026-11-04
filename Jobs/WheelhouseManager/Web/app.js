@@ -126,7 +126,10 @@
     currentTab: 'overview',
     watchedJob: null,
     pollTimer: null,
-    shown: {}
+    shown: {},
+    // The Add tab is rebuilt every time it is shown: what was typed, the publish checkbox and
+    // the outcome of the last "Add and resolve" live here so that a tab switch keeps them.
+    add: { text: '', publish: false, result: null }
   };
 
   // ---------------------------------------------------------------- header / tabs
@@ -619,14 +622,19 @@
     var reviewFix = state.reviewFix;
     state.reviewFix = false;
     var specs = h('textarea', { placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
+    specs.value = state.add.text;
+    specs.addEventListener('input', function () { state.add.text = specs.value; });
     var publishNow = h('input', { type: 'checkbox' });
+    publishNow.checked = state.add.publish;
+    publishNow.addEventListener('change', function () { state.add.publish = publishNow.checked; });
     var output = h('div', { class: 'add-result hidden' });
     var go = h('button', { class: 'btn primary', type: 'button', 'data-idle': true }, 'Add and resolve');
     // replace: swap the requirements.in line of a package that is already listed.
     var submit = function (list, replace) {
       api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked, replace: !!replace }).then(function (data) {
+        state.add.result = data;
         renderAddResult(output, data, submit);
-        if (data.job) { specs.value = ''; watchJob(data.job.id, false); }
+        if (data.job) { specs.value = ''; state.add.text = ''; watchJob(data.job.id, false); }
       }).catch(fail);
     };
     go.addEventListener('click', function () {
@@ -644,19 +652,23 @@
         output),
       h('div', { class: 'card', id: 'requirements-card' }),
       h('div', { class: 'card', id: 'rejected-card' }));
+    if (state.add.result) { renderAddResult(output, state.add.result, submit); }
     loadRequirements(reviewFix ? 'fix' : false);
     loadRejected();
   }
 
   // The outcome of "Add and resolve", inside step 1: a summary line with a button to show or
   // hide the lists, which scroll on their own when they are long. A package that is already
-  // listed with another version range can replace that line (submit(specs, true)).
+  // listed with another version range can replace that line (submit(specs, true)). A spec that
+  // is already in requirements.in exactly as entered is not an error and is listed on its own.
   function renderAddResult(output, data, submit) {
     var added = [].concat(data.added || []);
     var replaced = [].concat(data.replaced || []);
-    var skipped = [].concat(data.skipped || []);
+    var all = [].concat(data.skipped || []);
+    var listed = all.filter(function (s) { return s.AlreadyListed; });
+    var skipped = all.filter(function (s) { return !s.AlreadyListed; });
     clear(output);
-    var total = added.length + replaced.length + skipped.length;
+    var total = added.length + replaced.length + listed.length + skipped.length;
     output.classList.toggle('hidden', total === 0);
     if (total === 0) { return; }
     var replaceable = skipped.filter(function (s) { return s.Replaceable; }).map(function (s) { return s.Spec; });
@@ -667,6 +679,7 @@
     var lists = h('div', { class: 'result-scroll' },
       added.length ? [h('p', {}, 'Added to requirements.in:'), h('ul', { class: 'result-list' }, added.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
       replaced.length ? [h('p', {}, 'Replaced in requirements.in:'), h('ul', { class: 'result-list' }, replaced.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
+      listed.length ? [h('p', {}, 'Already in requirements.in (nothing to change):'), h('ul', { class: 'result-list' }, listed.map(function (s) { return h('li', { class: 'mono' }, s.Spec); }))] : null,
       skipped.length ? [h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, skipped.map(function (s) {
         return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason, s.Replaceable ? [' ', replaceButton([s.Spec], 'Replace')] : null);
       }))] : null,
@@ -681,6 +694,7 @@
       h('strong', {}, 'Result:'), ' ',
       added.length ? badge(added.length + ' added', 'ok') : null, ' ',
       replaced.length ? badge(replaced.length + ' replaced', 'ok') : null, ' ',
+      listed.length ? badge(listed.length + ' already listed') : null, ' ',
       skipped.length ? badge(skipped.length + ' not added', 'bad') : null,
       h('span', { class: 'spacer' }),
       replaceable.length > 1 ? replaceButton(replaceable, 'Replace all ' + replaceable.length) : null, toggle), lists);

@@ -720,8 +720,11 @@ resolved - nothing is downloaded yet.
   but gets a **Replace** button (and **Replace all** for several). It swaps the listed line for
   the one you entered and resolves again - for example when the resolve fails because an old
   range conflicts with another package.
-- The result (what was added, replaced and not added, with the reason) appears inside step 1 in
-  a scrolling list that **Hide list** / **Show list** folds away.
+- The result (what was added, replaced, already listed and not added, with the reason) appears
+  inside step 1 in a scrolling list that **Hide list** / **Show list** folds away. It stays there,
+  together with anything typed but not yet submitted, when you switch to another tab and back.
+- A requirement that is already in `requirements.in` exactly as entered is shown as
+  *already listed*, not as an error: there is nothing to change.
 - *Also publish right away* resolves and publishes in one go, skipping the review step.
 
 **2. Review and publish.** Lists only the resolved pins that are **not yet in the wheelhouse**

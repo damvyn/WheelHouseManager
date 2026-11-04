@@ -560,7 +560,7 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Resolve-MaliciousPackage` | published versions with an open, unwaived `MAL-*` finding: with `-AutoQuarantine` quarantine (denylisted); one `Malicious` notice per version; call under the write lock | `Invoke-WheelhouseSync`, scheduled check |
 | `Restore-WheelhousePackage` | section 9.5 (verify, journal, `Complete-WheelhouseRestoreJournal`, catalog + history); `-KeepDenylist` | UI |
 | `Test-PackageSpec` | allowed `requirements.in` line (name, extras, version operators; <= 200 chars) | `Add-RequirementInLine` |
-| `Add-RequirementInLine` | append valid, new, non-denylisted specs; `-Replace` swaps the line of a listed package (skipped entries say `Replaceable`) | UI add |
+| `Add-RequirementInLine` | append valid, new, non-denylisted specs; `-Replace` swaps the line of a listed package (skipped entries say `Replaceable`, and `AlreadyListed` when the spec is in the file exactly as entered) | UI add |
 | `Remove-RequirementInLine` | take packages' line(s) out of `requirements.in`; throws before writing if one is not listed (a dependency) | UI remove / clear |
 
 ### 8.11 `Scan.ps1`
