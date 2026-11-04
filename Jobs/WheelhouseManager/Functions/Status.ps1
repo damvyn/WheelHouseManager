@@ -138,7 +138,7 @@ function Get-WheelhouseAuditAge {
         else {
             "The oldest audit of a published version is from $($oldest.ToString('yyyy-MM-dd')) - more than $MaxAgeDays day(s) ago."
         }
-        $message += ' Updates audit only their new packages; run whm audit (UI: Packages -> Audit all), or let whm / the UI start it in the background.'
+        $message += ' Updates audit only their new packages - the weekly check audits the rest; whm and the UI start it now.'
     }
     return [PSCustomObject]@{
         Stale     = [bool]$stale
@@ -150,10 +150,17 @@ function Get-WheelhouseAuditAge {
 }
 
 function Start-WheelhouseBackgroundAudit {
-    # Starts Test-WheelhousePackage.ps1 (audit of every published version, results into the
-    # catalog, no alert) as a separate, hidden PowerShell process and returns at once:
-    # { Started; ProcessId; Message }. Only one at a time: <manager root>\state\background-audit.json
-    # remembers the process; while it runs (at most -MaxHours) nothing new is started.
+    # Runs the weekly check (Test-Wheelhouse.ps1: integrity, denylist, yanked, audit of every
+    # published version, malicious packages; results into the catalog and the UI; alert by
+    # email, or Alert_*.html in the reports folder) now, without waiting for it:
+    #   - the registered Scheduled Task when there is one for this installation, so it runs
+    #     as its account exactly like a scheduled run;
+    #   - otherwise Test-Wheelhouse.ps1 as a hidden child process of this PowerShell, as the
+    #     current user.
+    # Alerts are stateful, so an early run sends nothing twice. Only one at a time:
+    # <manager root>\state\background-audit.json remembers the start; while that run is still
+    # going (at most -MaxHours) nothing new is started. Returns { Started; Via (Task|Process);
+    # ProcessId; Message }.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -168,24 +175,46 @@ function Start-WheelhouseBackgroundAudit {
     $stateFolder = Join-Path $ManagerRoot 'state'
     $statePath = Join-Path $stateFolder 'background-audit.json'
     $now = (Get-Date).ToUniversalTime()
+
+    $task = $null
+    try {
+        $registered = Get-WheelhouseScheduledCheck -ManagerRoot $ManagerRoot
+        if ($registered.Registered -and $registered.ForThisInstallation) { $task = $registered }
+    }
+    catch { Write-Verbose "No Scheduled Task available: $($_.Exception.Message)" }
+
     if (Test-Path -LiteralPath $statePath) {
         try {
             $previous = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
             $since = ConvertTo-OptionalUtcDateTime -Value $previous.started_utc
-            $process = Get-Process -Id ([int]$previous.pid) -ErrorAction SilentlyContinue
-            if ($process -and $since -and ($now - $since).TotalHours -lt $MaxHours) {
-                return [PSCustomObject]@{ Started = $false; ProcessId = [int]$previous.pid; Message = "An audit of the wheelhouse is already running (started $($since.ToLocalTime().ToString('yyyy-MM-dd HH:mm')))." }
+            $running = if ([string]$previous.via -eq 'Task') { [bool]($task -and $task.State -eq 'Running') }
+            else { [bool](Get-Process -Id ([int]$previous.pid) -ErrorAction SilentlyContinue) }
+            if ($running -and $since -and ($now - $since).TotalHours -lt $MaxHours) {
+                return [PSCustomObject]@{ Started = $false; Via = [string]$previous.via; ProcessId = $previous.pid; Message = "The weekly check is already running (started $($since.ToLocalTime().ToString('yyyy-MM-dd HH:mm')))." }
             }
         }
-        catch { Write-Verbose "Unreadable $statePath - starting a new audit: $($_.Exception.Message)" }
+        catch { Write-Verbose "Unreadable $statePath - starting a new check: $($_.Exception.Message)" }
+    }
+    if (-not $PSCmdlet.ShouldProcess($WheelhousePath, 'Run the weekly check now')) {
+        return [PSCustomObject]@{ Started = $false; Via = ''; ProcessId = $null; Message = 'Not started (WhatIf).' }
+    }
+    New-Item -ItemType Directory -Path $stateFolder -Force | Out-Null
+
+    if ($task) {
+        if ($task.State -eq 'Running') {
+            return [PSCustomObject]@{ Started = $false; Via = 'Task'; ProcessId = $null; Message = "The weekly check's Scheduled Task is already running." }
+        }
+        try {
+            Start-WheelhouseScheduledCheck
+            Write-JsonFile -Path $statePath -InputObject ([ordered]@{ via = 'Task'; pid = $null; started_utc = $now.ToString('o'); wheelhouse = $WheelhousePath })
+            return [PSCustomObject]@{ Started = $true; Via = 'Task'; ProcessId = $null; Message = "The weekly check's Scheduled Task was started now (as $($task.User)). Its results appear in the UI, and its alert is emailed or saved as Alert_*.html in the reports folder." }
+        }
+        catch { Write-Log "The Scheduled Task could not be started ($($_.Exception.Message)) - running the weekly check as this user instead." 'WARN' }
     }
 
-    $script = Join-Path (Join-Path $ManagerRoot 'Jobs') 'Test-WheelhousePackage.ps1'
+    $script = Join-Path (Join-Path $ManagerRoot 'Jobs') 'Test-Wheelhouse.ps1'
     if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
-        return [PSCustomObject]@{ Started = $false; ProcessId = $null; Message = "Cannot start the audit: $script not found." }
-    }
-    if (-not $PSCmdlet.ShouldProcess($WheelhousePath, 'Start a background audit')) {
-        return [PSCustomObject]@{ Started = $false; ProcessId = $null; Message = 'Not started (WhatIf).' }
+        return [PSCustomObject]@{ Started = $false; Via = ''; ProcessId = $null; Message = "Cannot start the weekly check: $script not found." }
     }
     $startParams = @{
         FilePath     = (Get-Process -Id $PID).Path
@@ -194,14 +223,13 @@ function Start-WheelhouseBackgroundAudit {
     }
     if ($PSVersionTable.PSEdition -ne 'Core' -or $IsWindows) { $startParams['WindowStyle'] = 'Hidden' }
     $process = Start-Process @startParams
-    New-Item -ItemType Directory -Path $stateFolder -Force | Out-Null
-    Write-JsonFile -Path $statePath -InputObject ([ordered]@{ pid = $process.Id; started_utc = $now.ToString('o'); wheelhouse = $WheelhousePath })
-    return [PSCustomObject]@{ Started = $true; ProcessId = $process.Id; Message = "An audit of the whole wheelhouse was started in the background (process $($process.Id)); its log is Log_PackageAudit_* in the reports folder." }
+    Write-JsonFile -Path $statePath -InputObject ([ordered]@{ via = 'Process'; pid = $process.Id; started_utc = $now.ToString('o'); wheelhouse = $WheelhousePath })
+    return [PSCustomObject]@{ Started = $true; Via = 'Process'; ProcessId = $process.Id; Message = "The weekly check (Test-Wheelhouse.ps1) was started in the background as $(if ($env:USERNAME) { $env:USERNAME } else { 'this user' }) (process $($process.Id)) - no Scheduled Task is registered for this installation. Its results appear in the UI, and its alert is emailed or saved as Alert_*.html in the reports folder." }
 }
 
 function Invoke-WheelhouseAuditFreshnessCheck {
     # whm and the web UI call this on start: when the audits are older than -MaxAgeDays
-    # (Get-WheelhouseAuditAge), starts a background audit (Start-WheelhouseBackgroundAudit,
+    # (Get-WheelhouseAuditAge), runs the weekly check now (Start-WheelhouseBackgroundAudit,
     # unless -NoStart). Returns { Stale; Message; Started; StartMessage }. Never throws: a
     # problem is returned in Message.
     [CmdletBinding(SupportsShouldProcess)]
@@ -221,7 +249,7 @@ function Invoke-WheelhouseAuditFreshnessCheck {
         $catalog = Read-WheelhouseCatalog -WheelhousePath $WheelhousePath
         $age = Get-WheelhouseAuditAge -Catalog $catalog -MaxAgeDays $MaxAgeDays
         $start = $null
-        if ($age.Stale -and -not $NoStart -and $PSCmdlet.ShouldProcess($WheelhousePath, 'Start a background audit')) {
+        if ($age.Stale -and -not $NoStart -and $PSCmdlet.ShouldProcess($WheelhousePath, 'Run the weekly check now')) {
             $start = Start-WheelhouseBackgroundAudit -WheelhousePath $WheelhousePath -ManagerRoot $ManagerRoot
         }
         return [PSCustomObject]@{

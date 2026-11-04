@@ -360,7 +360,7 @@ settings file** > **the built-in default**. A key missing from the file uses its
 | `AutoQuarantine` | `$true` | A published wheel that disappeared from the share (e.g. moved to the file server antivirus' quarantine) is taken out of the group files and denylisted; one whose content changed is quarantined as evidence. The same switch quarantines a published version with a malicious-package advisory (`MAL-...`) and moves wheels nobody published to `_untracked\`. `$false`: only reported, and updates stop on a missing/changed wheel until someone acts. Override per run with `-AutoQuarantine On|Off`. An alert is sent either way. |
 | `DueDaysCritical` / `DueDaysHigh` / `DueDaysMedium` / `DueDaysLow` | `3` / `7` / `30` / `90` | Days a vulnerability of that severity may stay open before it is overdue. An advisory without a published severity counts as High. |
 | `WaiverMaxDays` | `90` | Longest allowed waiver. |
-| `AuditMaxAgeDays` | `7` | Updates audit only their new packages. When a published version has had no completed audit for this long, `whm` (every command except `help`, `audit`, `check`, `doctor`) and the web UI (on start, and on the Overview tab) say so and start an audit of the whole wheelhouse in the background (`Test-WheelhousePackage.ps1`, log `Log_PackageAudit_*`). One runs at a time. |
+| `AuditMaxAgeDays` | `7` | Updates audit only their new packages. When a published version has had no completed audit for this long, `whm` (every command except `help`, `audit`, `check`, `doctor`) and the web UI (on start, and on the Overview tab) say so and run the **weekly check** now - its Scheduled Task when one is registered for this installation (as the task's account), otherwise `Test-Wheelhouse.ps1` in the background as the current user. Its results appear in the UI, and its alert is emailed or saved as `Alert_*.html` (alerts are stateful, so nothing is sent twice). One runs at a time. |
 | `AuditFreshnessDays` | `8` | A published version without a completed audit for this long is alerted as *Unverified*; the UI warns when the weekly check has not completed for this long. |
 | `OverdueReminderDays` | `7` | How often an overdue vulnerability is alerted again. |
 | `EventLog` | `$false` | Also write run results and actions to the Windows Event Log (Application, source `WheelhouseManager`) - see [8](#8-alerts-reports-and-logs). Turn on with `Setup.ps1 -EnableEventLog` (as administrator, once). |
@@ -415,8 +415,9 @@ cd C:\WheelHouseManager
 `status` and `doctor` exit with 0 (all good), 1 (something to review) or 2 (act now).
 
 Before a command runs, whm checks when the published packages were last audited. If a version has
-had no completed audit for `AuditMaxAgeDays` (7), it prints a warning and starts an audit of the
-whole wheelhouse in the background; the command itself runs as usual. `whm audit` and `whm check`
+had no completed audit for `AuditMaxAgeDays` (7), it prints a warning and runs the weekly check
+now in the background (its Scheduled Task, or `Test-Wheelhouse.ps1`); the command itself runs as
+usual. `whm audit` and `whm check`
 audit anyway and skip this.
 
 ### 5.1 Add packages (the normal workflow)

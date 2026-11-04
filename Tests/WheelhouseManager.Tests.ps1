@@ -195,7 +195,7 @@ Describe 'WheelhouseManager' {
         if ($script:addedPythonStub) { Remove-Item -Path Function:\python -ErrorAction SilentlyContinue }
         Remove-Variable -Name WhmMockExitCode, WhmMockReport, WhmPipInstalls, WhmPipChecks, WhmIntakeAudit, WhmIntakeDownloaded, WhmIntakeCandidates, WhmScanDetections, WhmUiJobSteps,
             WhmReleases, WhmNoWheel, WhmWheelOverride, WhmScanStatus, WhmThreatPackage, WhmRestResponse, WhmPyPI, WhmScannedPath,
-            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline, WhmProposalPath, WhmStateDir, WhmEventLog, WhmTask, WhmTaskRegistered, WhmTaskError, WhmTaskCalls -Scope Global -ErrorAction SilentlyContinue
+            WhmOsvCalls, WhmOsvRecords, WhmOsvOffline, WhmProposalPath, WhmStateDir, WhmEventLog, WhmTask, WhmTaskRegistered, WhmTaskError, WhmTaskCalls, WhmTaskStarted -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'Get-NormalizedPackageName' {
@@ -2143,19 +2143,32 @@ Describe 'WheelhouseManager' {
             $never.Never | Should -Be 1
             (Get-WheelhouseStatus -WheelhousePath $wheelhouse -AuditMaxAgeDays 7 -ProposalPath (Join-Path (Get-TestFolder) 'none.json')).AuditStale | Should -Be $false
 
-            # The background audit: one process at a time, remembered in state\.
+            # The weekly check now: without a registered task, Test-Wheelhouse.ps1 as one
+            # background process at a time, remembered in state\.
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseScheduledCheck -MockWith { [PSCustomObject]@{ Registered = $false } }
             $root = Get-TestFolder
             New-Item -ItemType Directory -Path (Join-Path $root 'Jobs') | Out-Null
-            Set-Content -Path (Join-Path (Join-Path $root 'Jobs') 'Test-WheelhousePackage.ps1') -Value 'Start-Sleep -Seconds 20'
+            Set-Content -Path (Join-Path (Join-Path $root 'Jobs') 'Test-Wheelhouse.ps1') -Value 'Start-Sleep -Seconds 20'
             $first = Start-WheelhouseBackgroundAudit -WheelhousePath $wheelhouse -ManagerRoot $root
             try {
                 $first.Started | Should -Be $true
+                $first.Via | Should -Be 'Process'
                 $second = Start-WheelhouseBackgroundAudit -WheelhousePath $wheelhouse -ManagerRoot $root
                 $second.Started | Should -Be $false
                 $second.Message | Should -Match 'already running'
                 (Get-Content -Path (Join-Path (Join-Path $root 'state') 'background-audit.json') -Raw | ConvertFrom-Json).pid | Should -Be $first.ProcessId
             }
             finally { Stop-Process -Id $first.ProcessId -Force -ErrorAction SilentlyContinue }
+
+            # With the task registered for this installation, the task itself is started.
+            $global:WhmTaskStarted = 0
+            Mock -ModuleName WheelhouseManager -CommandName Get-WheelhouseScheduledCheck -MockWith { [PSCustomObject]@{ Registered = $true; ForThisInstallation = $true; State = 'Ready'; User = 'CONTOSO\svc' } }
+            Mock -ModuleName WheelhouseManager -CommandName Start-WheelhouseScheduledCheck -MockWith { $global:WhmTaskStarted++ }
+            $viaTask = Start-WheelhouseBackgroundAudit -WheelhousePath $wheelhouse -ManagerRoot (Get-TestFolder)
+            $viaTask.Started | Should -Be $true
+            $viaTask.Via | Should -Be 'Task'
+            $viaTask.Message | Should -Match 'Scheduled Task was started now \(as CONTOSO\\svc\)'
+            $global:WhmTaskStarted | Should -Be 1
 
             # The freshness check starts nothing while the audits are recent.
             $fresh = Invoke-WheelhouseAuditFreshnessCheck -WheelhousePath $wheelhouse -MaxAgeDays 7 -ManagerRoot $root

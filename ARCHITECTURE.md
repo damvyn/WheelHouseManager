@@ -855,10 +855,11 @@ Updates audit and scan only their candidates. `Invoke-WheelhouseStartupAuditChec
 every command except help/audit/check/ui/doctor; `Start-WheelhouseUiServer` on start) reads
 `WheelhousePath` and `AuditMaxAgeDays` from the settings -> `Invoke-WheelhouseAuditFreshnessCheck`
 -> `Get-WheelhouseAuditAge` (stale when a Published record's `checks.audit.last_run` is missing or
-older than the limit) -> `Start-WheelhouseBackgroundAudit`: `Test-WheelhousePackage.ps1` (every
-published version, results into the catalog, no alert) as a hidden child process of the same
-PowerShell; `<manager root>\state\background-audit.json` (`pid`, `started_utc`) keeps it to one at
-a time (at most 6 h). Never throws; logs a WARN. `Get-WheelhouseStatus` adds the same message as an
+older than the limit) -> `Start-WheelhouseBackgroundAudit`: the weekly check (9.3, with its
+stateful alert) now - `Start-WheelhouseScheduledCheck` when `Get-WheelhouseScheduledCheck` finds the
+task registered for this installation (runs as its account), else `Test-Wheelhouse.ps1` as a hidden
+child process of the same PowerShell; `<manager root>\state\background-audit.json` (`via`, `pid`,
+`started_utc`) keeps it to one at a time (at most 6 h). Never throws; logs a WARN. `Get-WheelhouseStatus` adds the same message as an
 Attention item (Overview tab, `whm status`).
 
 ### 9.4 Alerting
