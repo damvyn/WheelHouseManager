@@ -1026,3 +1026,331 @@ function Remove-RequirementInLine {
     }
     Write-Output -NoEnumerate $removed.ToArray()
 }
+
+function Set-RequirementInText {
+    # Replaces requirements.in with -Text as typed in the UI (comments and blank lines kept).
+    # Every other line must be a valid spec (Test-PackageSpec), name a package only once and
+    # not be blocked outright by the denylist. Returns @{ Problems = [{Line; Spec; Reason}];
+    # Requirements = string[] }; the file is written only when there is no problem.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [AllowEmptyCollection()]
+        [object[]]$Denylist = @()
+    )
+
+    $lines = @($Text -split "`r?`n" | ForEach-Object { $_.TrimEnd() })
+    while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines = @($lines | Select-Object -First ($lines.Count - 1)) }
+    $problems = [System.Collections.Generic.List[object]]::new()
+    $requirements = [System.Collections.Generic.List[string]]::new()
+    $seen = @{}
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $spec = ($lines[$i] -replace '(^|\s)#.*$', '').Trim()
+        if ($spec -eq '') { continue }
+        if (-not (Test-PackageSpec -Spec $spec)) {
+            $problems.Add([PSCustomObject]@{ Line = $i + 1; Spec = $spec; Reason = 'not a valid requirement (use a name with an optional version, e.g. numpy or pandas>=2.0)' })
+            continue
+        }
+        $null = $spec -match '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(?<rest>.*)$'
+        $name = Get-NormalizedPackageName $Matches['name']
+        $rest = $Matches['rest'].Replace(' ', '')
+        if ($seen.ContainsKey($name)) {
+            $problems.Add([PSCustomObject]@{ Line = $i + 1; Spec = $spec; Reason = "'$name' is already listed on line $($seen[$name]); keep one line per package" })
+            continue
+        }
+        $seen[$name] = $i + 1
+        $pinned = if ($rest -match '^==(?<v>[^,*]+)$') { $Matches['v'] } else { $null }
+        $blocked = if ($pinned) { Get-DenylistMatch -Name $name -Version $pinned -Denylist $Denylist } else { Get-DenylistMatch -Name $name -Version '*' -Denylist @($Denylist | Where-Object { $_.version -eq '*' }) }
+        if ($blocked) {
+            $problems.Add([PSCustomObject]@{ Line = $i + 1; Spec = $spec; Reason = "blocked by the denylist ($($blocked.version)): $($blocked.reason)" })
+            continue
+        }
+        $requirements.Add($spec)
+    }
+
+    if ($problems.Count -eq 0 -and $PSCmdlet.ShouldProcess($Path, "Write $($requirements.Count) requirement(s)")) {
+        $folder = Split-Path -Path $Path -Parent
+        if ($folder -and -not (Test-Path -Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+        Write-TextFileAtomic -Path $Path -Content ($lines -join "`r`n")
+    }
+    return @{ Problems = $problems.ToArray(); Requirements = $requirements.ToArray() }
+}
+
+function Test-RequirementTxtDirect {
+    # Whether a pin of requirements.txt was asked for (listed in the input) rather than only
+    # pulled in by another package. Without an annotation it counts as asked for.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Source
+    )
+    return ($Source.Count -eq 0) -or [bool](@($Source | Where-Object { $_ -match '^-r\s' }).Count)
+}
+
+function Remove-RequirementTxtPin {
+    # Takes pins out of requirements.txt (with their annotation lines), and then every pin that
+    # only the removed ones needed (from the "# via" annotations; a pin asked for directly is
+    # kept). Throws, before writing, when a name is not pinned. Returns the removed names.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string[]]$Name
+    )
+
+    $sources = Read-RequirementDependent -FilePath $Path -IncludeSource
+    $pins = Read-RequirementFile -FilePath $Path
+    $drop = @{}
+    foreach ($item in $Name) {
+        $normalized = Get-NormalizedPackageName $item
+        if (-not $pins.ContainsKey($normalized)) { throw [System.Collections.Generic.KeyNotFoundException]::new("'$normalized' is not pinned in requirements.txt.") }
+        $drop[$normalized] = $true
+    }
+    do {
+        $more = $false
+        foreach ($key in @($sources.Keys)) {
+            if ($drop.ContainsKey($key) -or -not $pins.ContainsKey($key)) { continue }
+            $from = @($sources[$key])
+            if ($from.Count -eq 0 -or (Test-RequirementTxtDirect -Source $from)) { continue }
+            if (@($from | Where-Object { -not $drop.ContainsKey($_) }).Count -eq 0) { $drop[$key] = $true; $more = $true }
+        }
+    } while ($more)
+
+    $kept = [System.Collections.Generic.List[string]]::new()
+    $skipping = $false
+    foreach ($raw in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $line = [string]$raw
+        if ($line -match '^(?<name>[A-Za-z0-9][A-Za-z0-9_.\-]*)\s*(\[[^\]]*\])?\s*==') { $skipping = $drop.ContainsKey((Get-NormalizedPackageName $Matches['name'])) }
+        elseif ($line -notmatch '^\s+#') { $skipping = $false }
+        if (-not $skipping) { $kept.Add($line) }
+    }
+    if ($PSCmdlet.ShouldProcess($Path, "Remove $($drop.Count) pin(s)")) {
+        Write-TextFileAtomic -Path $Path -Content ($kept -join "`r`n")
+    }
+    Write-Output -NoEnumerate ([string[]]@($drop.Keys | Sort-Object))
+}
+
+function Get-RequirementCarryOver {
+    # The pins of the current requirements.txt that are still waiting to be published (not in
+    # the manifest), as "name==version" lines to resolve again together with requirements.in -
+    # which is emptied after every resolve, so they would otherwise drop out of requirements.txt.
+    # Left out: names requirements.in lists itself, and versions the denylist blocks. Without
+    # a reachable wheelhouse every pin counts as waiting.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RequirementsInPath,
+
+        [Parameter(Mandatory)]
+        [string]$RequirementsTxtPath,
+
+        [AllowEmptyString()]
+        [string]$WheelhousePath,
+
+        [AllowEmptyCollection()]
+        [object[]]$Denylist = @()
+    )
+
+    $none = [string[]]@()
+    if (-not (Test-Path -LiteralPath $RequirementsTxtPath -PathType Leaf) -or -not ([System.IO.File]::ReadAllText($RequirementsTxtPath)).Trim()) { Write-Output -NoEnumerate $none; return }
+    $pins = Read-RequirementFile -FilePath $RequirementsTxtPath
+    $published = @{}
+    if ($WheelhousePath -and (Test-Path -LiteralPath $WheelhousePath -PathType Container)) {
+        $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+        foreach ($entry in $manifest) { $published["$(Get-NormalizedPackageName ([string]$entry.name))==$($entry.version)"] = $true }
+    }
+    $inLines = @()
+    if (Test-Path -LiteralPath $RequirementsInPath -PathType Leaf) { $inLines = @(Get-Content -LiteralPath $RequirementsInPath) }
+    $carry = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in ($pins.Keys | Sort-Object)) {
+        $version = [string]$pins[$name]
+        if ($published.ContainsKey("$name==$version")) { continue }
+        if (Get-RequirementInLine -Lines ([string[]]$inLines) -Name $name) { continue }
+        if (Get-DenylistMatch -Name $name -Version $version -Denylist $Denylist) { continue }
+        $carry.Add("$name==$version")
+    }
+    Write-Output -NoEnumerate $carry.ToArray()
+}
+
+function Clear-RequirementInFile {
+    # After a successful resolve: requirements.in keeps only its comment lines (the header), so
+    # it lists just what is asked for next. Returns the requirement lines taken out.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $kept = [System.Collections.Generic.List[string]]::new()
+    $removed = [System.Collections.Generic.List[string]]::new()
+    foreach ($raw in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $line = [string]$raw
+        $spec = ($line -replace '(^|\s)#.*$', '').Trim()
+        if ($spec) { $removed.Add($spec) } elseif ($line.Trim()) { $kept.Add($line) }
+    }
+    if ($removed.Count -gt 0 -and $PSCmdlet.ShouldProcess($Path, "Clear $($removed.Count) requirement(s)")) {
+        Write-TextFileAtomic -Path $Path -Content ($kept -join "`r`n")
+    }
+    Write-Output -NoEnumerate $removed.ToArray()
+}
+
+function Get-RequirementResolveProblem {
+    # After a failed resolve: one status per requirement of requirements.in, so the UI can show
+    # which lines to fix: { spec; ok; status }. Checks each name (and an exact == version)
+    # against PyPI, and marks the names uv's error output mentions (-ToolOutput) and the pins the
+    # wheel check found unusable (-Unavailable, "name==version").
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Lines,
+
+        [AllowEmptyCollection()]
+        [string[]]$ToolOutput = @(),
+
+        [AllowEmptyCollection()]
+        [string[]]$Unavailable = @(),
+
+        [string]$Target = ''
+    )
+
+    $unusable = @{}
+    foreach ($pin in $Unavailable) { if ($pin -match '^(?<n>[^=<>!~ ]+)') { $unusable[(Get-NormalizedPackageName $Matches['n'])] = [string]$pin } }
+    $toolText = (@($ToolOutput) -join "`n").ToLowerInvariant()
+    foreach ($line in $Lines) {
+        $spec = ([string]$line -replace '(^|\s)#.*$', '').Trim()
+        if ($spec -eq '' -or $spec -notmatch '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(?<rest>.*)$') { continue }
+        $rawName = $Matches['name']
+        $name = Get-NormalizedPackageName $rawName
+        $rest = $Matches['rest'].Replace(' ', '')
+        $status = $null
+        try {
+            $releases = @(Get-PyPIProjectRelease -Name $name)
+            if ($rest -match '^==(?<v>[^,*]+)$' -and -not @($releases | Where-Object { $_.Version -eq $Matches['v'] }).Count) { $status = "version $($Matches['v']) does not exist on PyPI" }
+        }
+        catch {
+            $code = $null
+            try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = $null }
+            $status = $(if ($code -eq 404 -or $_.Exception.Message -match '\b404\b|Not Found') { 'not found on PyPI - check the name' } else { "could not be checked on PyPI ($($_.Exception.Message))" })
+        }
+        if (-not $status -and $unusable.ContainsKey($name)) { $status = "$($unusable[$name]) has no usable wheel$(if ($Target) { " for $Target" })" }
+        if (-not $status -and $toolText -and @(@($name, $rawName.ToLowerInvariant()) | Where-Object { $toolText -match "(?<![a-z0-9_.-])$([regex]::Escape($_))(?![a-z0-9_-])" }).Count -gt 0) { $status = 'named in the resolver error - probably a version conflict (see the job log)' }
+        [PSCustomObject]@{ spec = $spec; ok = (-not $status); status = $(if ($status) { $status } else { 'ok' }) }
+    }
+}
+
+function Write-RequirementResolveStatus {
+    # Records the outcome of the latest resolve next to requirements.txt
+    # (requirements.status.json): -Problem (from Get-RequirementResolveProblem) and -Message
+    # for a failure; without -Failed the file is removed. The UI shows it in "Review and
+    # publish" and keeps Publish disabled while it reports a failure.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RequirementsTxtPath,
+
+        [switch]$Failed,
+
+        [string]$Message = '',
+
+        [AllowEmptyCollection()]
+        [object[]]$Problem = @()
+    )
+
+    $path = Join-Path (Split-Path -Path $RequirementsTxtPath -Parent) 'requirements.status.json'
+    if (-not $PSCmdlet.ShouldProcess($path, 'Write the resolve status')) { return }
+    if (-not $Failed) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        return
+    }
+    $packages = @(foreach ($item in $Problem) { [ordered]@{ spec = [string]$item.spec; ok = [bool]$item.ok; status = [string]$item.status } })
+    $record = [ordered]@{ failed = $true; time_utc = [DateTime]::UtcNow.ToString('o'); message = $Message; packages = $packages }
+    Write-TextFileAtomic -Path $path -Content (ConvertTo-Json -InputObject $record -Depth 5)
+}
+
+function Read-RequirementResolveStatus {
+    # The latest failed resolve recorded by Write-RequirementResolveStatus, or $null.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RequirementsTxtPath
+    )
+
+    $path = Join-Path (Split-Path -Path $RequirementsTxtPath -Parent) 'requirements.status.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try { $record = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
+    catch { return $null }
+    return @{
+        failed   = [bool]$record.failed
+        time_utc = (ConvertTo-IsoTimestamp $record.time_utc)
+        message  = [string]$record.message
+        packages = @(foreach ($item in @($record.packages)) { if ($item) { @{ spec = [string]$item.spec; ok = [bool]$item.ok; status = [string]$item.status } } })
+    }
+}
+
+function Clear-PublishedRequirementTxt {
+    # After a publish: empties requirements.txt when every pin in it is in the wheelhouse, so the
+    # Add tab starts over. A pin that is still missing (rejected, waiting for the cooldown) keeps
+    # the file as it is, so it stays listed in "Review and publish". Returns whether it emptied it.
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or -not ([System.IO.File]::ReadAllText($Path)).Trim()) { return $false }
+    $pins = Read-RequirementFile -FilePath $Path
+    if ($pins.Count -eq 0) { return $false }
+    $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+    $published = @{}
+    foreach ($entry in $manifest) { $published["$(Get-NormalizedPackageName ([string]$entry.name))==$($entry.version)"] = $true }
+    foreach ($name in $pins.Keys) { if (-not $published.ContainsKey("$name==$($pins[$name])")) { return $false } }
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Empty requirements.txt')) { return $false }
+    Write-TextFileAtomic -Path $Path -Content ''
+    return $true
+}
+
+function Reset-WheelhouseInput {
+    # When the UI starts: the Input files hold data of one session only. requirements.in keeps
+    # its comment header, requirements.txt is emptied, and the leftovers of a resolve
+    # (requirements.status.json, requirements.rejected.txt) are removed. The proposal history
+    # stays. Returns the files it changed.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$RequirementsInPath,
+
+        [string]$RequirementsTxtPath
+    )
+
+    $changed = [System.Collections.Generic.List[string]]::new()
+    if ($RequirementsInPath -and (Test-Path -LiteralPath $RequirementsInPath -PathType Leaf) -and $PSCmdlet.ShouldProcess($RequirementsInPath, 'Clear')) {
+        [string[]]$cleared = Clear-RequirementInFile -Path $RequirementsInPath
+        if ($cleared.Count -gt 0) { $changed.Add($RequirementsInPath) }
+    }
+    if ($RequirementsTxtPath -and (Test-Path -LiteralPath $RequirementsTxtPath -PathType Leaf) -and $PSCmdlet.ShouldProcess($RequirementsTxtPath, 'Clear')) {
+        if (([System.IO.File]::ReadAllText($RequirementsTxtPath)).Trim()) {
+            Write-TextFileAtomic -Path $RequirementsTxtPath -Content ''
+            $changed.Add($RequirementsTxtPath)
+        }
+        $folder = Split-Path -Path $RequirementsTxtPath -Parent
+        foreach ($leftover in @('requirements.status.json', 'requirements.rejected.txt')) {
+            $file = Join-Path $folder $leftover
+            if (Test-Path -LiteralPath $file -PathType Leaf) { Remove-Item -LiteralPath $file -Force; $changed.Add($file) }
+        }
+    }
+    Write-Output -NoEnumerate $changed.ToArray()
+}

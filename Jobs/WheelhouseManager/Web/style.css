@@ -215,6 +215,7 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .link-toggle:hover, .link-toggle:focus-visible { text-decoration: underline; }
 /* A job is running: buttons that would start another one look disabled (their clicks are blocked). */
 body.job-running [data-idle] { opacity: .45; cursor: not-allowed; }
+body.job-running #requirements-in { opacity: .6; cursor: not-allowed; }
 /* Audit tab */
 #tab-audit .table-wrap.scroll-list { max-height: 360px; margin: 8px 0; }
 .report-row { cursor: pointer; }
@@ -244,4 +245,26 @@ td.report-detail > p:first-child { margin-top: 0; }
 @media (prefers-reduced-motion: reduce) {
   .job-indicator.running .dot { animation: job-spin 1.6s linear infinite; }
   .job-indicator.running::after { animation: none; display: none; }
+}
+
+/* Busy feedback (api() in app.js): a bar sweeping under the top bar while a request or a job
+   runs, and a spinner in the button whose click sent a change. */
+.busybar { flex: 0 0 auto; height: 3px; position: relative; overflow: hidden; background: transparent; }
+.busybar.active { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.busybar.active::after {
+  content: ''; position: absolute; top: 0; bottom: 0; left: -30%; width: 30%;
+  background: var(--accent); border-radius: 3px; animation: busy-sweep 1.1s ease-in-out infinite;
+}
+@keyframes busy-sweep { 0% { left: -30%; } 100% { left: 100%; } }
+.btn.loading, button.loading { position: relative; color: transparent !important; pointer-events: none; }
+.btn.loading::after, button.loading::after {
+  content: ''; position: absolute; left: 50%; top: 50%; width: 14px; height: 14px; margin: -9px 0 0 -9px;
+  border: 2px solid var(--accent); border-right-color: transparent; border-radius: 50%;
+  animation: job-spin .7s linear infinite;
+}
+.btn.primary.loading::after { border-color: var(--accent-text); border-right-color: transparent; }
+.btn.danger.loading::after { border-color: var(--bad); border-right-color: transparent; }
+@media (prefers-reduced-motion: reduce) {
+  .busybar.active::after { animation-duration: 2.2s; }
+  .btn.loading::after, button.loading::after { animation-duration: 1.4s; }
 }

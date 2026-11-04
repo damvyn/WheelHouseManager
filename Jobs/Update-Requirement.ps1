@@ -20,6 +20,12 @@
     existing requirements.txt is left untouched, the rejected result is saved next to
     it as requirements.rejected.txt, and every unavailable package is listed.
 
+    When it resolved the configured requirements.in (settings RequirementsInPath), the pins of
+    the current requirements.txt that are not published yet are resolved together with it
+    (they would otherwise drop out), and after requirements.txt is written requirements.in is
+    emptied down to its comment lines: it only ever lists what is new. A failed resolve leaves
+    both files as they were.
+
     Exit codes: 0 written; 1 the result was rejected (uv could not resolve it, or a
     package has no usable wheel) - change requirements.in and run again; 2 the input
     file, python or the platform mapping is missing.
@@ -91,7 +97,7 @@ param(
 
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
-$paramNames = @('RequirementsInPath', 'RequirementsTxtPath', 'PythonVersion', 'Platform', 'MinimumPackageAgeDays')
+$paramNames = @('RequirementsInPath', 'RequirementsTxtPath', 'PythonVersion', 'Platform', 'MinimumPackageAgeDays', 'WheelhousePath')
 $whlParams = @{
     'BoundParameters' = $PSBoundParameters
     'Name' = $paramNames
@@ -132,8 +138,27 @@ $targetFolder = Split-Path -Path $cfg.RequirementsTxtPath -Parent
 $candidatePath = Join-Path $targetFolder "requirements.candidate.txt"
 $rejectedPath = Join-Path $targetFolder "requirements.rejected.txt"
 
+# requirements.in is emptied after every successful resolve of the configured file, so it
+# only lists what is new. Pins of the current requirements.txt that are not published yet
+# are resolved again with it - otherwise they would drop out of requirements.txt.
+$configuredIn = (Get-WheelhouseDefaultSetting).RequirementsInPath
+$configuredSetting = (Get-WheelhouseSetting)['RequirementsInPath']
+if ($configuredSetting) { $configuredIn = $configuredSetting }
+$clearInput = [bool]$configuredIn -and ([System.IO.Path]::GetFullPath($cfg.RequirementsInPath) -eq [System.IO.Path]::GetFullPath([string]$configuredIn))
+$compileInput = $cfg.RequirementsInPath
+$combinedPath = Join-Path $targetFolder "requirements.combined.tmp.in"
+if ($clearInput) {
+    [string[]]$carryOver = Get-RequirementCarryOver -RequirementsInPath $cfg.RequirementsInPath -RequirementsTxtPath $cfg.RequirementsTxtPath -WheelhousePath ([string]$cfg.WheelhousePath) -Denylist @(Read-WheelhouseDenylist)
+    if ($carryOver.Count -gt 0) {
+        Write-Log "Kept from the current requirements.txt (not published yet): $($carryOver -join ', ')"
+        $combined = @(Get-Content -LiteralPath $cfg.RequirementsInPath) + @('# still waiting to be published (from the previous requirements.txt)') + $carryOver
+        Set-Content -Path $combinedPath -Value $combined -Encoding utf8
+        $compileInput = $combinedPath
+    }
+}
+
 $compileArgs = @(
-    "pip", "compile", $cfg.RequirementsInPath,
+    "pip", "compile", $compileInput,
     "--exclude-newer", "$($cfg.MinimumPackageAgeDays) days",
     "--python-version", $cfg.PythonVersion,
     "--python-platform", $uvPlatform,
@@ -158,13 +183,29 @@ if ($PreferCurrent -and (Test-Path -LiteralPath $cfg.RequirementsTxtPath)) {
     Write-Log 'Keeping the current versions wherever they still fit (only what has to change changes).'
 }
 Write-Log "Resolving with uv (binary wheels only, $($cfg.PythonVersion) / $uvPlatform)..."
-Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs
+[string[]]$uvOutput = Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs -PassThru
+$uvExit = $LASTEXITCODE
 Remove-Item -Path $constraintsPath -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $combinedPath -Force -ErrorAction SilentlyContinue
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Log "uv pip compile FAILED (exit code $LASTEXITCODE). Review the output above." "ERROR"
+# For the UI: which lines of requirements.in to fix after a failed resolve.
+$target = "Python $($cfg.PythonVersion) / $($cfg.Platform)"
+function Write-ResolveFailure {
+    param([string]$Message, [string[]]$Unavailable = @())
+    try {
+        $problems = @(Get-RequirementResolveProblem -Lines ([string[]]@(Get-Content -LiteralPath $cfg.RequirementsInPath)) -ToolOutput $uvOutput -Unavailable $Unavailable -Target $target)
+        Write-RequirementResolveStatus -RequirementsTxtPath $cfg.RequirementsTxtPath -Failed -Message $Message -Problem $problems
+        foreach ($item in @($problems | Where-Object { -not $_.ok })) { Write-Log "  $($item.spec): $($item.status)" 'ERROR' }
+    }
+    catch { Write-Log "Could not record the resolve problems: $($_.Exception.Message)" 'WARN' }
+}
+
+if ($uvExit -ne 0) {
+    Write-Log "uv pip compile FAILED (exit code $uvExit). Review the output above." "ERROR"
     Write-Log "Typical cause: a package (or a version range in requirements.in) has no binary wheel for Python $($cfg.PythonVersion) / $($cfg.Platform)." "ERROR"
     Remove-Item -Path $candidatePath -Force -ErrorAction SilentlyContinue
+    $uvError = @($uvOutput | Where-Object { $_ -match '(?i)error|because|no solution|not found' } | Select-Object -First 3) -join ' '
+    Write-ResolveFailure -Message $(if ($uvError) { $uvError } else { 'The job log says why.' })
     exit 1
 }
 
@@ -184,6 +225,7 @@ if (-not $check.Passed) {
         Write-Log "Remove them from requirements.in, or constrain them there to a version that supports Python $($cfg.PythonVersion), then run this script again." "ERROR"
     }
     Write-Log "requirements.txt was NOT changed. The rejected result was saved for review: $rejectedPath" "ERROR"
+    Write-ResolveFailure -Message "Some resolved packages have no usable wheel for $target$(if ($check.Error) { ": $($check.Error)" })." -Unavailable ([string[]]@($check.Unavailable))
     exit 1
 }
 
@@ -191,6 +233,14 @@ Move-Item -Path $candidatePath -Destination $cfg.RequirementsTxtPath -Force
 Remove-Item -Path $rejectedPath -Force -ErrorAction SilentlyContinue
 
 Write-Log "requirements.txt written successfully: $($cfg.RequirementsTxtPath)" "OK"
+Write-RequirementResolveStatus -RequirementsTxtPath $cfg.RequirementsTxtPath
+if ($clearInput) {
+    try {
+        [string[]]$cleared = Clear-RequirementInFile -Path $cfg.RequirementsInPath
+        if ($cleared.Count -gt 0) { Write-Log "requirements.in emptied - its $($cleared.Count) requirement(s) are now in requirements.txt." 'OK' }
+    }
+    catch { Write-Log "Could not empty requirements.in: $($_.Exception.Message)" 'WARN' }
+}
 if (-not $NoProposal) {
     try {
         [void](New-WheelhouseProposal -RequirementsPath $cfg.RequirementsTxtPath -Kind 'resolve')

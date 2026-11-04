@@ -214,6 +214,15 @@ try {
     }
     $result = Invoke-WheelhouseSync @syncParams
 
+    # The Add tab starts over once everything in requirements.txt is published. Only for the
+    # configured file - an explicit -LocalRequirementsPath is the caller's.
+    if (-not $PSBoundParameters.ContainsKey('LocalRequirementsPath') -and $cfg.LocalRequirementsPath) {
+        try {
+            if (Clear-PublishedRequirementTxt -Path $cfg.LocalRequirementsPath -WheelhousePath $cfg.WheelhousePath) { Write-Log 'Every pin of requirements.txt is published - requirements.txt was emptied.' 'OK' }
+        }
+        catch { Write-Log "Could not empty requirements.txt: $($_.Exception.Message)" 'WARN' }
+    }
+
     if ($result.Outcome -eq 'Error') {
         $exitCode = Get-WheelhouseExitCode -Outcome Error
         $outcome = 'an audit could not be completed'

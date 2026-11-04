@@ -2820,6 +2820,149 @@ Describe 'WheelhouseManager' {
         }
     }
 
+    Context 'Set-RequirementInText' {
+        It 'writes the text as typed, keeping comments' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            $deny = @([PSCustomObject]@{ name = 'old'; version = '1.0'; reason = 'cve'; source = 'removed' })
+
+            $result = Set-RequirementInText -Path $path -Text "# header`nnumpy>=2.0`n`npandas  # data`nold>=1.1`n`n" -Denylist $deny
+
+            @($result.Problems).Count | Should -Be 0
+            $result.Requirements -join '|' | Should -Be 'numpy>=2.0|pandas|old>=1.1'
+            (Get-Content -Path $path) -join '|' | Should -Be '# header|numpy>=2.0||pandas  # data|old>=1.1'
+        }
+
+        It 'writes nothing when a line is invalid, listed twice or denylisted' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            [IO.File]::WriteAllText($path, 'numpy')
+            $deny = @([PSCustomObject]@{ name = 'evil'; version = '*'; reason = 'malware'; source = 'manual' })
+
+            $result = Set-RequirementInText -Path $path -Text "numpy`n-r other.txt`nNumPy>=2`nevil`npandas" -Denylist $deny
+
+            @($result.Problems | ForEach-Object { $_.Line }) -join ',' | Should -Be '2,3,4'
+            ($result.Problems | Where-Object { $_.Line -eq 3 }).Reason | Should -Match 'line 1'
+            ($result.Problems | Where-Object { $_.Line -eq 4 }).Reason | Should -Match 'denylist'
+            Get-Content -Path $path -Raw | Should -Be 'numpy'
+        }
+
+        It 'empties the file for an empty text' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            [IO.File]::WriteAllText($path, 'numpy')
+            $result = Set-RequirementInText -Path $path -Text ''
+            @($result.Requirements).Count | Should -Be 0
+            Get-Content -Path $path -Raw | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Requirement carry-over and cleanup' {
+        It 'reads the via annotations and tells asked-for pins from dependencies' {
+            $txt = Join-Path (Get-TestFolder) 'requirements.txt'
+            Set-Content -Path $txt -Value @('# header', 'Foo_Bar==1.0', '    # via', '    #   -r requirements.in', '    #   baz', 'baz==2.0', '    # via -r x.in', 'dep==3.0', '    # via Foo-Bar', 'plain==4.0')
+
+            $sources = Read-RequirementDependent -FilePath $txt -IncludeSource
+
+            $sources['foo-bar'] -join ',' | Should -Be '-r requirements.in,baz'
+            $sources['dep'] -join ',' | Should -Be 'foo-bar'
+            $sources.ContainsKey('plain') | Should -Be $false
+            (Read-RequirementDependent -FilePath $txt)['foo-bar'] -join ',' | Should -Be 'baz'
+            Test-RequirementTxtDirect -Source $sources['foo-bar'] | Should -Be $true
+            Test-RequirementTxtDirect -Source $sources['dep'] | Should -Be $false
+            Test-RequirementTxtDirect -Source @() | Should -Be $true
+        }
+
+        It 'carries over the pins that are not published, not listed again and not denylisted' {
+            $wheelhouse = Get-TestWheelhouse
+            $folder = Get-TestFolder
+            $in = Join-Path $folder 'requirements.in'
+            $txt = Join-Path $folder 'requirements.txt'
+            [IO.File]::WriteAllText($in, "# header`r`nrequests>=2.33")
+            Set-Content -Path $txt -Value @('six==1.16.0', 'requests==2.32.3', 'accelerate==1.15.0', 'torch==2.9.0')
+            $deny = @([PSCustomObject]@{ name = 'accelerate'; version = '1.15.0'; reason = 'Test'; source = 'quarantined' })
+
+            [string[]]$carry = Get-RequirementCarryOver -RequirementsInPath $in -RequirementsTxtPath $txt -WheelhousePath $wheelhouse -Denylist $deny
+
+            $carry -join '|' | Should -Be 'torch==2.9.0'
+        }
+
+        It 'empties requirements.in down to its comments' {
+            $in = Join-Path (Get-TestFolder) 'requirements.in'
+            [IO.File]::WriteAllText($in, "# header`r`n#   numpy`r`nfaiss-cpu==1.15.1`r`n`r`nscipy  # wanted")
+
+            [string[]]$cleared = Clear-RequirementInFile -Path $in
+
+            $cleared -join '|' | Should -Be 'faiss-cpu==1.15.1|scipy'
+            (Get-Content -Path $in) -join '|' | Should -Be '# header|#   numpy'
+        }
+    }
+
+    Context 'Resolve status and the Input lifecycle' {
+        It 'gives every line of requirements.in a status after a failed resolve' {
+            Mock -ModuleName WheelhouseManager -CommandName Get-PyPIProjectRelease -MockWith {
+                if ($Name -eq 'sdfsdf') { throw 'Response status code does not indicate success: 404 (Not Found).' }
+                if ($Name -eq 'offline') { throw 'The remote name could not be resolved' }
+                [PSCustomObject]@{ Version = '1.0'; FirstUploadUtc = $null; Yanked = $false }
+                [PSCustomObject]@{ Version = '2.0'; FirstUploadUtc = $null; Yanked = $false }
+            }
+            $lines = @('# header', 'sdfsdf', 'good==3.0', 'good-two>=1', 'offline', 'clash', 'nowheel==2.0', 'fine==1.0  # ok')
+            $output = @('  x No solution found when resolving dependencies:', '  Because clash==1.0 depends on good-two<1 ...')
+
+            $result = @(Get-RequirementResolveProblem -Lines $lines -ToolOutput $output -Unavailable @('nowheel==2.0') -Target 'Python 3.14 / win_amd64')
+
+            $result.Count | Should -Be 7
+            ($result | Where-Object { $_.spec -eq 'sdfsdf' }).status | Should -Match 'not found on PyPI'
+            ($result | Where-Object { $_.spec -eq 'good==3.0' }).status | Should -Match 'version 3.0 does not exist'
+            ($result | Where-Object { $_.spec -eq 'good-two>=1' }).status | Should -Match 'resolver error'
+            ($result | Where-Object { $_.spec -eq 'offline' }).status | Should -Match 'could not be checked'
+            ($result | Where-Object { $_.spec -eq 'clash' }).status | Should -Match 'resolver error'
+            ($result | Where-Object { $_.spec -eq 'nowheel==2.0' }).status | Should -Match 'no usable wheel for Python 3.14'
+            ($result | Where-Object { $_.spec -eq 'fine==1.0' }).ok | Should -Be $true
+        }
+
+        It 'records a failed resolve next to requirements.txt and removes it after a good one' {
+            $txt = Join-Path (Get-TestFolder) 'requirements.txt'
+            Write-RequirementResolveStatus -RequirementsTxtPath $txt -Failed -Message 'no solution' -Problem @([PSCustomObject]@{ spec = 'sdfsdf'; ok = $false; status = 'not found on PyPI' })
+
+            $status = Read-RequirementResolveStatus -RequirementsTxtPath $txt
+            $status.failed | Should -Be $true
+            $status.message | Should -Be 'no solution'
+            @($status.packages).Count | Should -Be 1
+            @($status.packages)[0].spec | Should -Be 'sdfsdf'
+
+            Write-RequirementResolveStatus -RequirementsTxtPath $txt
+            Read-RequirementResolveStatus -RequirementsTxtPath $txt | Should -BeNullOrEmpty
+        }
+
+        It 'empties requirements.txt only when every pin is published' {
+            $wheelhouse = Get-TestWheelhouse
+            $txt = Join-Path (Get-TestFolder) 'requirements.txt'
+            Set-Content -Path $txt -Value @('six==1.16.0', 'requests==2.32.3')
+            Clear-PublishedRequirementTxt -Path $txt -WheelhousePath $wheelhouse | Should -Be $false
+            (Get-Content -Path $txt) -join '|' | Should -Be 'six==1.16.0|requests==2.32.3'
+
+            Set-Content -Path $txt -Value @('six==1.16.0', '    # via -r requirements.in', 'attrs==23.1.0')
+            Clear-PublishedRequirementTxt -Path $txt -WheelhousePath $wheelhouse | Should -Be $true
+            Get-Content -Path $txt -Raw | Should -BeNullOrEmpty
+        }
+
+        It 'starts the UI with empty Input files' {
+            $folder = Get-TestFolder
+            $in = Join-Path $folder 'requirements.in'
+            $txt = Join-Path $folder 'requirements.txt'
+            [IO.File]::WriteAllText($in, "# header`r`nnumpy")
+            [IO.File]::WriteAllText($txt, 'numpy==2.3.1')
+            Set-Content -Path (Join-Path $folder 'requirements.status.json') -Value '{}'
+            Set-Content -Path (Join-Path $folder 'proposal-history.jsonl') -Value '{}'
+
+            [string[]]$changed = Reset-WheelhouseInput -RequirementsInPath $in -RequirementsTxtPath $txt
+
+            $changed.Count | Should -Be 3
+            (Get-Content -Path $in) -join '|' | Should -Be '# header'
+            Get-Content -Path $txt -Raw | Should -BeNullOrEmpty
+            Test-Path -Path (Join-Path $folder 'requirements.status.json') | Should -Be $false
+            Test-Path -Path (Join-Path $folder 'proposal-history.jsonl') | Should -Be $true
+        }
+    }
+
     Context 'Remove-RequirementInLine' {
         It 'removes the package by its normalized name and keeps the other lines' {
             $path = Join-Path (Get-TestFolder) 'requirements.in'
@@ -3201,6 +3344,28 @@ Describe 'WheelhouseManager' {
             $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
         }
 
+        It 'shows requirements.in and saves the edit box as a whole' {
+            $m = Get-TestManager
+            $in = Join-Path $m.Root 'requirements.in'
+            [IO.File]::WriteAllText($in, "# header`r`nnumpy")
+
+            $read = Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements/in' -ManagerRoot $m.Root
+            $read.Status | Should -Be 200
+            $read.Body.text | Should -Be "# header`r`nnumpy"
+
+            $bad = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/in' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"text":"numpy\n-r evil.txt"}')
+            $bad.Status | Should -Be 200
+            $bad.Body.saved | Should -Be $false
+            @($bad.Body.problems).Count | Should -Be 1
+            $global:WhmUiJobSteps | Should -BeNullOrEmpty
+            Get-Content -Path $in -Raw | Should -Be "# header`r`nnumpy"
+
+            $ok = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/in' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"text":"# header\nnumpy\npandas>=2.0","publish":true}')
+            $ok.Body.saved | Should -Be $true
+            (Get-Content -Path $in) -join '|' | Should -Be '# header|numpy|pandas>=2.0'
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1|Update-Wheelhouse.ps1'
+        }
+
         It 'lists the audit reports and shows one with its advisories' {
             $m = Get-TestManager
             $reports = Join-Path $m.Wheelhouse 'reports'
@@ -3229,58 +3394,45 @@ Describe 'WheelhouseManager' {
             (Invoke-WheelhouseUiApi -Method GET -Path '/api/audits/Report_Missing-OSV_20261101_100000.json' -ManagerRoot $m.Root).Status | Should -Be 404
         }
 
-        It 'removes a package from requirements.in and resolves again' {
+        It 'removes a pin and the pins only it needed from requirements.txt' {
             $m = Get-TestManager
-            $in = Join-Path $m.Root 'requirements.in'
-            [IO.File]::WriteAllText($in, "numpy>=2.0`r`nrequests==2.32.3")
             $txt = Join-Path $m.Root 'requirements.txt'
             Set-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1') -Updates @{ LocalRequirementsPath = $txt }
-            Set-Content -Path $txt -Value @('numpy==2.3.1', 'requests==2.32.3', 'urllib3==2.5.0')
+            Set-Content -Path $txt -Value @('# This file was autogenerated by uv', 'certifi==2026.1.1', '    # via', '    #   numpy', '    #   requests', 'numpy==2.3.1', '    # via -r requirements.in', 'requests==2.32.3', '    # via -r requirements.in', 'urllib3==2.5.0', '    # via requests')
 
             $review = Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root
             (@($review.Body.pending) | Where-Object { $_.name -eq 'requests' }).direct | Should -Be $true
             (@($review.Body.pending) | Where-Object { $_.name -eq 'urllib3' }).direct | Should -Be $false
+            @((@($review.Body.pending) | Where-Object { $_.name -eq 'requests' }).requested_by) -join ',' | Should -Be 'User input'
+            @((@($review.Body.pending) | Where-Object { $_.name -eq 'certifi' }).requested_by) -join ',' | Should -Be 'numpy,requests'
 
             (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"-r evil"}')).Status | Should -Be 400
-            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"urllib3"}')).Status | Should -Be 404
-            $global:WhmUiJobSteps | Should -BeNullOrEmpty
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"pandas"}')).Status | Should -Be 404
 
             $result = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"requests"}')
             $result.Status | Should -Be 200
-            @($result.Body.removed) -join '|' | Should -Be 'requests==2.32.3'
-            (Get-Content -Path $in) -join '|' | Should -Be 'numpy>=2.0'
-            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
+            @($result.Body.removed) -join '|' | Should -Be 'requests|urllib3'
+            # certifi is still needed by numpy.
+            (Get-Content -Path $txt) -join '|' | Should -Be '# This file was autogenerated by uv|certifi==2026.1.1|    # via|    #   numpy|    #   requests|numpy==2.3.1|    # via -r requirements.in'
+            $global:WhmUiJobSteps | Should -BeNullOrEmpty
         }
 
-        It 'clears every requirement still waiting to be published' {
+        It 'clears every pin still waiting to be published' {
             $m = Get-TestManager
-            $in = Join-Path $m.Root 'requirements.in'
-            # six is in the test wheelhouse; requests and urllib3 (a dependency) are not.
-            [IO.File]::WriteAllText($in, "six`r`nrequests==2.32.3")
             $txt = Join-Path $m.Root 'requirements.txt'
             Set-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1') -Updates @{ LocalRequirementsPath = $txt }
-            Set-Content -Path $txt -Value @('six==1.16.0', 'requests==2.32.3', 'urllib3==2.5.0')
+            # six is in the test wheelhouse; requests is not.
+            Set-Content -Path $txt -Value @('six==1.16.0', 'requests==2.32.3')
 
             $result = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/clear' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')
             $result.Status | Should -Be 200
-            @($result.Body.removed) -join '|' | Should -Be 'requests==2.32.3'
-            (Get-Content -Path $in) -join '|' | Should -Be 'six'
-            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
+            $result.Body.job | Should -BeNullOrEmpty
+            (Get-Content -Path $txt) -join '|' | Should -Not -Match 'requests'
 
-            # Nothing listed is waiting any more: refused.
-            Set-Content -Path $txt -Value @('six==1.16.0', 'urllib3==2.5.0')
+            # Nothing is waiting any more: refused.
+            Set-Content -Path $txt -Value @('six==1.16.0')
             $none = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/clear' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')
             "$($none.Status) $($none.Body.error)" | Should -Match '^409 Nothing to clear'
-
-            # Clearing the last requirement empties requirements.txt instead of resolving nothing.
-            $global:WhmUiJobSteps = $null
-            [IO.File]::WriteAllText($in, 'requests==2.32.3')
-            Set-Content -Path $txt -Value @('requests==2.32.3')
-            $last = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/clear' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')
-            $last.Status | Should -Be 200
-            $last.Body.job | Should -BeNullOrEmpty
-            $global:WhmUiJobSteps | Should -BeNullOrEmpty
-            (Get-Content -Path $txt) -join '|' | Should -Not -Match 'requests'
         }
 
         It 'shows requirements.txt for review and publishes it only with a confirmation' {

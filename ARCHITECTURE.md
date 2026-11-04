@@ -107,7 +107,7 @@ is the repo root; tests pass explicit paths (`-ManagerRoot`, `-StagingRoot`, `-S
 | `config\settings.psd1` | Setup.ps1, `Set-WheelhouseSetting` (UI) | psd1, keys sorted, written atomically | Warning, defaults are used (`Get-WheelhouseSetting`) |
 | `config\denylist.json` | `Add-/Remove-WheelhouseDenylistEntry` | JSON array (section 11) | **Throws** - never read as empty |
 | `config\waivers.json` | `Add-/Remove-WheelhouseWaiver` (UI, under the write lock) | JSON array (section 11) | **Throws** - never read as empty |
-| `Input\requirements.in` | User, `Add-RequirementInLine` / `Remove-RequirementInLine` (UI) | pip requirements, unpinned allowed | uv fails |
+| `Input\requirements.in` | User, `Set-RequirementInText` (UI), `Set-RequirementInSpec` (remediation), `Clear-RequirementInFile` (after a successful `Update-Requirement.ps1` of the configured file) | pip requirements, unpinned allowed | uv fails |
 | `Input\requirements.txt` | Update-Requirement.ps1 (move of the candidate file) | uv output, exact pins | Unsupported lines are skipped with a warning |
 | `Input\requirements.candidate.txt` / `.rejected.txt` / `.constraints.tmp` | Update-Requirement.ps1 | transient / last rejected result / denylist as `!=` constraints | - |
 | `staging\<guid>\` | `Invoke-CandidateIntake` | downloads of one intake call; deleted in `finally` | - |
@@ -479,7 +479,7 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Add-RequirementToGroupFile` | append `name==version` (create file if needed) | file | worker, restore |
 | `ConvertTo-UvPythonPlatform` | pip platform tag -> uv triple; throws if unknown | string | Update-Requirement, settings validation |
 | `Invoke-PipPinRetry` | run pip over pins; drop the pin named in "No matching distribution found for X"; retry. A failure naming no pin -> `Error` | `@{ Succeeded; Failed; Error }` | wheel check, intake download |
-| `Read-RequirementDependent` | the `# via` annotations of a `uv pip compile` file (one-line and list style; `-r`/`-c` sources skipped) | hashtable name -> names of the pins that need it | sync run |
+| `Read-RequirementDependent` | the `# via` annotations of a `uv pip compile` file (one-line and list style; `-r`/`-c` sources skipped, `-IncludeSource` keeps `-r <file>`) | hashtable name -> names of the pins that need it | sync run |
 | `Get-DependentRejection` | invariant 30: candidates (`-Candidates`) that need a rejected pin of exactly the `-Pins` version, transitively; reason `needs X==v, which was rejected (<reason>)` | `{Name; Version; Category dependency; Reason; Dependency}` | sync run |
 | `Test-RequirementWheelAvailability` | `pip install --dry-run --no-deps --ignore-installed --only-binary=:all: --python-version --platform --implementation cp --target <tmp>` | `@{ Passed; Unavailable; Error }` | Update-Requirement |
 
@@ -575,7 +575,16 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Restore-WheelhousePackage` | section 9.5 (verify, journal, `Complete-WheelhouseRestoreJournal`, catalog + history); `-KeepDenylist` | UI |
 | `Test-PackageSpec` | allowed `requirements.in` line (name, extras, version operators; <= 200 chars) | `Add-RequirementInLine` |
 | `Add-RequirementInLine` | append valid, new, non-denylisted specs; `-Replace` swaps the line of a listed package (skipped entries say `Replaceable`) | UI add |
-| `Remove-RequirementInLine` | take packages' line(s) out of `requirements.in`; throws before writing if one is not listed (a dependency) | UI remove / clear |
+| `Remove-RequirementInLine` | take packages' line(s) out of `requirements.in`; throws before writing if one is not listed (a dependency) | scripts (the UI removes from requirements.txt now) |
+| `Set-RequirementInText` | replace `requirements.in` with the UI's edit box; refuses (writes nothing, returns `Problems` with line numbers) invalid specs, a package listed twice, outright denylisted packages | UI save |
+| `Clear-RequirementInFile` | keep only the comment lines of `requirements.in`; returns the requirements taken out | `Update-Requirement.ps1` after writing requirements.txt, when it resolved the configured `RequirementsInPath` |
+| `Get-RequirementCarryOver` | `name==version` of the requirements.txt pins not in the manifest, not listed in requirements.in and not denylisted (all pins when the wheelhouse is unreachable) | `Update-Requirement.ps1` (resolved together with requirements.in) |
+| `Test-RequirementTxtDirect` | from `Read-RequirementDependent -IncludeSource` (which keeps the `-r <file>` entries): whether a pin was asked for; no annotation counts as asked for | `Get-WheelhouseUiPendingPin` (`direct`, `requested_by`), `Remove-RequirementTxtPin` |
+| `Get-RequirementResolveProblem` | after a failed resolve: `{spec; ok; status}` per requirements.in line (PyPI name / exact version, `-Unavailable` from the wheel check, names in uv's error output) | `Update-Requirement.ps1` |
+| `Write-RequirementResolveStatus` / `Read-RequirementResolveStatus` | `Input\requirements.status.json` - the latest failed resolve (removed by a good one) | `Update-Requirement.ps1` / `GET /api/requirements` (`resolve_failure`) |
+| `Clear-PublishedRequirementTxt` | empty requirements.txt when every pin is in the manifest | `Update-Wheelhouse.ps1` (configured `LocalRequirementsPath` only) |
+| `Reset-WheelhouseInput` | empty requirements.in (keeps comments) and requirements.txt, remove `requirements.status.json` / `requirements.rejected.txt`; the proposal history stays | `Start-WheelhouseUI.ps1` unless `-KeepInput` |
+| `Remove-RequirementTxtPin` | take pins out of requirements.txt plus the pins only they needed; throws before writing for a name not pinned | UI remove |
 
 ### 8.11 `Scan.ps1`
 
@@ -973,10 +982,12 @@ Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it wor
 | `POST /api/packages/scan` | `{all}` or `{files:[...]}` | job `Invoke-WheelhouseScan.ps1 [-File ...]` | 202 |
 | `GET /api/audits` | - | the newest 200 pip-audit reports (`Get-AuditReportInfo` names) as `ConvertTo-WheelhouseUiAuditReport` summaries | 200 |
 | `GET /api/audits/<file>` | - | one report with every package and advisory (`-IncludeDependency`); 404 for a file that is not an audit report | 200 |
-| `POST /api/requirements/remove` | `{name}` | `Invoke-WheelhouseUiRequirementRemoval` -> `Remove-RequirementInLine`; job `Update-Requirement.ps1` (title *Remove packages*), or requirements.txt emptied when requirements.in lists nothing | 200 |
-| `POST /api/requirements/clear` | `{}` | the same for every pending pin listed in requirements.in (`Get-WheelhouseUiPendingPin`, `direct`); title *Clear list*; 409 when none | 200 |
+| `POST /api/requirements/remove` | `{name}` | `Invoke-WheelhouseUiRequirementRemoval` -> `Remove-RequirementTxtPin` on requirements.txt, then a `manual` proposal of the changed file; no job | 200 `{removed, job:null}`, 404 not pinned |
+| `POST /api/requirements/clear` | `{}` | empties requirements.txt; 409 when no pin is pending | 200 |
 | `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool, replace:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
-| `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review, plus `pending` (pins not in the manifest, each with the reason from the latest `Report_Rejected_*` if any) and `published_count` | 200 `{path, text, modified_utc, pin_count}` |
+| `GET /api/requirements/in` | - | `RequirementsInPath` (<= 1 MB), the Add tab's edit box | 200 `{path, text, modified_utc}` |
+| `POST /api/requirements/in` | `{text (<= 100 KB), publish:bool}` | `Set-RequirementInText`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` if `publish:true`); no job when no requirement is listed (requirements.txt unchanged); problems -> `saved:false` and nothing written | 200 `{saved, problems, job}` |
+| `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review, plus `pending` (pins not in the manifest, each with the reason from the latest `Report_Rejected_*` if any, `direct` and `requested_by` from the `# via` lines), `published_count` and `resolve_failure` (`Read-RequirementResolveStatus`) | 200 `{path, text, modified_utc, pin_count}` |
 | `POST /api/wheelhouse/update` | `{confirm:true}` | job `Update-Wheelhouse.ps1` | 202 / 400 |
 | `POST /api/packages/remove` | `{packages (<= 200), mode:'quarantine'\|'delete', reason (<= 400), confirm}` | `Remove-WheelhousePackage` per package; refused while a job runs | 200 `{results}` |
 | `GET /api/quarantine`, `POST /api/quarantine/restore` | `{id, keep_denylist}` | list / `Restore-WheelhousePackage` | 200 |
@@ -1280,7 +1291,7 @@ Which code runs for each user scenario (user steps are in the README):
 | Wheel copied in by hand | check or update: `Move-UntrackedWheelFile` -> `_untracked\<ts>\` |
 | File server antivirus removed/changed a wheel | check or update: `Assert-WheelhouseIntegrity -AllowChangedFiles` -> `Resolve-WheelhouseIntegrityProblem` -> `Remove-WheelhousePackage -LockHeld` |
 | Audit / scan from the UI | `POST /api/packages/audit` or `/scan` -> job -> `Test-WheelhousePackage.ps1` / `Invoke-WheelhouseScan.ps1` |
-| Add from the UI | `POST /api/packages/add` -> `Add-RequirementInLine` -> job `Update-Requirement.ps1`; then `GET /api/requirements` -> `POST /api/wheelhouse/update` |
+| Add from the UI | `GET /api/requirements/in` (edit box) -> `POST /api/requirements/in` -> `Set-RequirementInText` -> job `Update-Requirement.ps1`; then `GET /api/requirements` -> `POST /api/wheelhouse/update`; `Update-Requirement.ps1` carries over the unpublished pins (`Get-RequirementCarryOver`) and empties requirements.in (`Clear-RequirementInFile`) |
 | Quarantine / delete / restore | `POST /api/packages/remove` / `/api/quarantine/restore` -> 9.5 |
 | Denylist edit | `/api/denylist/*` -> `Add-/Remove-WheelhouseDenylistEntry` |
 | Package table | `GET /api/packages` -> `Get-WheelhousePackage` -> `Get-PackageAuditStatus`, `Get-PackageScanStatus` |

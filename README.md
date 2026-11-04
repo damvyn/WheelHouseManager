@@ -423,16 +423,21 @@ audit anyway and skip this.
 ### 5.1 Add packages (the normal workflow)
 
 1. **Ask for packages.** Add one requirement per line to `Input\requirements.in` - a name
-   (`numpy`) or a range (`pandas>=2.0`). Keep everything you have ever asked for in the file; it
-   is the full list, not just the new lines.
+   (`numpy`) or a range (`pandas>=2.0`). List only what is new: after every successful resolve of
+   the configured file, `requirements.in` is emptied down to its comment lines - its packages
+   are then in `requirements.txt`.
 2. **Resolve them.**
    ```powershell
    .\Update-Requirement.ps1
    ```
-   This writes `Input\requirements.txt` with exact pins for every package and dependency. If a
-   package has no wheel for your Python/platform, nothing is changed: the problem packages are
-   listed, the attempt is saved as `Input\requirements.rejected.txt`, and you fix
-   `requirements.in` (remove the package or constrain its version) and run it again.
+   This writes `Input\requirements.txt` with exact pins for every package and dependency. The
+   pins of the old `requirements.txt` that are not published yet (and not denylisted) are
+   resolved again together with `requirements.in`, so nothing waiting is lost. Pins that are
+   already published are not, so a resolve checks the new packages against what is waiting, not
+   against everything in the wheelhouse. If the resolve fails (a version conflict, a package that
+   does not exist, no wheel for your Python/platform), nothing is changed and `requirements.in`
+   keeps its lines: the problem packages are listed, a wheel-check failure is saved as
+   `Input\requirements.rejected.txt`, and you fix `requirements.in` and run it again.
 3. **Review and approve.** Resolving records a **proposal** for exactly this `requirements.txt`
    (who requested it, when; `Input\proposal.json`, history in `Input\proposal-history.jsonl`).
    Only an approved proposal is published. Who may approve depends on `ApprovalMode`:
@@ -687,7 +692,16 @@ where the fix proposal waits for approval.
 ```powershell
 C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1                     # opens the browser
 C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -Port 9000 -NoBrowser
+C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -KeepInput         # keep Input\requirements.*
 ```
+
+While the UI works on something - a request such as removing a package or editing the denylist,
+or a job such as an audit - a bar sweeps under the top bar, and the button you clicked shows a
+spinner until the server answers. A running job also shows in the pill at the top right.
+
+Every start empties `Input\requirements.in` (down to its comment header) and
+`Input\requirements.txt`, so the Add packages tab starts fresh. Use `-KeepInput` when a
+`requirements.txt` waits for a second person's approval (`ApprovalMode = SeparateApprover`).
 
 The UI runs on the manager server only (`http://localhost:8765/`). Keep the PowerShell window open
 while you use it; stop it with Ctrl+C or the **Stop UI** button. Start it from an **elevated**
@@ -733,32 +747,42 @@ in place and only the table scrolls. A banner warns when the weekly check has no
 
 ![Add packages tab](Images/AddPackages.png)
 
-**1. Add packages.** Enter one requirement per line; they are added to `requirements.in` and
-resolved - nothing is downloaded yet.
+**1. Add packages.** The box is `requirements.in` itself, one requirement per line. Edit it and
+click **Add and resolve**: the whole box replaces `requirements.in` and is resolved, together with
+the pins still waiting in step 2 (new packages are added, duplicates are ignored) - nothing is
+downloaded yet. While a job runs, the box and the button are locked.
 
-- A package that is already listed in `requirements.in` with another version range is not added,
-  but gets a **Replace** button (and **Replace all** for several). It swaps the listed line for
-  the one you entered and resolves again - for example when the resolve fails because an old
-  range conflicts with another package.
-- The result (what was added, replaced and not added, with the reason) appears inside step 1 in
-  a scrolling list that **Hide list** / **Show list** folds away.
+- Nothing is saved while a line has a problem (not a valid requirement, a package listed twice,
+  or blocked by the denylist); the lines to fix are listed under the box.
+- An edit you have not saved yet stays in the box when you switch tabs (*Not saved yet*);
+  **Discard changes** shows the file as it is again.
+- When the resolve succeeds, `requirements.in` is emptied and the box with it: the packages are
+  now in step 2. When it fails, the lines stay in the box so you can fix them.
 - *Also publish right away* resolves and publishes in one go, skipping the review step.
 
 **2. Review and publish.** Lists only the resolved pins that are **not yet in the wheelhouse**
 (pins already published are only counted; the whole `requirements.txt` is behind *Show the whole
-requirements.txt*), each marked *new* or *rejected last time* with the reason. When resolving
-succeeds, the page scrolls to step 2 and highlights it.
+requirements.txt*), with **Requested by** (*User input* for your own lines, otherwise the
+packages that need it, from the `# via` lines uv writes) and the status: *new* or *rejected last
+time* with the reason. When resolving succeeds, the page scrolls to step 2 and highlights it.
+
+- When the latest resolve **failed**, step 2 says why and lists every line of step 1 with its
+  status (not found on PyPI, version does not exist, no usable wheel, named in a version
+  conflict). Publishing is off (*Fix the resolve first*) until a resolve succeeds.
+- After a publish in which every pin of `requirements.txt` got into the wheelhouse,
+  `requirements.txt` is emptied. If a pin was rejected (or waits for the cooldown), the file
+  stays, so the pin stays listed here with Remove and Clear list.
 
 - **Publish N pin(s)** runs every check, then publishes. It counts only pins that can pass: a pin
   the latest publish rejected is not counted, except one rejected only for the cooldown (*waiting
   for cooldown*) - its own, or that of a dependency it was held back for - which publishing adds
   once the cooldown has passed. When only rejected pins are
   left, the button reads *Nothing to publish*.
-- **Remove** on a rejected pin (when it is listed in `requirements.in`) takes it out of
-  `requirements.in` and resolves again. A rejected pin marked *dependency* is needed by another
-  requirement and goes away only with it.
-- **Clear list** takes every waiting package out of `requirements.in` at once (the wheelhouse
-  does not change). Clearing the last requirement empties `requirements.txt`.
+- **Remove** on a rejected pin takes it out of `requirements.txt`, together with the pins only it
+  needed (from the `# via` lines uv writes). A rejected pin marked *dependency* is needed by
+  another package and goes away only with it.
+- **Clear list** empties `requirements.txt`, so nothing waits any more (the wheelhouse does not
+  change).
 - With the default approval mode there is no separate Approve step - publishing records who
   published. With `ApprovalMode = SeparateApprover` the **Approve** / **Reject** buttons appear
   for the second person.
@@ -843,7 +867,7 @@ shows the details.
 | `Jobs\Invoke-WheelhouseRemediation.ps1` | Prepare the fix of a vulnerable published version as a proposal (5.14) | `-Package name==ver`, `-ExpediteReason` |
 | `Jobs\Invoke-WheelhouseScan.ps1` | On-demand Defender scan of all or chosen wheels - copied locally and hash-checked first, never scanned on the share (elevated) | `-File name.whl,...` |
 | `Jobs\Send-VulnerabilityAlert.ps1` | Build and send/save an alert (used by the scripts above) | `-ReportPaths`, `-Findings`, `-AuditErrors`, `-Notices`, `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
-| `Jobs\Start-WheelhouseUI.ps1` | Start the web UI | `-Port`, `-NoBrowser` |
+| `Jobs\Start-WheelhouseUI.ps1` | Start the web UI (empties the Input files first) | `-Port`, `-NoBrowser`, `-KeepInput` |
 
 Changes to the wheelhouse are serialized, but only for the seconds in which files are written:
 quarantine, delete and restore work while an update runs, and the update and the checks wait (up

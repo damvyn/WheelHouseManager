@@ -42,13 +42,16 @@ function Read-RequirementDependent {
     #         # via requests
     # gives @{ urllib3 = @('requests') }. Both annotation styles are read (one line, or
     # "# via" followed by one "#   name" line per parent). Sources that are not pins
-    # (-r requirements.in, -c constraints.txt) are skipped. A file compiled with
-    # --no-annotate gives an empty table.
+    # (-r requirements.in, -c constraints.txt) are skipped - with -IncludeSource the
+    # "-r <file>" entries are kept as they are, so a caller can tell a pin that was asked for
+    # from one that is only a dependency. A file compiled with --no-annotate gives an empty table.
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory)]
-        [string]$FilePath
+        [string]$FilePath,
+
+        [switch]$IncludeSource
     )
 
     $dependents = @{}
@@ -57,6 +60,12 @@ function Read-RequirementDependent {
     $add = {
         param([string]$Entry)
         $token = ($Entry.Trim() -split '\s+')[0]
+        if ($IncludeSource -and $token -eq '-r') {
+            $source = ($Entry.Trim() -replace '\s+', ' ')
+            if (-not $dependents.ContainsKey($current)) { $dependents[$current] = @() }
+            if ($dependents[$current] -notcontains $source) { $dependents[$current] = @($dependents[$current]) + $source }
+            return
+        }
         if (-not $token -or $token.StartsWith('-') -or $token -notmatch '^[A-Za-z0-9][A-Za-z0-9_.\-]*$') { return }
         $parent = Get-NormalizedPackageName $token
         if ($parent -eq $current) { return }
