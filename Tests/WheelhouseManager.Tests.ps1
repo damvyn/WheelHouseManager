@@ -2587,8 +2587,6 @@ Describe 'WheelhouseManager' {
             @($offer.Added).Count + @($offer.Replaced).Count | Should -Be 0
             ($offer.Skipped | Where-Object { $_.Spec -eq 'huggingface_hub~=1.5' }).Replaceable | Should -Be $true
             ($offer.Skipped | Where-Object { $_.Spec -eq 'numpy' }).Replaceable | Should -Be $false
-            ($offer.Skipped | Where-Object { $_.Spec -eq 'numpy' }).AlreadyListed | Should -Be $true
-            ($offer.Skipped | Where-Object { $_.Spec -eq 'huggingface_hub~=1.5' }).AlreadyListed | Should -Be $false
 
             $result = Add-RequirementInLine -Path $path -Spec @('huggingface_hub~=1.5', 'numpy', 'pandas') -Replace
             $result.Replaced -join '|' | Should -Be 'huggingface_hub~=1.5'
@@ -2601,6 +2599,75 @@ Describe 'WheelhouseManager' {
             $result = Add-RequirementInLine -Path $path -Spec @('-e .')
             @($result.Added).Count | Should -Be 0
             Test-Path -Path $path | Should -Be $false
+        }
+    }
+
+    Context 'Set-RequirementInText' {
+        It 'writes the text as typed, keeping comments' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            $deny = @([PSCustomObject]@{ name = 'old'; version = '1.0'; reason = 'cve'; source = 'removed' })
+
+            $result = Set-RequirementInText -Path $path -Text "# header`nnumpy>=2.0`n`npandas  # data`nold>=1.1`n`n" -Denylist $deny
+
+            @($result.Problems).Count | Should -Be 0
+            $result.Requirements -join '|' | Should -Be 'numpy>=2.0|pandas|old>=1.1'
+            (Get-Content -Path $path) -join '|' | Should -Be '# header|numpy>=2.0||pandas  # data|old>=1.1'
+        }
+
+        It 'writes nothing when a line is invalid, listed twice or denylisted' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            [IO.File]::WriteAllText($path, 'numpy')
+            $deny = @([PSCustomObject]@{ name = 'evil'; version = '*'; reason = 'malware'; source = 'manual' })
+
+            $result = Set-RequirementInText -Path $path -Text "numpy`n-r other.txt`nNumPy>=2`nevil`npandas" -Denylist $deny
+
+            @($result.Problems | ForEach-Object { $_.Line }) -join ',' | Should -Be '2,3,4'
+            ($result.Problems | Where-Object { $_.Line -eq 3 }).Reason | Should -Match 'line 1'
+            ($result.Problems | Where-Object { $_.Line -eq 4 }).Reason | Should -Match 'denylist'
+            Get-Content -Path $path -Raw | Should -Be 'numpy'
+        }
+
+        It 'empties the file for an empty text' {
+            $path = Join-Path (Get-TestFolder) 'requirements.in'
+            [IO.File]::WriteAllText($path, 'numpy')
+            $result = Set-RequirementInText -Path $path -Text ''
+            @($result.Requirements).Count | Should -Be 0
+            Get-Content -Path $path -Raw | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Remove-PublishedRequirementInLine' {
+        It 'takes out the requirements whose pinned version is in the wheelhouse' {
+            $wheelhouse = Get-TestWheelhouse
+            $folder = Get-TestFolder
+            $in = Join-Path $folder 'requirements.in'
+            $txt = Join-Path $folder 'requirements.txt'
+            [IO.File]::WriteAllText($in, "# header`r`nSix>=1.0`r`nattrs  # wanted`r`nsdfsdf`r`nnumpy")
+            [IO.File]::WriteAllText($txt, "six==1.16.0`r`nattrs==23.2.0`r`nnumpy==2.1.0")
+            (Get-Item -Path $in).LastWriteTimeUtc = (Get-Item -Path $txt).LastWriteTimeUtc.AddMinutes(-1)
+            $resolved = (Get-Item -Path $txt).LastWriteTimeUtc
+
+            [string[]]$removed = Remove-PublishedRequirementInLine -Path $in -RequirementsTxtPath $txt -WheelhousePath $wheelhouse
+
+            # attrs is pinned to a version the wheelhouse does not have; sdfsdf and numpy are not published.
+            $removed -join '|' | Should -Be 'Six>=1.0'
+            (Get-Content -Path $in) -join '|' | Should -Be '# header|attrs  # wanted|sdfsdf|numpy'
+            (Get-Item -Path $in).LastWriteTimeUtc | Should -Be $resolved
+        }
+
+        It 'leaves requirements.in alone when it changed after the resolve' {
+            $wheelhouse = Get-TestWheelhouse
+            $folder = Get-TestFolder
+            $in = Join-Path $folder 'requirements.in'
+            $txt = Join-Path $folder 'requirements.txt'
+            [IO.File]::WriteAllText($txt, 'six==1.16.0')
+            [IO.File]::WriteAllText($in, 'six')
+            (Get-Item -Path $in).LastWriteTimeUtc = (Get-Item -Path $txt).LastWriteTimeUtc.AddMinutes(1)
+
+            [string[]]$removed = Remove-PublishedRequirementInLine -Path $in -RequirementsTxtPath $txt -WheelhousePath $wheelhouse
+
+            $removed.Count | Should -Be 0
+            Get-Content -Path $in -Raw | Should -Be 'six'
         }
     }
 
@@ -2983,6 +3050,28 @@ Describe 'WheelhouseManager' {
             @($swap.Body.replaced) -join ',' | Should -Be 'numpy>=2.1'
             (Get-Content -Path (Join-Path $m.Root 'requirements.in')) -join '|' | Should -Be 'numpy>=2.1|pandas'
             $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1'
+        }
+
+        It 'shows requirements.in and saves the edit box as a whole' {
+            $m = Get-TestManager
+            $in = Join-Path $m.Root 'requirements.in'
+            [IO.File]::WriteAllText($in, "# header`r`nnumpy")
+
+            $read = Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements/in' -ManagerRoot $m.Root
+            $read.Status | Should -Be 200
+            $read.Body.text | Should -Be "# header`r`nnumpy"
+
+            $bad = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/in' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"text":"numpy\n-r evil.txt"}')
+            $bad.Status | Should -Be 200
+            $bad.Body.saved | Should -Be $false
+            @($bad.Body.problems).Count | Should -Be 1
+            $global:WhmUiJobSteps | Should -BeNullOrEmpty
+            Get-Content -Path $in -Raw | Should -Be "# header`r`nnumpy"
+
+            $ok = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/in' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"text":"# header\nnumpy\npandas>=2.0","publish":true}')
+            $ok.Body.saved | Should -Be $true
+            (Get-Content -Path $in) -join '|' | Should -Be '# header|numpy|pandas>=2.0'
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1|Update-Wheelhouse.ps1'
         }
 
         It 'lists the audit reports and shows one with its advisories' {

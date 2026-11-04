@@ -168,7 +168,7 @@ param(
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays, ApprovalMode
+    -Name WheelhousePath, LocalRequirementsPath, RequirementsInPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays, ApprovalMode
 
 $title = 'Wheelhouse maintenance script'
 $outcome = $null
@@ -209,6 +209,17 @@ try {
         AuditFreshnessDays    = [int]$cfg.AuditFreshnessDays
     }
     $result = Invoke-WheelhouseSync @syncParams
+
+    # requirements.in lists what is still to be published: once a package is in the wheelhouse
+    # its line is taken out. Only for the configured requirements.txt - an explicit
+    # -LocalRequirementsPath was not resolved from requirements.in.
+    if (-not $PSBoundParameters.ContainsKey('LocalRequirementsPath') -and $cfg.LocalRequirementsPath -and $cfg.RequirementsInPath) {
+        try {
+            [string[]]$cleaned = Remove-PublishedRequirementInLine -Path $cfg.RequirementsInPath -RequirementsTxtPath $cfg.LocalRequirementsPath -WheelhousePath $cfg.WheelhousePath
+            if ($cleaned.Count -gt 0) { Write-Log "Published, so taken out of requirements.in: $($cleaned -join ', ')" 'OK' }
+        }
+        catch { Write-Log "Could not take the published packages out of requirements.in: $($_.Exception.Message)" 'WARN' }
+    }
 
     if ($result.Outcome -eq 'Error') {
         $exitCode = Get-WheelhouseExitCode -Outcome Error

@@ -921,8 +921,7 @@ function Add-RequirementInLine {
     # the denylist blocks outright, and names that are already listed - unless -Replace,
     # which then swaps the listed line for the new spec (to change a version range that
     # makes the resolve fail). Returns @{ Added = string[]; Replaced = string[];
-    # Skipped = [{Spec; Reason; Replaceable; AlreadyListed}] }; AlreadyListed marks a spec
-    # that is in requirements.in exactly as entered. Nothing is written if nothing changes.
+    # Skipped = [{Spec; Reason; Replaceable}] }; nothing is written if nothing changes.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -952,7 +951,7 @@ function Add-RequirementInLine {
     foreach ($raw in $Spec) {
         $item = ([string]$raw).Trim()
         if (-not (Test-PackageSpec -Spec $item)) {
-            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = 'not a valid requirement (use a name with an optional version, e.g. numpy or pandas>=2.0)'; Replaceable = $false; AlreadyListed = $false })
+            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = 'not a valid requirement (use a name with an optional version, e.g. numpy or pandas>=2.0)'; Replaceable = $false })
             continue
         }
         $null = $item -match '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(?<rest>.*)$'
@@ -964,14 +963,14 @@ function Add-RequirementInLine {
             $listed = ($current.Line -replace '(^|\s)#.*$', '').Trim()
             $same = $listed.Replace(' ', '') -eq $item.Replace(' ', '')
             if ($same -or -not $Replace) {
-                $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "'$name' is already listed in requirements.in as '$listed'"; Replaceable = (-not $same); AlreadyListed = $same })
+                $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "'$name' is already listed in requirements.in as '$listed'"; Replaceable = (-not $same) })
                 continue
             }
         }
         $pinned = if ($rest -match '^==(?<v>[^,*]+)$') { $Matches['v'] } else { $null }
         $blocked = if ($pinned) { Get-DenylistMatch -Name $name -Version $pinned -Denylist $Denylist } else { Get-DenylistMatch -Name $name -Version '*' -Denylist @($Denylist | Where-Object { $_.version -eq '*' }) }
         if ($blocked) {
-            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "blocked by the denylist ($($blocked.version)): $($blocked.reason)"; Replaceable = $false; AlreadyListed = $false })
+            $skipped.Add([PSCustomObject]@{ Spec = $item; Reason = "blocked by the denylist ($($blocked.version)): $($blocked.reason)"; Replaceable = $false })
             continue
         }
 
@@ -1024,6 +1023,115 @@ function Remove-RequirementInLine {
     }
     if ($PSCmdlet.ShouldProcess($Path, "Remove $($Name -join ', ')")) {
         Write-TextFileAtomic -Path $Path -Content ($lines -join "`r`n")
+    }
+    Write-Output -NoEnumerate $removed.ToArray()
+}
+
+function Set-RequirementInText {
+    # Replaces requirements.in with -Text as typed in the UI (comments and blank lines kept).
+    # Every other line must be a valid spec (Test-PackageSpec), name a package only once and
+    # not be blocked outright by the denylist. Returns @{ Problems = [{Line; Spec; Reason}];
+    # Requirements = string[] }; the file is written only when there is no problem.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [AllowEmptyCollection()]
+        [object[]]$Denylist = @()
+    )
+
+    $lines = @($Text -split "`r?`n" | ForEach-Object { $_.TrimEnd() })
+    while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines = @($lines | Select-Object -First ($lines.Count - 1)) }
+    $problems = [System.Collections.Generic.List[object]]::new()
+    $requirements = [System.Collections.Generic.List[string]]::new()
+    $seen = @{}
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $spec = ($lines[$i] -replace '(^|\s)#.*$', '').Trim()
+        if ($spec -eq '') { continue }
+        if (-not (Test-PackageSpec -Spec $spec)) {
+            $problems.Add([PSCustomObject]@{ Line = $i + 1; Spec = $spec; Reason = 'not a valid requirement (use a name with an optional version, e.g. numpy or pandas>=2.0)' })
+            continue
+        }
+        $null = $spec -match '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(?<rest>.*)$'
+        $name = Get-NormalizedPackageName $Matches['name']
+        $rest = $Matches['rest'].Replace(' ', '')
+        if ($seen.ContainsKey($name)) {
+            $problems.Add([PSCustomObject]@{ Line = $i + 1; Spec = $spec; Reason = "'$name' is already listed on line $($seen[$name]); keep one line per package" })
+            continue
+        }
+        $seen[$name] = $i + 1
+        $pinned = if ($rest -match '^==(?<v>[^,*]+)$') { $Matches['v'] } else { $null }
+        $blocked = if ($pinned) { Get-DenylistMatch -Name $name -Version $pinned -Denylist $Denylist } else { Get-DenylistMatch -Name $name -Version '*' -Denylist @($Denylist | Where-Object { $_.version -eq '*' }) }
+        if ($blocked) {
+            $problems.Add([PSCustomObject]@{ Line = $i + 1; Spec = $spec; Reason = "blocked by the denylist ($($blocked.version)): $($blocked.reason)" })
+            continue
+        }
+        $requirements.Add($spec)
+    }
+
+    if ($problems.Count -eq 0 -and $PSCmdlet.ShouldProcess($Path, "Write $($requirements.Count) requirement(s)")) {
+        $folder = Split-Path -Path $Path -Parent
+        if ($folder -and -not (Test-Path -Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+        Write-TextFileAtomic -Path $Path -Content ($lines -join "`r`n")
+    }
+    return @{ Problems = $problems.ToArray(); Requirements = $requirements.ToArray() }
+}
+
+function Remove-PublishedRequirementInLine {
+    # After an update run: takes out of requirements.in every requirement whose package is now
+    # in the wheelhouse at the version requirements.txt pins, so requirements.in only lists what
+    # is still waiting (new, rejected or in the cooldown). Comments stay. Nothing is removed
+    # when requirements.in changed after requirements.txt was resolved - the pins would not
+    # describe it. Returns the removed lines.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$RequirementsTxtPath,
+
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath
+    )
+
+    $none = [string[]]@()
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or -not (Test-Path -LiteralPath $RequirementsTxtPath -PathType Leaf)) { Write-Output -NoEnumerate $none; return }
+    if ((Get-Item -LiteralPath $Path).LastWriteTimeUtc -gt (Get-Item -LiteralPath $RequirementsTxtPath).LastWriteTimeUtc) {
+        Write-Log 'requirements.in changed after requirements.txt was resolved - its published lines are left in place.' 'WARN'
+        Write-Output -NoEnumerate $none
+        return
+    }
+    $pins = @{}
+    if (([System.IO.File]::ReadAllText($RequirementsTxtPath)).Trim()) { $pins = Read-RequirementFile -FilePath $RequirementsTxtPath }
+    $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+    $published = @{}
+    foreach ($entry in $manifest) { $published["$(Get-NormalizedPackageName ([string]$entry.name))==$($entry.version)"] = $true }
+
+    $kept = [System.Collections.Generic.List[string]]::new()
+    $removed = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $spec = ([string]$line -replace '(^|\s)#.*$', '').Trim()
+        if ($spec -match '^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)') {
+            $name = Get-NormalizedPackageName $Matches['name']
+            if ($pins.ContainsKey($name) -and $published.ContainsKey("$name==$($pins[$name])")) {
+                $removed.Add($spec)
+                continue
+            }
+        }
+        $kept.Add([string]$line)
+    }
+    if ($removed.Count -gt 0 -and $PSCmdlet.ShouldProcess($Path, "Remove $($removed.Count) published requirement(s)")) {
+        $resolvedUtc = (Get-Item -LiteralPath $RequirementsTxtPath).LastWriteTimeUtc
+        Write-TextFileAtomic -Path $Path -Content ($kept -join "`r`n")
+        # Taking out published lines does not make requirements.txt stale: keep the file's time
+        # at the resolve, so the next run still trusts the pins for the lines left.
+        (Get-Item -LiteralPath $Path).LastWriteTimeUtc = $resolvedUtc
     }
     Write-Output -NoEnumerate $removed.ToArray()
 }

@@ -886,6 +886,58 @@ function Get-WheelhouseUiRoute {
         }
 
         @{
+            Method  = 'GET'
+            Pattern = '^/api/requirements/in$'
+            Handler = {
+                param($Context, $Body, $Match)
+                # requirements.in as it is now - the Add tab's edit box shows it.
+                $path = [string]$Context.Settings.RequirementsInPath
+                $text = ''
+                $modified = ''
+                if ($path -and (Test-Path -LiteralPath $path -PathType Leaf)) {
+                    $item = Get-Item -LiteralPath $path
+                    if ($item.Length -gt 1MB) { throw [System.InvalidOperationException]::new("requirements.in is too large to show here: $path") }
+                    $text = [System.IO.File]::ReadAllText($path)
+                    $modified = $item.LastWriteTimeUtc.ToString('o')
+                }
+                return @{ Status = 200; Body = @{ path = $path; text = $text; modified_utc = $modified } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/requirements/in$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                # "Save and resolve": the edit box replaces requirements.in, then requirements.txt is
+                # resolved again (and published too with "publish": true). Lines with a problem
+                # are returned and nothing is written.
+                $text = [string](Get-UiBodyValue -Body $Body -Name 'text')
+                if ($text.Length -gt 100KB) { throw [System.ArgumentException]::new('requirements.in is too long (at most 100 KB).') }
+                $saved = Set-RequirementInText -Path $Context.Settings.RequirementsInPath -Text $text -Denylist @(Read-WheelhouseDenylist -Path $Context.DenylistPath)
+                $problems = @($saved.Problems)
+                if ($problems.Count -gt 0) { return @{ Status = 200; Body = @{ saved = $false; problems = $problems; job = $null } } }
+                $count = @($saved.Requirements).Count
+                if ($count -eq 0) {
+                    # Nothing left to resolve: nothing waits to be published either.
+                    $txt = [string]$Context.Settings.LocalRequirementsPath
+                    if ($txt) { Write-TextFileAtomic -Path $txt -Content '# requirements.in lists no package' }
+                    return @{ Status = 200; Body = @{ saved = $true; problems = @(); job = $null } }
+                }
+                $steps = @(@{ Script = 'Update-Requirement.ps1'; Arguments = @() })
+                $title = 'Resolve requirements.in'
+                if ((Get-UiBodyValue -Body $Body -Name 'publish') -eq $true) {
+                    $steps += @{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() }
+                    $title = 'Resolve and publish requirements.in'
+                }
+                $job = Start-WheelhouseUiJob -Title $title -Kind 'add' -Detail @($saved.Requirements) -Context $Context -Steps $steps
+                return @{ Status = 200; Body = @{ saved = $true; problems = @(); job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
+            }
+        }
+
+        @{
             Method     = 'POST'
             Pattern    = '^/api/requirements/remove$'
             Wheelhouse = $true

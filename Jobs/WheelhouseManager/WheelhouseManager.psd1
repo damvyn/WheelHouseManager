@@ -176,6 +176,8 @@
         'Test-PackageSpec',
         'Add-RequirementInLine',
         'Remove-RequirementInLine',
+        'Set-RequirementInText',
+        'Remove-PublishedRequirementInLine',
         'Test-WheelhouseDefenderAvailable',
         'Invoke-MpScan',
         'Get-WheelhouseThreatDetection',

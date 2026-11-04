@@ -411,8 +411,11 @@ cd C:\WheelHouseManager
 ### 5.1 Add packages (the normal workflow)
 
 1. **Ask for packages.** Add one requirement per line to `Input\requirements.in` - a name
-   (`numpy`) or a range (`pandas>=2.0`). Keep everything you have ever asked for in the file; it
-   is the full list, not just the new lines.
+   (`numpy`) or a range (`pandas>=2.0`). The file lists what is still to be published: after a
+   publish (`Update-Wheelhouse.ps1` with the configured `requirements.txt`), every line whose
+   package is now in the wheelhouse is taken out. Lines that were rejected or wait for the
+   cooldown stay. Each resolve therefore checks the new packages against each other, not against
+   everything already published.
 2. **Resolve them.**
    ```powershell
    .\Update-Requirement.ps1
@@ -713,18 +716,16 @@ in place and only the table scrolls. A banner warns when the weekly check has no
 
 ![Add packages tab](Images/AddPackages.png)
 
-**1. Add packages.** Enter one requirement per line; they are added to `requirements.in` and
-resolved - nothing is downloaded yet.
+**1. Add packages.** The box is `requirements.in` itself, one requirement per line. Edit it and
+click **Save and resolve**: the whole box replaces `requirements.in` and is resolved - nothing is
+downloaded yet.
 
-- A package that is already listed in `requirements.in` with another version range is not added,
-  but gets a **Replace** button (and **Replace all** for several). It swaps the listed line for
-  the one you entered and resolves again - for example when the resolve fails because an old
-  range conflicts with another package.
-- The result (what was added, replaced, already listed and not added, with the reason) appears
-  inside step 1 in a scrolling list that **Hide list** / **Show list** folds away. It stays there,
-  together with anything typed but not yet submitted, when you switch to another tab and back.
-- A requirement that is already in `requirements.in` exactly as entered is shown as
-  *already listed*, not as an error: there is nothing to change.
+- Nothing is saved while a line has a problem (not a valid requirement, a package listed twice,
+  or blocked by the denylist); the lines to fix are listed under the box.
+- An edit you have not saved yet stays in the box when you switch tabs (*Not saved yet*);
+  **Discard changes** shows the file as it is again.
+- After a publish, the lines of packages that reached the wheelhouse are taken out of
+  `requirements.in`, so the box lists only what is still waiting.
 - *Also publish right away* resolves and publishes in one go, skipping the review step.
 
 **2. Review and publish.** Lists only the resolved pins that are **not yet in the wheelhouse**

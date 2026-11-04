@@ -127,9 +127,9 @@
     watchedJob: null,
     pollTimer: null,
     shown: {},
-    // The Add tab is rebuilt every time it is shown: what was typed, the publish checkbox and
-    // the outcome of the last "Add and resolve" live here so that a tab switch keeps them.
-    add: { text: '', publish: false, result: null }
+    // The Add tab is rebuilt every time it is shown: an unsaved edit of requirements.in (null
+    // when there is none), the publish checkbox and the lines a save refused live here.
+    add: { draft: null, publish: false, problems: null }
   };
 
   // ---------------------------------------------------------------- header / tabs
@@ -621,83 +621,76 @@
     clear(root);
     var reviewFix = state.reviewFix;
     state.reviewFix = false;
-    var specs = h('textarea', { placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
-    specs.value = state.add.text;
-    specs.addEventListener('input', function () { state.add.text = specs.value; });
+    // The box is requirements.in itself. An edit not saved yet is kept in state.add.draft,
+    // so switching tabs does not lose it; otherwise the box shows the file as it is now.
+    var specs = h('textarea', { id: 'requirements-in', spellcheck: 'false', placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
+    specs.addEventListener('input', function () { state.add.draft = specs.value; showDirty(); });
     var publishNow = h('input', { type: 'checkbox' });
     publishNow.checked = state.add.publish;
     publishNow.addEventListener('change', function () { state.add.publish = publishNow.checked; });
-    var output = h('div', { class: 'add-result hidden' });
-    var go = h('button', { class: 'btn primary', type: 'button', 'data-idle': true }, 'Add and resolve');
-    // replace: swap the requirements.in line of a package that is already listed.
-    var submit = function (list, replace) {
-      api('POST', '/api/packages/add', { specs: list, publish: publishNow.checked, replace: !!replace }).then(function (data) {
-        state.add.result = data;
-        renderAddResult(output, data, submit);
-        if (data.job) { specs.value = ''; state.add.text = ''; watchJob(data.job.id, false); }
-      }).catch(fail);
-    };
+    var info = h('span', { class: 'muted', id: 'requirements-in-info' });
+    var output = h('div', { class: 'add-result hidden', id: 'requirements-in-problems' });
+    var go = h('button', { class: 'btn primary', type: 'button', 'data-idle': true }, 'Save and resolve');
+    var undo = h('button', { class: 'btn', type: 'button', title: 'Discard the changes and show requirements.in as it is' }, 'Discard changes');
+    function showDirty() {
+      undo.classList.toggle('hidden', state.add.draft === null);
+      info.textContent = state.add.draft === null ? info.getAttribute('data-saved') || '' : 'Not saved yet.';
+    }
+    undo.addEventListener('click', function () { state.add.draft = null; state.add.problems = null; renderProblems(output); loadRequirementsIn(); });
     go.addEventListener('click', function () {
-      var list = specs.value.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(function (s) { return s && s.charAt(0) !== '#'; });
-      if (list.length === 0) { toast('Enter at least one package.', 'bad'); return; }
-      submit(list, false);
+      api('POST', '/api/requirements/in', { text: specs.value, publish: publishNow.checked }).then(function (data) {
+        state.add.problems = data.saved ? null : [].concat(data.problems || []);
+        renderProblems(output);
+        if (!data.saved) { return; }
+        state.add.draft = null;
+        if (data.job) { watchJob(data.job.id, false); } else { toast('requirements.in has no package left - nothing waits to be published.'); loadRequirements(); }
+        loadRequirementsIn();
+      }).catch(fail);
     });
     root.append(
       h('div', { class: 'card' },
         h('h2', {}, '1. Add packages'),
-        h('p', { class: 'muted' }, 'One requirement per line, for example numpy or pandas>=2.0. The names go into requirements.in, and Update-Requirement.ps1 resolves them (with the cooldown) into requirements.txt. Nothing is downloaded yet: review the result below first.'),
+        h('p', { class: 'muted' }, 'This is requirements.in: one requirement per line, for example numpy or pandas>=2.0. Edit it here and click Save and resolve: Update-Requirement.ps1 resolves it (with the cooldown) into requirements.txt. Nothing is downloaded yet: review the result below first. Once a package is published, its line is taken out of requirements.in, so this box lists only what is still waiting.'),
         specs,
         h('p', {}, h('label', {}, publishNow, ' Also publish right away (skips the review step)')),
-        h('div', { class: 'toolbar' }, go),
+        h('div', { class: 'toolbar' }, go, undo, info),
         output),
       h('div', { class: 'card', id: 'requirements-card' }),
       h('div', { class: 'card', id: 'rejected-card' }));
-    if (state.add.result) { renderAddResult(output, state.add.result, submit); }
+    showDirty();
+    renderProblems(output);
+    loadRequirementsIn();
     loadRequirements(reviewFix ? 'fix' : false);
     loadRejected();
   }
 
-  // The outcome of "Add and resolve", inside step 1: a summary line with a button to show or
-  // hide the lists, which scroll on their own when they are long. A package that is already
-  // listed with another version range can replace that line (submit(specs, true)). A spec that
-  // is already in requirements.in exactly as entered is not an error and is listed on its own.
-  function renderAddResult(output, data, submit) {
-    var added = [].concat(data.added || []);
-    var replaced = [].concat(data.replaced || []);
-    var all = [].concat(data.skipped || []);
-    var listed = all.filter(function (s) { return s.AlreadyListed; });
-    var skipped = all.filter(function (s) { return !s.AlreadyListed; });
+  // Shows requirements.in in the Add tab's box - unless an edit is not saved yet.
+  function loadRequirementsIn() {
+    var box = $('requirements-in');
+    if (!box) { return; }
+    if (state.add.draft !== null) { box.value = state.add.draft; return; }
+    api('GET', '/api/requirements/in').then(function (data) {
+      if (state.add.draft !== null || !$('requirements-in')) { return; }
+      box.value = data.text || '';
+      var info = $('requirements-in-info');
+      if (info) {
+        var saved = (data.path || 'requirements.in') + (data.modified_utc ? ' (changed ' + fmtDate(data.modified_utc) + ')' : '');
+        info.setAttribute('data-saved', saved);
+        info.textContent = saved;
+      }
+    }).catch(fail);
+  }
+
+  // The lines "Save and resolve" refused (nothing was written), until they are fixed.
+  function renderProblems(output) {
+    var problems = state.add.problems || [];
     clear(output);
-    var total = added.length + replaced.length + listed.length + skipped.length;
-    output.classList.toggle('hidden', total === 0);
-    if (total === 0) { return; }
-    var replaceable = skipped.filter(function (s) { return s.Replaceable; }).map(function (s) { return s.Spec; });
-    var replaceButton = function (list, label) {
-      return h('button', { class: 'btn small', type: 'button', 'data-idle': true, title: 'Use ' + list.join(', ') + ' instead of the line in requirements.in, then resolve again',
-        onclick: function () { submit(list, true); } }, label);
-    };
-    var lists = h('div', { class: 'result-scroll' },
-      added.length ? [h('p', {}, 'Added to requirements.in:'), h('ul', { class: 'result-list' }, added.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
-      replaced.length ? [h('p', {}, 'Replaced in requirements.in:'), h('ul', { class: 'result-list' }, replaced.map(function (a) { return h('li', { class: 'mono' }, a); }))] : null,
-      listed.length ? [h('p', {}, 'Already in requirements.in (nothing to change):'), h('ul', { class: 'result-list' }, listed.map(function (s) { return h('li', { class: 'mono' }, s.Spec); }))] : null,
-      skipped.length ? [h('p', {}, 'Not added:'), h('ul', { class: 'result-list' }, skipped.map(function (s) {
-        return h('li', { class: 'bad' }, h('span', { class: 'mono' }, s.Spec), ' - ', s.Reason, s.Replaceable ? [' ', replaceButton([s.Spec], 'Replace')] : null);
-      }))] : null,
-      replaceable.length ? h('p', { class: 'muted' }, 'Replace swaps the listed line for the one you entered and resolves again - for example to fix a version range that makes the resolve fail.') : null);
-    var toggle = h('button', { class: 'btn small', type: 'button' }, 'Hide list');
-    toggle.addEventListener('click', function () {
-      var hide = !lists.classList.contains('hidden');
-      lists.classList.toggle('hidden', hide);
-      toggle.textContent = hide ? 'Show list' : 'Hide list';
-    });
-    output.append(h('div', { class: 'add-result-head' },
-      h('strong', {}, 'Result:'), ' ',
-      added.length ? badge(added.length + ' added', 'ok') : null, ' ',
-      replaced.length ? badge(replaced.length + ' replaced', 'ok') : null, ' ',
-      listed.length ? badge(listed.length + ' already listed') : null, ' ',
-      skipped.length ? badge(skipped.length + ' not added', 'bad') : null,
-      h('span', { class: 'spacer' }),
-      replaceable.length > 1 ? replaceButton(replaceable, 'Replace all ' + replaceable.length) : null, toggle), lists);
+    output.classList.toggle('hidden', problems.length === 0);
+    if (problems.length === 0) { return; }
+    output.append(h('div', { class: 'add-result-head' }, h('strong', {}, 'Not saved:'), ' ', badge(problems.length + ' line(s) to fix', 'bad')),
+      h('div', { class: 'result-scroll' }, h('ul', { class: 'result-list' }, problems.map(function (p) {
+        return h('li', { class: 'bad' }, 'Line ' + p.Line + ': ', h('span', { class: 'mono' }, p.Spec), ' - ', p.Reason);
+      }))));
   }
 
   function loadRequirements(showNextStep) {
@@ -1371,10 +1364,11 @@
     if (state.currentTab === 'packages') { loadPackages(); }
     else if (state.currentTab === 'jobs') { loadJobs(); }
     else if (state.currentTab === 'add') {
-      // After a successful "Add and resolve", the next step is reviewing the result.
+      // After a successful "Save and resolve", the next step is reviewing the result.
       var next = job.kind === 'add' && job.status === 'Succeeded';
       if (job.kind === 'remediate' && job.status === 'Succeeded') { next = 'fix'; }
       loadRequirements(next);
+      loadRequirementsIn();
       loadRejected();
     }
     if (job.kind === 'remediate' && job.status === 'Succeeded' && state.currentTab !== 'add') {
