@@ -57,10 +57,11 @@ function Read-RequirementDependent {
     $dependents = @{}
     $current = $null
     $inList = $false
+    $keepSource = [bool]$IncludeSource
     $add = {
         param([string]$Entry)
         $token = ($Entry.Trim() -split '\s+')[0]
-        if ($IncludeSource -and $token -eq '-r') {
+        if ($keepSource -and $token -eq '-r') {
             $source = ($Entry.Trim() -replace '\s+', ' ')
             if (-not $dependents.ContainsKey($current)) { $dependents[$current] = @() }
             if ($dependents[$current] -notcontains $source) { $dependents[$current] = @($dependents[$current]) + $source }
