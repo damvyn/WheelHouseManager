@@ -250,6 +250,18 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
     last verification is not hashed; missing files always count); `Test-Wheelhouse.ps1` hashes
     everything and refreshes the cache. The cache never lives on the share.
 
+30. **A package is never published without the pins it needs; a published one is never removed for
+    a dependency.** `Invoke-WheelhouseSync` checks every group before it publishes any, then holds
+    back (category `dependency`) each verified package whose dependency - from the `# via`
+    annotations of `requirements.txt` (`Read-RequirementDependent`) - was rejected in any group,
+    up the chain (`Get-DependentRejection`). *Why:* clients resolve from the whole share with
+    `no-index`; a parent without its dependency fails to install, or silently gets an older,
+    possibly vulnerable, version. Once published, a parent stays when its dependency later fails
+    a check (it is installed on clients and the fix is the dependency's new version); findings,
+    notices and the UI name it instead (`Get-CatalogDependent`, from the `requires[]` the catalog
+    reads once from each wheel's METADATA). Without annotations (`--no-annotate`) nothing is held
+    back and the run warns.
+
 ---
 
 ## 5. Layers and dependency rules
@@ -467,6 +479,8 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Add-RequirementToGroupFile` | append `name==version` (create file if needed) | file | worker, restore |
 | `ConvertTo-UvPythonPlatform` | pip platform tag -> uv triple; throws if unknown | string | Update-Requirement, settings validation |
 | `Invoke-PipPinRetry` | run pip over pins; drop the pin named in "No matching distribution found for X"; retry. A failure naming no pin -> `Error` | `@{ Succeeded; Failed; Error }` | wheel check, intake download |
+| `Read-RequirementDependent` | the `# via` annotations of a `uv pip compile` file (one-line and list style; `-r`/`-c` sources skipped) | hashtable name -> names of the pins that need it | sync run |
+| `Get-DependentRejection` | invariant 30: candidates (`-Candidates`) that need a rejected pin of exactly the `-Pins` version, transitively; reason `needs X==v, which was rejected (<reason>)` | `{Name; Version; Category dependency; Reason; Dependency}` | sync run |
 | `Test-RequirementWheelAvailability` | `pip install --dry-run --no-deps --ignore-installed --only-binary=:all: --python-version --platform --implementation cp --target <tmp>` | `@{ Passed; Unavailable; Error }` | Update-Requirement |
 
 ### 8.4 `Manifest.ps1`
@@ -600,12 +614,23 @@ request), `Get-WheelhouseUiToolStatus` (`Get-WheelhouseToolStatus` cached for 30
 | `Update-CatalogRecordFinding` | invariant 23: add / update / resolve / reopen findings; history `FindingNew`, `SeverityChanged`, `FindingResolved`, `FindingReopened` | `Update-CatalogAuditResult` |
 | `Set-CatalogFindingWaiver` | copy unexpired waivers onto open findings, take ended ones off; history `Waived` / `WaiverEnded` | audit recording, UI waiver routes |
 | `Get-CatalogFindingStatus` | `Resolved` / `Waived` / `Overdue` / `Open` | alerts, UI |
-| `Get-CatalogFindingAlert` | every finding of a published version with `Status`, `Level` and `AlertReason` (`New`, `Overdue`, `Reminder`, `WaiverExpired`, `Resolved` or `$null`), shaped for the alert; `-NowUtc`, `-ReminderDays` | scheduled check |
+| `Get-CatalogFindingAlert` | every finding of a published version with `Status`, `Level`, `AlertReason` (`New`, `Overdue`, `Reminder`, `WaiverExpired`, `Resolved` or `$null`) and `NeededBy` (`Get-CatalogDependent`), shaped for the alert; `-NowUtc`, `-ReminderDays` | scheduled check |
 | `Set-CatalogFindingNotified` | after delivery: record the alerted level, drop alerted resolved findings | scheduled check |
 | `Get-CatalogUnverifiedRecord` | published versions without a completed audit for `-FreshnessDays` (never-audited ones once published that long) | scheduled check |
 | `Get-CatalogMaliciousRecord` | published versions with an open, unwaived `MAL-*` finding: `{Record; Ids}` | `Resolve-MaliciousPackage`, scheduled check |
 | `Update-WheelhouseCatalog` | write lock (unless `-LockHeld`) + read + sync + `-Update { param($catalog) }` + save | scripts, journal repair, sync run |
 | `Set-WheelhouseCatalogState` | record operation results (`{Name; Version; State; Action; Detail}`) in history and catalog; failure only warns | publish, remove, restore |
+
+### 8.13a `Dependency.ps1`
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Read-WheelRequirement` | `Requires-Dist` of a wheel's `.dist-info/METADATA` (headers only), without `extra == ...` entries: `{name; spec; marker}`; throws for an unreadable wheel | `Update-CatalogRequirement` |
+| `Test-VersionSpecifier` | PEP 440 specifier (`==`, `!=`, `<`, `<=`, `>`, `>=`, `~=`, `===`, `.*`) -> `$true`/`$false`, `$null` when a clause cannot be evaluated | `Get-CatalogDependent` |
+| `Update-CatalogRequirement` | fill `requires[]` once per Published record (`requires_checked`); unreadable -> retried next time | `Sync-WheelhouseCatalog` |
+| `Get-CatalogDependent` | Published versions whose `requires[]` names the package with a specifier that accepts (or may accept) the version: `{Name; Version; Requirement}` | alerts, notices, UI history |
+| `Format-CatalogDependent` | `name==version (needs <requirement>)` | same |
+| `Add-WheelhouseNoticeDependent` | sets `NeededBy` and extends the message of Denylisted/Yanked/FileMissing/FileModified/Malicious notices | sync run, `Test-Wheelhouse.ps1` |
 
 ### 8.14 `Journal.ps1`
 
@@ -766,11 +791,16 @@ A [write lock]  Read-WheelhouseDenylist; Read-WheelhouseManifest; isBootstrap = 
                     is missing or older than AuditFreshnessDays; Read-WheelhouseWaiver
                 Get-WheelhouseGroupFile + Read-RequirementFile per group (snapshot)
 B [no lock]     Read-RequirementFile(local); Get-RequirementMergePlan -> additions per group
-C per group (existing first, then new by number):
+C [no lock]     Read-RequirementDependent(local)  (no annotations -> warning, nothing held back)
+  per group (existing first, then new by number):
    [no lock]    candidates = additions + Compare-RequirementsAgainstManifest(listed vs manifest).Packages
                 Invoke-CandidateIntake (Expedite, RequireDefenderScan, StagingRoot)
+  [no lock]     Get-DependentRejection(every group's rejections, verified pins) -> moved from
+                Verified to Rejected (category dependency) in their group (invariant 30)
+  per group:
    [write lock] Publish-CandidateIntake (9.1 steps 6-10) -> manifest refreshed
    [no lock]    rejections -> list (+ IntakeBlocked notice for integrity/defender; audit-error => incomplete)
+  finally       staging folders of groups not published (a throw in between) are deleted
    after all groups: Invoke-PublishedAudit -Stage Deployed over what was published before this
                 run (one set per "n-th version of a package", not one audit per group)
                 warn about unused -ExpeditePackage; write Report_Rejected_*
@@ -784,6 +814,7 @@ E [no lock]     Get-AuditResultSeverity(all audits)                      (OSV, c
   [write lock]  catalog: Sync + Update-CatalogAuditResult(all audits, Severity, DueDays, Waiver)
                 Resolve-MaliciousPackage -AutoQuarantine:$AutoQuarantine -> Malicious notices
                 (no scan of the share)
+Add-WheelhouseNoticeDependent(notices)                   (published packages that need them)
 Outcome: incomplete -> Error, any failure -> Attention, else Ok
 ```
 
@@ -808,7 +839,8 @@ Update-WheelhouseCatalog { Update-CatalogAuditResult(Severity, DueDays, Waiver);
     this block is skipped and the Vulnerable reports are alerted as before
 Get-CatalogMaliciousRecord -> Resolve-MaliciousPackage (AutoQuarantine on: write lock) -> Malicious notices
 Get-CatalogUnverifiedRecord(AuditFreshnessDays) -> Unverified notices
-Get-CatalogFindingAlert(OverdueReminderDays)
+Get-CatalogFindingAlert(OverdueReminderDays)            (each finding with NeededBy)
+Add-WheelhouseNoticeDependent(notices)
 Get-VulnerabilityAlertParameter(AuditResults, Notice, CheckError, Finding) -> & Send-VulnerabilityAlert.ps1
 delivered (or nothing to send) -> Update-WheelhouseCatalog { Set-CatalogFindingNotified }
 exit: incomplete or alert failed -> 2; open (unwaived) findings or notices -> 1; else 0
@@ -826,7 +858,8 @@ pipeline is stateful too: it passes `Get-CatalogFindingAlert` as `-Finding` and 
 delivery; with `-Finding`, Vulnerable reports are kept only for `PreDownload` (blocked candidates).
 `Send-VulnerabilityAlert.ps1` -> `Get-VulnerabilityFinding` (group from the report name,
 `-candidates` suffix => blocked before download) -> HTML: notices table, findings table (deployed:
-line to remove + exact wheel files from the manifest; blocked: change `requirements.in`), errors
+line to remove + exact wheel files from the manifest + the published packages that need it;
+blocked: change `requirements.in`), errors
 list. Integrity failures abort before any alert (they surface as exit code 2 and
 `Report_Integrity_*`).
 
@@ -876,7 +909,8 @@ Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it wor
   one record per manifest version (`Published`) and per quarantine record (`Quarantined`), with
   the latest audit/scan results imported from the report files, and one `CatalogCreated` event.
 - Reconciled by every catalog write: state, files and groups follow manifest, group files and
-  quarantine; differences produce `Reconciled` or `Discovered` events.
+  quarantine; differences produce `Reconciled` or `Discovered` events. `requires[]` is read once
+  per published version from its wheel (`Update-CatalogRequirement`).
 - Operations record their own changes with a reason (`Published`, `Quarantined`, `Deleted`,
   `Restored`, `Recovered`, `UntrackedMoved`); checks record `AuditChanged`, `ScanChanged`,
   `PyPIChanged`; findings record `FindingNew`, `SeverityChanged`, `FindingResolved`,
@@ -913,7 +947,7 @@ Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it wor
 | `GET /api/overview` | - | `Get-WheelhouseStatus` (counts, `attention[]`, last check) + the Scheduled Task's state | 200 |
 | `GET /api/state` | - | path, configured, reachable, defender, is_admin, python/platform, `tools` (python, pip-audit, uv), running job | 200 |
 | `GET /api/packages` | - | `Get-WheelhousePackage` (denylist, configured services) + `last_check_utc`, `check_overdue` (no completed weekly check within `AuditFreshnessDays`), `audit_freshness_days` | 200 |
-| `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks, findings) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
+| `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks, findings, `needed_by`) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
 | `GET /api/schedule` | - | `Get-WheelhouseScheduledCheck` + `last_check_utc` (catalog), `current_user`, `mapped_drive {drive; unc}` | 200 |
 | `POST /api/schedule` | `{days[], time 'HH:mm', user, password}` | `Register-WheelhouseScheduledCheck` (password -> SecureString at once) | 200 / 400 / 409 |
 | `POST /api/schedule/run`, `POST /api/schedule/remove` | - / `{confirm:true}` | `Start-` / `Unregister-WheelhouseScheduledCheck` | 200 / 400 / 404 / 409 |
@@ -1029,7 +1063,8 @@ UploadTimeUtc; Yanked; YankedReason}]`, `FirstUploadUtc`, `Yanked`, `YankedReaso
 
 **Catalog** (`catalog.json`): `{ schema: 1; updated_utc; scheduled_check_utc; packages: [record] }`.
 Record: `name`, `version`, `state` (`Published`/`Quarantined`/`Removed`), `state_since`, `state_reason`,
-`groups[]` (group file names), `files[]`, `published_utc`, `findings[]` (`id`, `aliases[]`, `summary`,
+`groups[]` (group file names), `files[]`, `published_utc`, `requires[]` (`{name; spec}` from the
+wheel's Requires-Dist, extras left out), `requires_checked`, `findings[]` (`id`, `aliases[]`, `summary`,
 `fix_versions[]`, `severity` Critical|High|Medium|Low|Unknown, `score`, `severity_source`,
 `first_seen`, `due`, `resolved_utc`, `waiver {reason; by; expires_utc}`|null, `notified`
 New|Overdue|Waived|Resolved|'', `notified_utc`), `checks`:

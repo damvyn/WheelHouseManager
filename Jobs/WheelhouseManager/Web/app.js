@@ -471,6 +471,7 @@
         record ? h('p', {}, h('strong', {}, 'State: '), record.state, record.state_since ? ' since ' + fmtDate(record.state_since) : '',
           record.state_reason ? ' - ' + record.state_reason : '') : h('p', { class: 'muted' }, 'Not in the catalog.'),
         record && record.groups && record.groups.length ? h('div', {}, h('strong', {}, 'Groups: '), [].concat(record.groups).join(', ')) : null,
+        record && record.needed_by && [].concat(record.needed_by).length ? h('div', {}, h('strong', {}, 'Needed by: '), [].concat(record.needed_by).join('; ')) : null,
         line('Audit', checks.audit, function (c) { return c.status + (c.vulnerabilities && [].concat(c.vulnerabilities).length ? ' - ' + [].concat(c.vulnerabilities).join(', ') : ''); }),
         line('Defender', checks.scan, function (c) { return c.status; }),
         line('PyPI', checks.pypi, function (c) { return c.status + (c.reason ? ' - ' + c.reason : ''); }));

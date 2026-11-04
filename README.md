@@ -86,8 +86,12 @@ The two parts only share the wheelhouse folder: the manager writes it, clients r
    | Verification | The downloaded file is not one PyPI lists for the release, its sha256 differs from PyPI's, or the file itself is yanked or newer than the cooldown. |
    | Defender | Microsoft Defender detects something in the download. |
 
-   Downloads wait in a staging folder on the manager server until they passed everything. Only
-   then are they copied to the share, so clients never see an unchecked file.
+   | Dependency | A package it needs (from the `# via` lines `uv pip compile` writes into `requirements.txt`) was rejected by any of the checks above, in any group. The package is **held back** with it, so clients never get a package without the dependency it needs. Packages that need a held-back package are held back too. |
+
+   Every group is checked first and published only afterwards, so a dependency rejected in one
+   group also holds back a package destined for another group. Downloads wait in a staging folder
+   on the manager server until they passed everything. Only then are they copied to the share, so
+   clients never see an unchecked file.
 5. **Published.** The wheel is in the wheelhouse, recorded with its SHA256 in `manifest.json`, and
    its pin is listed in a group file. Clients can install it. The package catalog
    (`catalog.json`) marks the version *Published* and its history records who published it.
@@ -466,6 +470,7 @@ Every rejection has a reason. What to do:
 | `Microsoft Defender detected` | Malware detection in the download. **Security event.** | Do not use this version. Review the detection in Defender. |
 | `denylist` | The version is blocked. | Remove the entry from the denylist if the block is no longer wanted. |
 | `the Defender scan could not be completed` | `RequireDefenderScanAtIntake` is on and the run was not elevated. | Run from an elevated PowerShell. |
+| `needs <dependency>==<version>, which was rejected (<its reason>)` | Category `dependency`: the package passed its own checks but needs a pin that was rejected. Nothing of it was published. | Deal with the dependency's reason (the text in brackets). If that is the cooldown, nothing to do - both are published together once it has passed. Otherwise constrain the dependency in `requirements.in` (e.g. `urllib3>=2.9`) or choose another version of the package, resolve, publish. |
 
 A rejected **new** pin is simply tried again on the next run. A rejected pin that a group file
 **already lists** (e.g. a hand-edited group file) is reported as "still listed without a wheel" -
@@ -496,7 +501,11 @@ severity and fix-by date (or *overdue*).
 
 An alert (email, or `<wheelhouse>\reports\Alert_<timestamp>.html`) can contain three sections:
 
-**Packages that need attention** - each row has a recommended action:
+**Packages that need attention** - each row has a recommended action. When the version is a
+dependency of other published packages, the details end with **Published package(s) that need
+it** (for example `requests==2.32.3 (needs urllib3 <3,>=1.21.1)`). Those packages stay published -
+they are installed on clients - but check that they still install, and update them together with
+the dependency.
 
 | Kind | What happened | What to do |
 |---|---|---|
@@ -513,7 +522,9 @@ An alert (email, or `<wheelhouse>\reports\Alert_<timestamp>.html`) can contain t
 version, the group file(s) that list it and the exact wheel file(s). In the weekly check's alert
 each finding also has a **severity**, a **fix-by** date and a **status**: `NEW`, `OVERDUE`,
 `OVERDUE (reminder)`, `waiver ended`, or `open` (already alerted, listed again for completeness).
-Overdue ones come first; resolved findings are listed in a short section of their own. The weekly
+Overdue ones come first; resolved findings are listed in a short section of their own. A finding
+in a version that other published packages need says so (**Needed by published package(s)**):
+removing it without a replacement would break their installs, so prefer the fix version. The weekly
 check alerts only when there is something new to say (a new, newly overdue, reminded, unwaived or
 resolved finding, a notice, or a failed check). A finding marked *Blocked before download* was a
 candidate that never reached the wheelhouse - just change `requirements.in`. For a published
@@ -704,7 +715,8 @@ Every published wheel with its groups, latest audit (for a vulnerable one: worst
 fix-by date, or *overdue*) and Defender result, a *yanked* badge if PyPI withdrew it, and the
 denylist flag. Filter by name or status (vulnerable, fix overdue, risk accepted, threat, never
 audited/scanned, yanked, denylisted, file missing). Select rows to **Audit**, **Scan**,
-**Quarantine** or **Delete**; **History** shows one version's state, checks, vulnerabilities
+**Quarantine** or **Delete**; **History** shows one version's state, the published packages that
+need it (*Needed by*), checks, vulnerabilities
 (with **Accept risk** / **Remove waiver** and **Fix**, see 5.14) and history. The toolbar stays
 in place and only the table scrolls. A banner warns when the weekly check has not run for
 `AuditFreshnessDays`.
@@ -731,7 +743,8 @@ succeeds, the page scrolls to step 2 and highlights it.
 
 - **Publish N pin(s)** runs every check, then publishes. It counts only pins that can pass: a pin
   the latest publish rejected is not counted, except one rejected only for the cooldown (*waiting
-  for cooldown*), which publishing adds once the cooldown has passed. When only rejected pins are
+  for cooldown*) - its own, or that of a dependency it was held back for - which publishing adds
+  once the cooldown has passed. When only rejected pins are
   left, the button reads *Nothing to publish*.
 - **Remove** on a rejected pin (when it is listed in `requirements.in`) takes it out of
   `requirements.in` and resolves again. A rejected pin marked *dependency* is needed by another

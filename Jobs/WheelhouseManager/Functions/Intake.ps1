@@ -8,7 +8,9 @@ function Invoke-CandidateIntake {
     # and decides per package:
     #   Verified - passed everything; its downloaded files wait in the staging folder.
     #   Rejected - failed a step (with the reason and a category).
-    # A package that fails never holds back the others. Publish-CandidateIntake then
+    # Each package is checked on its own here; Invoke-WheelhouseSync then holds back the
+    # verified packages that need a rejected one (Get-DependentRejection, category
+    # 'dependency') before anything is published. Publish-CandidateIntake then
     # publishes the verified ones (and deletes the staging folder), so a group file
     # never lists a package whose wheel was not published.
     #

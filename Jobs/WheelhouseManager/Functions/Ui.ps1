@@ -72,7 +72,8 @@ function Get-WheelhouseUiToolStatus {
 function Get-WheelhouseUiPendingPin {
     # What publishing requirements.txt would add: its pins (-Pin, name -> version) that are not
     # in the wheelhouse yet, as { name; version; rejected (the latest update's reason or $null);
-    # retryable (rejected only for the cooldown, so publishing again can pass); direct (listed
+    # retryable (rejected only for the cooldown - its own, or a dependency's it waits for - so
+    # publishing again can pass); direct (listed
     # in requirements.in - otherwise a dependency of another requirement) }. Without a
     # reachable wheelhouse every pin is pending.
     [CmdletBinding()]
@@ -112,7 +113,7 @@ function Get-WheelhouseUiPendingPin {
             name      = $name
             version   = [string]$Pin[$name]
             rejected  = $reason
-            retryable = [bool]($reason -and $reason -match '^cooldown')
+            retryable = [bool]($reason -and $reason -match '^(needs \S+, which was rejected \()*cooldown')
             direct    = [bool](Get-RequirementInLine -Lines ([string[]]$inLines) -Name $name)
         }
     }
@@ -767,6 +768,8 @@ function Get-WheelhouseUiRoute {
                         published_utc = $record.published_utc
                         checks        = $record.checks
                         findings      = @(ConvertTo-WheelhouseUiFinding -Record $record)
+                        # Published packages that need this version.
+                        needed_by     = [string[]]@(Format-CatalogDependent -Dependent (Get-CatalogDependent -Catalog $catalog -Name $name -Version $version))
                     }
                 }
                 return @{ Status = 200; Body = @{ name = $name; version = $version; record = $state; events = $events } }

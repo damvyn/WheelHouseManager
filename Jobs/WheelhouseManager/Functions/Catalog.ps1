@@ -10,6 +10,8 @@
 # Record:
 #   name, version, state (Published / Quarantined / Removed), state_since, state_reason,
 #   groups[] (group file names), files[] (wheel file names), published_utc,
+#   requires[] = the wheel's Requires-Dist without extras: { name; spec } (Update-CatalogRequirement),
+#   requires_checked (true once read - requires[] may be empty),
 #   checks.audit = { status Passed|Vulnerable|Unknown; last_run; last_ok; vulnerabilities[];
 #                    services: { <service>: { status; last_run; vulnerabilities[]; last_error; error } } }
 #   checks.scan  = { status Clean|Threat; last_run; threat_files[] }
@@ -157,6 +159,8 @@ function ConvertTo-CatalogRecord {
         groups        = @(foreach ($group in @($InputObject.groups)) { if ($group) { [string]$group } })
         files         = @(foreach ($file in @($InputObject.files)) { if ($file) { [string]$file } })
         published_utc = ConvertTo-IsoTimestamp -Value $InputObject.published_utc
+        requires      = @(foreach ($requirement in @($InputObject.requires)) { if ($requirement -and $requirement.name) { [PSCustomObject]@{ name = [string]$requirement.name; spec = [string]$requirement.spec } } })
+        requires_checked = [bool]$InputObject.requires_checked
         findings      = @(foreach ($finding in @($InputObject.findings)) { if ($finding -and $finding.id) { ConvertTo-CatalogFinding -InputObject $finding } })
         checks        = [PSCustomObject]@{
             audit = ConvertTo-CatalogCheck -Kind 'audit' -Check $(if ($checks) { $checks.audit } else { $null })
@@ -465,6 +469,9 @@ function Sync-WheelhouseCatalog {
         }
         if (@($record.groups).Count -gt 0) { $record.groups = @(); $changed = $true }
     }
+
+    # What each published version needs (read once per version from its wheel).
+    if (Update-CatalogRequirement -Catalog $Catalog) { $changed = $true }
 
     if ($isNew) {
         # Keep what the UI already showed: the latest audit and scan results from the reports.
@@ -838,7 +845,9 @@ function Get-CatalogFindingAlert {
         $record = $Catalog.Records[$key]
         if ($record.state -ne 'Published') { continue }
         $serviceMap = Get-CatalogServiceMap -Record $record
+        $neededBy = $null
         foreach ($finding in @($record.findings)) {
+            if ($null -eq $neededBy) { $neededBy = Format-CatalogDependent -Dependent (Get-CatalogDependent -Catalog $Catalog -Name $record.name -Version $record.version) }
             if ($null -eq $finding) { continue }
             $services = [System.Collections.Generic.List[string]]::new()
             foreach ($service in $serviceMap.Keys) {
@@ -880,6 +889,8 @@ function Get-CatalogFindingAlert {
                 Notified       = $finding.notified
                 AlertReason    = $reason
                 Waiver         = $finding.waiver
+                # Published packages that need this version (Get-CatalogDependent).
+                NeededBy       = $neededBy
             }
         }
     }
