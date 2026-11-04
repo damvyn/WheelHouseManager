@@ -108,12 +108,17 @@ function Get-WheelhouseUiPendingPin {
         $key = "$name==$($Pin[$name])"
         if ($published.ContainsKey($key)) { continue }
         $reason = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null })
+        [string[]]$from = @()
+        if ($sources.ContainsKey($name)) { $from = $sources[$name] }
+        # "User input" for a line of requirements.in, otherwise the packages that need it.
+        $requestedBy = @(@(foreach ($item in $from) { if ($item -match '^-r\s') { 'User input' } else { $item } }) | Select-Object -Unique)
         @{
             name      = $name
             version   = [string]$Pin[$name]
             rejected  = $reason
             retryable = [bool]($reason -and $reason -match '^cooldown')
-            direct    = [bool](Test-RequirementTxtDirect -Source ([string[]]@($(if ($sources.ContainsKey($name)) { $sources[$name] } else { @() }))))
+            direct    = [bool](Test-RequirementTxtDirect -Source $from)
+            requested_by = $requestedBy
         }
     }
 }
@@ -885,6 +890,7 @@ function Get-WheelhouseUiRoute {
                         pending         = @($pending)
                         published_count = $pins.Count - @($pending).Count
                         approval        = (Get-WheelhouseUiApproval -Context $Context -RequirementsPath $path)
+                        resolve_failure = $(if ($path) { Read-RequirementResolveStatus -RequirementsTxtPath $path } else { $null })
                     }
                 }
             }

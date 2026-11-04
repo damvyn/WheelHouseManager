@@ -215,6 +215,7 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .link-toggle:hover, .link-toggle:focus-visible { text-decoration: underline; }
 /* A job is running: buttons that would start another one look disabled (their clicks are blocked). */
 body.job-running [data-idle] { opacity: .45; cursor: not-allowed; }
+body.job-running #requirements-in { opacity: .6; cursor: not-allowed; }
 /* Audit tab */
 #tab-audit .table-wrap.scroll-list { max-height: 360px; margin: 8px 0; }
 .report-row { cursor: pointer; }

@@ -673,7 +673,12 @@ where the fix proposal waits for approval.
 ```powershell
 C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1                     # opens the browser
 C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -Port 9000 -NoBrowser
+C:\WheelHouseManager\Jobs\Start-WheelhouseUI.ps1 -KeepInput         # keep Input\requirements.*
 ```
+
+Every start empties `Input\requirements.in` (down to its comment header) and
+`Input\requirements.txt`, so the Add packages tab starts fresh. Use `-KeepInput` when a
+`requirements.txt` waits for a second person's approval (`ApprovalMode = SeparateApprover`).
 
 The UI runs on the manager server only (`http://localhost:8765/`). Keep the PowerShell window open
 while you use it; stop it with Ctrl+C or the **Stop UI** button. Start it from an **elevated**
@@ -719,8 +724,9 @@ in place and only the table scrolls. A banner warns when the weekly check has no
 ![Add packages tab](Images/AddPackages.png)
 
 **1. Add packages.** The box is `requirements.in` itself, one requirement per line. Edit it and
-click **Save and resolve**: the whole box replaces `requirements.in` and is resolved - nothing is
-downloaded yet.
+click **Add and resolve**: the whole box replaces `requirements.in` and is resolved, together with
+the pins still waiting in step 2 (new packages are added, duplicates are ignored) - nothing is
+downloaded yet. While a job runs, the box and the button are locked.
 
 - Nothing is saved while a line has a problem (not a valid requirement, a package listed twice,
   or blocked by the denylist); the lines to fix are listed under the box.
@@ -732,8 +738,16 @@ downloaded yet.
 
 **2. Review and publish.** Lists only the resolved pins that are **not yet in the wheelhouse**
 (pins already published are only counted; the whole `requirements.txt` is behind *Show the whole
-requirements.txt*), each marked *new* or *rejected last time* with the reason. When resolving
-succeeds, the page scrolls to step 2 and highlights it.
+requirements.txt*), with **Requested by** (*User input* for your own lines, otherwise the
+packages that need it, from the `# via` lines uv writes) and the status: *new* or *rejected last
+time* with the reason. When resolving succeeds, the page scrolls to step 2 and highlights it.
+
+- When the latest resolve **failed**, step 2 says why and lists every line of step 1 with its
+  status (not found on PyPI, version does not exist, no usable wheel, named in a version
+  conflict). Publishing is off (*Fix the resolve first*) until a resolve succeeds.
+- After a publish in which every pin of `requirements.txt` got into the wheelhouse,
+  `requirements.txt` is emptied. If a pin was rejected (or waits for the cooldown), the file
+  stays, so the pin stays listed here with Remove and Clear list.
 
 - **Publish N pin(s)** runs every check, then publishes. It counts only pins that can pass: a pin
   the latest publish rejected is not counted, except one rejected only for the cooldown (*waiting
@@ -828,7 +842,7 @@ shows the details.
 | `Jobs\Invoke-WheelhouseRemediation.ps1` | Prepare the fix of a vulnerable published version as a proposal (5.14) | `-Package name==ver`, `-ExpediteReason` |
 | `Jobs\Invoke-WheelhouseScan.ps1` | On-demand Defender scan of all or chosen wheels - copied locally and hash-checked first, never scanned on the share (elevated) | `-File name.whl,...` |
 | `Jobs\Send-VulnerabilityAlert.ps1` | Build and send/save an alert (used by the scripts above) | `-ReportPaths`, `-Findings`, `-AuditErrors`, `-Notices`, `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
-| `Jobs\Start-WheelhouseUI.ps1` | Start the web UI | `-Port`, `-NoBrowser` |
+| `Jobs\Start-WheelhouseUI.ps1` | Start the web UI (empties the Input files first) | `-Port`, `-NoBrowser`, `-KeepInput` |
 
 Changes to the wheelhouse are serialized, but only for the seconds in which files are written:
 quarantine, delete and restore work while an update runs, and the update and the checks wait (up

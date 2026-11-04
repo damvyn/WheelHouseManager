@@ -566,6 +566,10 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Clear-RequirementInFile` | keep only the comment lines of `requirements.in`; returns the requirements taken out | `Update-Requirement.ps1` after writing requirements.txt, when it resolved the configured `RequirementsInPath` |
 | `Get-RequirementCarryOver` | `name==version` of the requirements.txt pins not in the manifest, not listed in requirements.in and not denylisted (all pins when the wheelhouse is unreachable) | `Update-Requirement.ps1` (resolved together with requirements.in) |
 | `Get-RequirementTxtSource` / `Test-RequirementTxtDirect` | uv's `# via` annotations: name -> what requires it (`-r <file>` = asked for); no annotation counts as asked for | `Get-WheelhouseUiPendingPin` (`direct`), `Remove-RequirementTxtPin` |
+| `Get-RequirementResolveProblem` | after a failed resolve: `{spec; ok; status}` per requirements.in line (PyPI name / exact version, `-Unavailable` from the wheel check, names in uv's error output) | `Update-Requirement.ps1` |
+| `Write-RequirementResolveStatus` / `Read-RequirementResolveStatus` | `Input\requirements.status.json` - the latest failed resolve (removed by a good one) | `Update-Requirement.ps1` / `GET /api/requirements` (`resolve_failure`) |
+| `Clear-PublishedRequirementTxt` | empty requirements.txt when every pin is in the manifest | `Update-Wheelhouse.ps1` (configured `LocalRequirementsPath` only) |
+| `Reset-WheelhouseInput` | empty requirements.in (keeps comments) and requirements.txt, remove `requirements.status.json` / `requirements.rejected.txt`; the proposal history stays | `Start-WheelhouseUI.ps1` unless `-KeepInput` |
 | `Remove-RequirementTxtPin` | take pins out of requirements.txt plus the pins only they needed; throws before writing for a name not pinned | UI remove |
 
 ### 8.11 `Scan.ps1`
@@ -936,7 +940,7 @@ Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it wor
 | `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool, replace:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
 | `GET /api/requirements/in` | - | `RequirementsInPath` (<= 1 MB), the Add tab's edit box | 200 `{path, text, modified_utc}` |
 | `POST /api/requirements/in` | `{text (<= 100 KB), publish:bool}` | `Set-RequirementInText`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` if `publish:true`); no job when no requirement is listed (requirements.txt unchanged); problems -> `saved:false` and nothing written | 200 `{saved, problems, job}` |
-| `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review, plus `pending` (pins not in the manifest, each with the reason from the latest `Report_Rejected_*` if any) and `published_count` | 200 `{path, text, modified_utc, pin_count}` |
+| `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review, plus `pending` (pins not in the manifest, each with the reason from the latest `Report_Rejected_*` if any, `direct` and `requested_by` from the `# via` lines), `published_count` and `resolve_failure` (`Read-RequirementResolveStatus`) | 200 `{path, text, modified_utc, pin_count}` |
 | `POST /api/wheelhouse/update` | `{confirm:true}` | job `Update-Wheelhouse.ps1` | 202 / 400 |
 | `POST /api/packages/remove` | `{packages (<= 200), mode:'quarantine'\|'delete', reason (<= 400), confirm}` | `Remove-WheelhousePackage` per package; refused while a job runs | 200 `{results}` |
 | `GET /api/quarantine`, `POST /api/quarantine/restore` | `{id, keep_denylist}` | list / `Restore-WheelhousePackage` | 200 |

@@ -183,14 +183,29 @@ if ($PreferCurrent -and (Test-Path -LiteralPath $cfg.RequirementsTxtPath)) {
     Write-Log 'Keeping the current versions wherever they still fit (only what has to change changes).'
 }
 Write-Log "Resolving with uv (binary wheels only, $($cfg.PythonVersion) / $uvPlatform)..."
-Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs
+[string[]]$uvOutput = Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs -PassThru
+$uvExit = $LASTEXITCODE
 Remove-Item -Path $constraintsPath -Force -ErrorAction SilentlyContinue
 Remove-Item -Path $combinedPath -Force -ErrorAction SilentlyContinue
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Log "uv pip compile FAILED (exit code $LASTEXITCODE). Review the output above." "ERROR"
+# For the UI: which lines of requirements.in to fix after a failed resolve.
+$target = "Python $($cfg.PythonVersion) / $($cfg.Platform)"
+function Write-ResolveFailure {
+    param([string]$Message, [string[]]$Unavailable = @())
+    try {
+        $problems = @(Get-RequirementResolveProblem -Lines ([string[]]@(Get-Content -LiteralPath $cfg.RequirementsInPath)) -ToolOutput $uvOutput -Unavailable $Unavailable -Target $target)
+        Write-RequirementResolveStatus -RequirementsTxtPath $cfg.RequirementsTxtPath -Failed -Message $Message -Problem $problems
+        foreach ($item in @($problems | Where-Object { -not $_.ok })) { Write-Log "  $($item.spec): $($item.status)" 'ERROR' }
+    }
+    catch { Write-Log "Could not record the resolve problems: $($_.Exception.Message)" 'WARN' }
+}
+
+if ($uvExit -ne 0) {
+    Write-Log "uv pip compile FAILED (exit code $uvExit). Review the output above." "ERROR"
     Write-Log "Typical cause: a package (or a version range in requirements.in) has no binary wheel for Python $($cfg.PythonVersion) / $($cfg.Platform)." "ERROR"
     Remove-Item -Path $candidatePath -Force -ErrorAction SilentlyContinue
+    $uvError = @($uvOutput | Where-Object { $_ -match '(?i)error|because|no solution|not found' } | Select-Object -First 3) -join ' '
+    Write-ResolveFailure -Message $(if ($uvError) { $uvError } else { 'The job log says why.' })
     exit 1
 }
 
@@ -210,6 +225,7 @@ if (-not $check.Passed) {
         Write-Log "Remove them from requirements.in, or constrain them there to a version that supports Python $($cfg.PythonVersion), then run this script again." "ERROR"
     }
     Write-Log "requirements.txt was NOT changed. The rejected result was saved for review: $rejectedPath" "ERROR"
+    Write-ResolveFailure -Message "Some resolved packages have no usable wheel for $target$(if ($check.Error) { ": $($check.Error)" })." -Unavailable ([string[]]@($check.Unavailable))
     exit 1
 }
 
@@ -217,6 +233,7 @@ Move-Item -Path $candidatePath -Destination $cfg.RequirementsTxtPath -Force
 Remove-Item -Path $rejectedPath -Force -ErrorAction SilentlyContinue
 
 Write-Log "requirements.txt written successfully: $($cfg.RequirementsTxtPath)" "OK"
+Write-RequirementResolveStatus -RequirementsTxtPath $cfg.RequirementsTxtPath
 if ($clearInput) {
     try {
         [string[]]$cleared = Clear-RequirementInFile -Path $cfg.RequirementsInPath

@@ -2676,6 +2676,74 @@ Describe 'WheelhouseManager' {
         }
     }
 
+    Context 'Resolve status and the Input lifecycle' {
+        It 'gives every line of requirements.in a status after a failed resolve' {
+            Mock -ModuleName WheelhouseManager -CommandName Get-PyPIProjectRelease -MockWith {
+                if ($Name -eq 'sdfsdf') { throw 'Response status code does not indicate success: 404 (Not Found).' }
+                if ($Name -eq 'offline') { throw 'The remote name could not be resolved' }
+                [PSCustomObject]@{ Version = '1.0'; FirstUploadUtc = $null; Yanked = $false }
+                [PSCustomObject]@{ Version = '2.0'; FirstUploadUtc = $null; Yanked = $false }
+            }
+            $lines = @('# header', 'sdfsdf', 'good==3.0', 'good-two>=1', 'offline', 'clash', 'nowheel==2.0', 'fine==1.0  # ok')
+            $output = @('  x No solution found when resolving dependencies:', '  Because clash==1.0 depends on good-two<1 ...')
+
+            $result = @(Get-RequirementResolveProblem -Lines $lines -ToolOutput $output -Unavailable @('nowheel==2.0') -Target 'Python 3.14 / win_amd64')
+
+            $result.Count | Should -Be 7
+            ($result | Where-Object { $_.spec -eq 'sdfsdf' }).status | Should -Match 'not found on PyPI'
+            ($result | Where-Object { $_.spec -eq 'good==3.0' }).status | Should -Match 'version 3.0 does not exist'
+            ($result | Where-Object { $_.spec -eq 'good-two>=1' }).status | Should -Match 'resolver error'
+            ($result | Where-Object { $_.spec -eq 'offline' }).status | Should -Match 'could not be checked'
+            ($result | Where-Object { $_.spec -eq 'clash' }).status | Should -Match 'resolver error'
+            ($result | Where-Object { $_.spec -eq 'nowheel==2.0' }).status | Should -Match 'no usable wheel for Python 3.14'
+            ($result | Where-Object { $_.spec -eq 'fine==1.0' }).ok | Should -Be $true
+        }
+
+        It 'records a failed resolve next to requirements.txt and removes it after a good one' {
+            $txt = Join-Path (Get-TestFolder) 'requirements.txt'
+            Write-RequirementResolveStatus -RequirementsTxtPath $txt -Failed -Message 'no solution' -Problem @([PSCustomObject]@{ spec = 'sdfsdf'; ok = $false; status = 'not found on PyPI' })
+
+            $status = Read-RequirementResolveStatus -RequirementsTxtPath $txt
+            $status.failed | Should -Be $true
+            $status.message | Should -Be 'no solution'
+            @($status.packages).Count | Should -Be 1
+            @($status.packages)[0].spec | Should -Be 'sdfsdf'
+
+            Write-RequirementResolveStatus -RequirementsTxtPath $txt
+            Read-RequirementResolveStatus -RequirementsTxtPath $txt | Should -BeNullOrEmpty
+        }
+
+        It 'empties requirements.txt only when every pin is published' {
+            $wheelhouse = Get-TestWheelhouse
+            $txt = Join-Path (Get-TestFolder) 'requirements.txt'
+            Set-Content -Path $txt -Value @('six==1.16.0', 'requests==2.32.3')
+            Clear-PublishedRequirementTxt -Path $txt -WheelhousePath $wheelhouse | Should -Be $false
+            (Get-Content -Path $txt) -join '|' | Should -Be 'six==1.16.0|requests==2.32.3'
+
+            Set-Content -Path $txt -Value @('six==1.16.0', '    # via -r requirements.in', 'attrs==23.1.0')
+            Clear-PublishedRequirementTxt -Path $txt -WheelhousePath $wheelhouse | Should -Be $true
+            Get-Content -Path $txt -Raw | Should -BeNullOrEmpty
+        }
+
+        It 'starts the UI with empty Input files' {
+            $folder = Get-TestFolder
+            $in = Join-Path $folder 'requirements.in'
+            $txt = Join-Path $folder 'requirements.txt'
+            [IO.File]::WriteAllText($in, "# header`r`nnumpy")
+            [IO.File]::WriteAllText($txt, 'numpy==2.3.1')
+            Set-Content -Path (Join-Path $folder 'requirements.status.json') -Value '{}'
+            Set-Content -Path (Join-Path $folder 'proposal-history.jsonl') -Value '{}'
+
+            [string[]]$changed = Reset-WheelhouseInput -RequirementsInPath $in -RequirementsTxtPath $txt
+
+            $changed.Count | Should -Be 3
+            (Get-Content -Path $in) -join '|' | Should -Be '# header'
+            Get-Content -Path $txt -Raw | Should -BeNullOrEmpty
+            Test-Path -Path (Join-Path $folder 'requirements.status.json') | Should -Be $false
+            Test-Path -Path (Join-Path $folder 'proposal-history.jsonl') | Should -Be $true
+        }
+    }
+
     Context 'Remove-RequirementInLine' {
         It 'removes the package by its normalized name and keeps the other lines' {
             $path = Join-Path (Get-TestFolder) 'requirements.in'
@@ -3116,6 +3184,8 @@ Describe 'WheelhouseManager' {
             $review = Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root
             (@($review.Body.pending) | Where-Object { $_.name -eq 'requests' }).direct | Should -Be $true
             (@($review.Body.pending) | Where-Object { $_.name -eq 'urllib3' }).direct | Should -Be $false
+            @((@($review.Body.pending) | Where-Object { $_.name -eq 'requests' }).requested_by) -join ',' | Should -Be 'User input'
+            @((@($review.Body.pending) | Where-Object { $_.name -eq 'certifi' }).requested_by) -join ',' | Should -Be 'numpy,requests'
 
             (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"-r evil"}')).Status | Should -Be 400
             (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"pandas"}')).Status | Should -Be 404

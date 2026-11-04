@@ -624,13 +624,14 @@
     // The box is requirements.in itself. An edit not saved yet is kept in state.add.draft,
     // so switching tabs does not lose it; otherwise the box shows the file as it is now.
     var specs = h('textarea', { id: 'requirements-in', spellcheck: 'false', placeholder: 'numpy\npandas>=2.0\nrequests==2.32.3' });
+    specs.readOnly = document.body.classList.contains('job-running');
     specs.addEventListener('input', function () { state.add.draft = specs.value; showDirty(); });
     var publishNow = h('input', { type: 'checkbox' });
     publishNow.checked = state.add.publish;
     publishNow.addEventListener('change', function () { state.add.publish = publishNow.checked; });
     var info = h('span', { class: 'muted', id: 'requirements-in-info' });
     var output = h('div', { class: 'add-result hidden', id: 'requirements-in-problems' });
-    var go = h('button', { class: 'btn primary', type: 'button', 'data-idle': true }, 'Save and resolve');
+    var go = h('button', { class: 'btn primary', type: 'button', 'data-idle': true }, 'Add and resolve');
     var undo = h('button', { class: 'btn', type: 'button', title: 'Discard the changes and show requirements.in as it is' }, 'Discard changes');
     function showDirty() {
       undo.classList.toggle('hidden', state.add.draft === null);
@@ -650,7 +651,7 @@
     root.append(
       h('div', { class: 'card' },
         h('h2', {}, '1. Add packages'),
-        h('p', { class: 'muted' }, 'This is requirements.in: one requirement per line, for example numpy or pandas>=2.0. Edit it here and click Save and resolve: Update-Requirement.ps1 resolves it (with the cooldown) together with the pins still waiting below into requirements.txt. Nothing is downloaded yet: review the result below first. When the resolve succeeds, requirements.in is emptied - its packages are then listed below. When it fails, the box keeps the lines so you can fix them.'),
+        h('p', { class: 'muted' }, 'This is requirements.in: one requirement per line, for example numpy or pandas>=2.0. Edit it here and click Add and resolve: Update-Requirement.ps1 resolves it (with the cooldown) together with the pins still waiting below into requirements.txt. Nothing is downloaded yet: review the result below first. When the resolve succeeds, requirements.in is emptied - its packages are then listed below. When it fails, the box keeps the lines so you can fix them.'),
         specs,
         h('p', {}, h('label', {}, publishNow, ' Also publish right away (skips the review step)')),
         h('div', { class: 'toolbar' }, go, undo, info),
@@ -710,6 +711,20 @@
       card.append(h('h2', {}, '2. Review and publish'),
         h('p', { class: 'muted' }, 'Resolved pins in ' + (data.path || 'requirements.txt') + (data.modified_utc ? ' (changed ' + fmtDate(data.modified_utc) + ')' : '') +
           '. Publishing runs Update-Wheelhouse.ps1: every new pin is checked against the denylist, audited, checked for the cooldown and for yanked releases, downloaded into a staging folder, verified against the sha256 published on PyPI and scanned with Defender. Only then is it copied into the wheelhouse. Pins already in the wheelhouse are skipped.'));
+      // The latest "Add and resolve" failed: what to fix in step 1, and no publishing until then.
+      var failure = data.resolve_failure && data.resolve_failure.failed ? data.resolve_failure : null;
+      if (failure) {
+        var lines = [].concat(failure.packages || []);
+        card.append(h('div', { class: 'banner' }, h('strong', {}, 'The latest resolve failed' + (failure.time_utc ? ' (' + fmtDate(failure.time_utc) + ')' : '') + '. '), failure.message || '',
+          ' Fix the lines in step 1 and click Add and resolve again; publishing stays off until then.'));
+        if (lines.length) {
+          card.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Line in step 1'), h('th', {}, 'Status'))),
+            h('tbody', {}, lines.map(function (l) {
+              return h('tr', {}, h('td', { class: 'mono' }, l.spec), h('td', {}, l.ok ? badge('ok', 'ok') : [badge('problem', 'bad'), ' ', l.status]));
+            })))));
+        }
+      }
       if (!data.pin_count) {
         card.append(h('div', { class: 'empty' }, 'requirements.txt is empty - add packages above first.'));
         return;
@@ -726,7 +741,7 @@
       }
       var rejectedCount = pending.filter(function (p) { return p.rejected; }).length;
       card.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Status'), rejectedCount ? h('th', {}, '') : null)),
+        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Requested by'), h('th', {}, 'Status'), rejectedCount ? h('th', {}, '') : null)),
         h('tbody', {}, pending.map(function (p) {
           // Only a pin the latest publish rejected can be taken out of requirements.txt here; a
           // dependency of another requirement goes away only with that requirement.
@@ -738,7 +753,10 @@
           }
           var status = !p.rejected ? badge('new', 'ok')
             : p.retryable ? [badge('waiting for cooldown', 'warn'), ' ', p.rejected] : [badge('rejected', 'bad'), ' ', p.rejected];
-          return h('tr', {}, h('td', { class: 'mono' }, p.name + '==' + p.version), h('td', {}, status),
+          var by = [].concat(p.requested_by || []);
+          return h('tr', {}, h('td', { class: 'mono' }, p.name + '==' + p.version),
+            h('td', {}, by.length ? by.map(function (b, i) { return [i ? ', ' : '', b === 'User input' ? h('strong', {}, b) : h('span', { class: 'mono' }, b)]; }) : h('span', { class: 'muted' }, '-')),
+            h('td', {}, status),
             rejectedCount ? h('td', { class: 'num' }, action) : null);
         })))));
       // A rejected pin is not counted for publishing; one rejected only for the cooldown is,
@@ -753,7 +771,7 @@
         card.append(h('p', { class: 'muted' }, waiting + ' pin(s) are newer than the cooldown. Publishing again adds them once the cooldown has passed; Remove takes them out if you do not want to wait.'));
       }
       var clearable = pending.length > 0;
-      card.append(renderApproval(data.approval, publishable, clearable), whole);
+      card.append(renderApproval(data.approval, failure ? 0 : publishable, clearable, !!failure), whole);
     }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
   }
 
@@ -772,7 +790,7 @@
   // The proposal behind requirements.txt and the buttons. With the default approval mode the
   // person who publishes is recorded and there is nothing to approve separately; the
   // SeparateApprover mode (decision D3) keeps Approve / Reject for a second person.
-  function renderApproval(a, publishable, clearable) {
+  function renderApproval(a, publishable, clearable, resolveFailed) {
     var box = h('div', { class: 'approval' });
     var p = a.proposal;
     var separate = a.mode === 'SeparateApprover';
@@ -833,7 +851,7 @@
       buttons.append(propose);
     }
     var publish = h('button', { class: 'btn primary', type: 'button', 'data-idle': true, disabled: !a.can_publish || publishable === 0 },
-      publishable === 0 ? 'Nothing to publish' : 'Publish ' + publishable + ' pin(s)');
+      resolveFailed ? 'Fix the resolve first' : publishable === 0 ? 'Nothing to publish' : 'Publish ' + publishable + ' pin(s)');
     publish.addEventListener('click', function () {
       confirmDialog('Publish ' + publishable + ' pin(s)?', h('div', {},
         h('p', {}, 'Every pin that is not yet in the wheelhouse goes through all checks; a package that fails one is rejected with the reason and nothing about it is published.'),
@@ -1349,6 +1367,9 @@
   // (marked data-idle) looks disabled and its clicks are swallowed: the server refuses them anyway.
   function setJobRunning(running) {
     document.body.classList.toggle('job-running', !!running);
+    // While a job runs, requirements.in cannot be edited either (step 1 of the Add tab).
+    var box = $('requirements-in');
+    if (box) { box.readOnly = !!running; }
   }
   document.addEventListener('click', function (e) {
     if (!document.body.classList.contains('job-running')) { return; }
