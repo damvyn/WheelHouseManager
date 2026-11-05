@@ -199,6 +199,7 @@
         'Get-WheelhouseThreatDetection',
         'Invoke-WheelhouseCopyScan',
         'Invoke-WheelhouseDefenderScan',
+        'Save-WheelhouseScanReport',
         'Get-WheelhouseUiContext',
         'Get-WheelhouseScheduledCheckScript',
         'ConvertTo-ScheduledCheckResultText',

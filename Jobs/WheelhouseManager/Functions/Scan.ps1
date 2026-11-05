@@ -141,17 +141,31 @@ function Invoke-WheelhouseCopyScan {
             NotScanned   = $notScanned.ToArray()
             ReportPath   = $null
         }
-        if ($ReportsFolder -and (Test-Path -Path $ReportsFolder)) {
-            $reportFile = Join-Path $ReportsFolder "Report_Scan_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-            Write-JsonFile -Path $reportFile -InputObject $result -Depth 4
-            $result.ReportPath = $reportFile
-            Write-Log "Scan report saved to: $reportFile"
-        }
+        Save-WheelhouseScanReport -Result $result -ReportsFolder $ReportsFolder
         return $result
     }
     finally {
         Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Save-WheelhouseScanReport {
+    # Saves a Wheelhouse.ScanResult as <ReportsFolder>\Report_Scan_<timestamp>.json and sets its
+    # ReportPath. Does nothing without an existing reports folder.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Result,
+
+        [AllowEmptyString()]
+        [string]$ReportsFolder
+    )
+
+    if (-not $ReportsFolder -or -not (Test-Path -Path $ReportsFolder)) { return }
+    $reportFile = Join-Path $ReportsFolder "Report_Scan_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+    Write-JsonFile -Path $reportFile -InputObject $Result -Depth 4
+    $Result.ReportPath = $reportFile
+    Write-Log "Scan report saved to: $reportFile"
 }
 
 function Invoke-WheelhouseDefenderScan {
@@ -237,11 +251,6 @@ function Invoke-WheelhouseDefenderScan {
         ReportPath   = $null
     }
 
-    if ($ReportsFolder -and (Test-Path -Path $ReportsFolder)) {
-        $reportFile = Join-Path $ReportsFolder "Report_Scan_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-        Write-JsonFile -Path $reportFile -InputObject $result -Depth 4
-        $result.ReportPath = $reportFile
-        Write-Log "Scan report saved to: $reportFile"
-    }
+    Save-WheelhouseScanReport -Result $result -ReportsFolder $ReportsFolder
     return $result
 }

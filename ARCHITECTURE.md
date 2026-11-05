@@ -654,6 +654,7 @@ The resolve loop of `Update-Requirement.ps1` (sequence in 7.3). It never touches
 | `Get-WheelhouseThreatDetection` | detections since a time, per resource, with threat name (mock seam) | scan |
 | `Invoke-WheelhouseCopyScan` | copy wheels to local staging, check SHA256 against the manifest, scan the copies, report the share files; changed/uncopyable wheels in `NotScanned` | `Wheelhouse.ScanResult` | Invoke-WheelhouseScan.ps1 |
 | `Invoke-WheelhouseDefenderScan` | scan local paths, match detections (5 s margin) by substring of the scanned path; `Threat` > `Error` > `Clean`; optional `Report_Scan_*`. Never given the share. | intake, `Invoke-WheelhouseCopyScan` |
+| `Save-WheelhouseScanReport` | save a scan result as `Report_Scan_<timestamp>.json` and set its `ReportPath` | `Invoke-WheelhouseDefenderScan`, `Invoke-WheelhouseCopyScan` |
 
 ### 8.13 `Ui.ps1`
 See [section 10](#10-web-ui). Functions: `Get-WheelhouseUiContext` (effective settings, read per
