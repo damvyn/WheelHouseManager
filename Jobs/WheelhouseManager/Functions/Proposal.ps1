@@ -37,7 +37,7 @@ function Get-WheelhouseCurrentUser {
     param()
 
     try { return [System.Security.Principal.WindowsIdentity]::GetCurrent().Name }
-    catch { return $(if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }) }
+    catch { return Get-WheelhouseUserName }
 }
 
 function Get-RequirementFileHash {

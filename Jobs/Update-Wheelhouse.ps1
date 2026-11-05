@@ -196,7 +196,7 @@ try {
         if ([string]::IsNullOrWhiteSpace($ExpediteReason)) {
             throw '-ExpeditePackage needs -ExpediteReason: say why the cooldown is skipped.'
         }
-        $user = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
+        $user = Get-WheelhouseUserName
         Write-Log "Cooldown is skipped for $(($expedite.Keys | Sort-Object | ForEach-Object { "$_==$($expedite[$_])" }) -join ', ') - requested by $user. Reason: $ExpediteReason" 'WARN'
     }
 

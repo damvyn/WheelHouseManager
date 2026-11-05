@@ -485,6 +485,8 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Test-WheelhousePackageName` / `Test-WheelhousePackageVersion` / `Test-WheelhouseWheelFileName` | validate names, versions, bare wheel file names from outside | bool | UI, denylist, scan script |
 | `ConvertTo-WheelhousePin` | `name==version` pins from arrays and comma/semicolon lists; `ArgumentException` otherwise | `{Name; Version}` | Update-Wheelhouse, Test-WheelhousePackage |
 | `ConvertTo-HtmlSafe` | HTML-encode | string | alert HTML |
+| `Enable-WheelhouseTls12` | add TLS 1.2 on Windows PowerShell 5.1 (no-op on 7) | - | PyPI and OSV requests |
+| `Get-WheelhouseUserName` | `$env:USERNAME`, or `unknown` | string | history, journal, denylist, quarantine, waivers |
 | `Write-TextFileAtomic` | write `<path>.tmp`, move over target | file | JSON/settings/group rewrites |
 | `Write-JsonFile` | `ConvertTo-Json` (arrays stay arrays, null -> `[]`) + atomic write | file | manifest, reports, denylist, quarantine |
 | `Invoke-NativeCommand` | run exe, stderr merged as text, lines echoed; `-PassThru` returns lines (`-NoEnumerate`); `$LASTEXITCODE` kept | lines | pip, pip-audit, uv callers |

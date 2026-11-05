@@ -498,7 +498,7 @@ function Remove-WheelhousePackage {
         $affectedGroups = @($allGroups | Where-Object {
                 (Read-RequirementFile -FilePath $_)[$normalized] -eq $Version
             })
-        $user = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
+        $user = Get-WheelhouseUserName
         # "Deleting" a version whose wheels are already gone (e.g. the file server's
         # antivirus took them) only takes it out of the group files and the manifest.
         $alreadyGone = (-not $Quarantine) -and -not ($entries | Where-Object { Test-Path -LiteralPath (Join-Path $WheelhousePath ([string]$_.file)) })
@@ -877,7 +877,7 @@ function Restore-WheelhousePackage {
         $data = [ordered]@{ id = $Id; name = [string]$record.name; version = [string]$record.version; record = $record; folder = $folder; keep_denylist = [bool]$KeepDenylist }
         $journal = New-WheelhouseJournal -WheelhousePath $WheelhousePath -Operation 'restore' -Data $data
         $denyRemoved = Complete-WheelhouseRestoreJournal -WheelhousePath $WheelhousePath -Data $data -DenylistPath $DenylistPath
-        $user = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
+        $user = Get-WheelhouseUserName
         $change = [PSCustomObject]@{
             Name    = [string]$record.name
             Version = [string]$record.version

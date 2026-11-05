@@ -47,7 +47,7 @@ function New-WheelhouseJournal {
     $journal = [ordered]@{
         operation   = $Operation
         started_utc = (Get-Date).ToUniversalTime().ToString('o')
-        user        = $(if ($env:USERNAME) { $env:USERNAME } else { 'unknown' })
+        user        = (Get-WheelhouseUserName)
         pid         = $PID
         data        = $Data
     }

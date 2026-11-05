@@ -6,6 +6,8 @@
     PowerShellVersion = '5.1'
     FunctionsToExport = @(
         'Write-Log',
+        'Enable-WheelhouseTls12',
+        'Get-WheelhouseUserName',
         'Get-NormalizedPackageName',
         'Test-WheelhousePackageName',
         'Test-WheelhousePackageVersion',

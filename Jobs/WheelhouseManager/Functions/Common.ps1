@@ -90,6 +90,27 @@ function Write-Log {
     Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
 }
 
+function Enable-WheelhouseTls12 {
+    # Windows PowerShell 5.1 on older .NET Framework defaults to TLS 1.0/1.1, which pypi.org
+    # and OSV reject - every web check would then fail closed. Call before a web request.
+    [CmdletBinding()]
+    param()
+
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+}
+
+function Get-WheelhouseUserName {
+    # The user name recorded in history, journals and denylist entries ('unknown' without one).
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    if ($env:USERNAME) { return $env:USERNAME }
+    return 'unknown'
+}
+
 function Get-NormalizedPackageName {
     # PEP 503 style normalization: runs of -, _, . collapse to a single "-", lowercase.
     [CmdletBinding()]

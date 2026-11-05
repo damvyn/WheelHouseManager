@@ -516,9 +516,7 @@ function Test-WheelhouseHealth {
     }
 
     if (-not $Offline) {
-        if ($PSVersionTable.PSEdition -ne 'Core') {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        }
+        Enable-WheelhouseTls12
         foreach ($site in @(@('PyPI', 'https://pypi.org/pypi/pip/json'), @('OSV', 'https://api.osv.dev/v1/vulns/GHSA-j8r2-6x86-q33q'))) {
             try {
                 [void](Invoke-RestMethod -Uri $site[1] -TimeoutSec 20 -ErrorAction Stop)

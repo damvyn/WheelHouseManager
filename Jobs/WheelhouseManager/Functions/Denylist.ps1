@@ -109,7 +109,7 @@ function Add-WheelhouseDenylistEntry {
         version   = $Version
         reason    = $Reason.Trim()
         added_utc = (Get-Date).ToUniversalTime().ToString('o')
-        added_by  = $(if ($env:USERNAME) { $env:USERNAME } else { 'unknown' })
+        added_by  = (Get-WheelhouseUserName)
         source    = $Source
     }
 
