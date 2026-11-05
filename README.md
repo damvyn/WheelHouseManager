@@ -70,7 +70,9 @@ The two parts only share the wheelhouse folder: the manager writes it, clients r
    UI.
 2. **Resolved.** `Update-Requirement.ps1` turns that into exact pins (`numpy==2.3.1` plus every
    dependency) in `Input\requirements.txt`, using only versions that have a wheel for your target
-   Python and platform and that are older than the cooldown.
+   Python and platform and that are older than the cooldown. A line that cannot be resolved (too
+   new, no usable wheel, not on PyPI, a conflict) is **set aside** with its reason, and the rest is
+   resolved without it.
 3. **Reviewed.** You (or whoever approves changes) read `requirements.txt`.
 4. **Checked and published.** `Update-Wheelhouse.ps1` takes each new pin through these checks,
    in order. A package that fails one is **rejected with the reason** and never reaches the
@@ -84,8 +86,7 @@ The two parts only share the wheelhouse folder: the manager writes it, clients r
    | Cooldown | The release is newer than `MinimumPackageAgeDays` (default 10). The reason says when it becomes eligible. |
    | Download | No wheel exists for the target Python / platform. |
    | Verification | The downloaded file is not one PyPI lists for the release, its sha256 differs from PyPI's, or the file itself is yanked or newer than the cooldown. |
-   | Defender | Microsoft Defender detects something in the download. |
-
+   | Defender | Microsoft Defender detects something in the download (skipped when `DefenderScanAtIntake` is off). |
    | Dependency | A package it needs (from the `# via` lines `uv pip compile` writes into `requirements.txt`) was rejected by any of the checks above, in any group. The package is **held back** with it, so clients never get a package without the dependency it needs. Packages that need a held-back package are held back too. |
 
    Every group is checked first and published only afterwards, so a dependency rejected in one
@@ -138,6 +139,8 @@ can scan published wheels on demand (from hash-checked local copies).
 | **Manifest** | `manifest.json` in the wheelhouse: every published wheel with its SHA256. Any change to a wheel is detected. |
 | **Cooldown** | Minimum age of a release before it is accepted (`MinimumPackageAgeDays`). Protects against freshly published malicious or broken releases. |
 | **Denylist** | `config\denylist.json`: versions (or `*` for all versions) that must never enter the wheelhouse. |
+| **Set aside** | A `requirements.in` line the resolve could not resolve (too new, no usable wheel, not found, conflict). It is listed with its reason and the rest is resolved without it. |
+| **Held back** | A package that passed its own checks but was not published because a package it needs was rejected (category `dependency`). |
 | **Quarantine** | `<wheelhouse>\_quarantine\`: removed packages kept for later restore. |
 | **Catalog** | `catalog.json` in the wheelhouse: each package version's state (*Published*, *Quarantined*, *Removed*) and its latest audit, Defender and PyPI results. Rebuilt automatically from the other files if it is missing. |
 | **History** | `events.jsonl` in the wheelhouse: who did what to which version, and when a check result changed. |
@@ -212,14 +215,18 @@ C:\WheelHouseManager\
         settings.psd1               your settings
         denylist.json               blocked packages (created on first use)
     Input\
-        requirements.in             what you ask for
+        requirements.in             what you ask for (emptied after each successful resolve)
         requirements.txt            resolved pins, waiting to be published
+        requirements.status.json    lines the last resolve set aside, with the reason
+        proposal.json               who requested / approved requirements.txt (+ proposal-history.jsonl)
     staging\                        downloads waiting for their checks (emptied after each run)
+    state\                          integrity cache, background-audit marker (never on the share)
     logs\ui\                        output of jobs started from the web UI
 ```
 
-The wheelhouse share gets `manifest.json`, `catalog.json`, `events.jsonl`, `advisories.json`, the
-group files, `reports\` and `_quarantine\` as they are needed. After an upgrade from a version without a
+The wheelhouse share gets `manifest.json`, `catalog.json`, `events.jsonl`, `advisories.json`,
+`index.html`, the group files, `reports\`, `_quarantine\`, `_untracked\` (wheels nobody published)
+and `_replaced\` (copies an overwrite replaced) as they are needed. After an upgrade from a version without a
 catalog, the first run that changes or checks the wheelhouse creates `catalog.json` from what is
 there (including the latest audit and scan results); nothing needs to be done by hand.
 
@@ -434,10 +441,13 @@ audit anyway and skip this.
    pins of the old `requirements.txt` that are not published yet (and not denylisted) are
    resolved again together with `requirements.in`, so nothing waiting is lost. Pins that are
    already published are not, so a resolve checks the new packages against what is waiting, not
-   against everything in the wheelhouse. If the resolve fails (a version conflict, a package that
-   does not exist, no wheel for your Python/platform), nothing is changed and `requirements.in`
-   keeps its lines: the problem packages are listed, a wheel-check failure is saved as
-   `Input\requirements.rejected.txt`, and you fix `requirements.in` and run it again.
+   against everything in the wheelhouse. One run deals with every line: a line that cannot be
+   resolved (too new for the cooldown, no wheel for your Python/platform, not on PyPI, a version
+   conflict) is **set aside** with its reason (`Input\requirements.status.json`, and the UI's
+   *Packages with problems* table) and the rest is resolved without it. Change or remove the
+   set-aside line and resolve again, or expedite one that is only too new (5.6). Only when
+   nothing usable comes out (uv fails without naming a line, pip cannot run) is `requirements.txt`
+   left unchanged and the result saved as `Input\requirements.rejected.txt`.
 3. **Review and approve.** Resolving records a **proposal** for exactly this `requirements.txt`
    (who requested it, when; `Input\proposal.json`, history in `Input\proposal-history.jsonl`).
    Only an approved proposal is published. Who may approve depends on `ApprovalMode`:
@@ -455,8 +465,11 @@ audit anyway and skip this.
    ```powershell
    .\Update-Wheelhouse.ps1
    ```
-   Pins already in the wheelhouse are skipped. Each new pin goes through every check (see
-   [the life of a package](#the-life-of-a-package)). The log ends with what was accepted and what
+   Pins already in the wheelhouse are skipped (unless you overwrite them with
+   `-OverwritePackage name==version`, see [6.3](#63-add-packages)). Each new pin goes through every
+   check (see [the life of a package](#the-life-of-a-package)); only these new packages are audited
+   and scanned - what is already published is re-checked by the weekly check. When every pin of
+   `requirements.txt` is in the wheelhouse afterwards, `requirements.txt` is emptied. The log ends with what was accepted and what
    was rejected, and why; the rejections are also saved in
    `<wheelhouse>\reports\Report_Rejected_<timestamp>.json`.
 
@@ -464,8 +477,10 @@ audit anyway and skip this.
    run found (vulnerable candidates, Defender detections, ...).
 
 In the UI: **Add packages** tab -> enter the packages -> **Add and resolve** -> check the
-**Review and publish** card -> **Approve** (or **Approve and publish**) -> **Publish**. The card
-shows the proposal, who requested and approved it, and only the buttons you are allowed to use.
+**Review and publish** card (problems first, then the packages to publish, with checkboxes) ->
+**Publish N package(s)** (with `SeparateApprover`, **Approve** first). The card shows the proposal,
+who requested and approved it, and only the buttons you are allowed to use - see
+[6.3](#63-add-packages).
 
 ### 5.2 Handle rejected packages
 
@@ -483,7 +498,11 @@ Every rejection has a reason. What to do:
 | `Microsoft Defender detected` | Malware detection in the download. **Security event.** | Do not use this version. Review the detection in Defender. |
 | `denylist` | The version is blocked. | Remove the entry from the denylist if the block is no longer wanted. |
 | `the Defender scan could not be completed` | `RequireDefenderScanAtIntake` is on and the run was not elevated. | Run from an elevated PowerShell. |
+| `overwrite refused: the copy downloaded from PyPI ... differs from the sha256 in the manifest` | An *already added* version you chose to overwrite downloaded with another hash than the one published. **Security event.** The published copy stays. | Find out why (proxy, cache, a changed upload); do not retry blindly. |
 | `needs <dependency>==<version>, which was rejected (<its reason>)` | Category `dependency`: the package passed its own checks but needs a pin that was rejected. Nothing of it was published. | Deal with the dependency's reason (the text in brackets). If that is the cooldown, nothing to do - both are published together once it has passed. Otherwise constrain the dependency in `requirements.in` (e.g. `urllib3>=2.9`) or choose another version of the package, resolve, publish. |
+
+Lines the **resolve** set aside never reach this point; they are listed with their reason in the
+Add tab's *Packages with problems* table (cooldown, no usable wheel, not found, conflict).
 
 A rejected **new** pin is simply tried again on the next run. A rejected pin that a group file
 **already lists** (e.g. a hand-edited group file) is reported as "still listed without a wheel" -
@@ -571,14 +590,21 @@ again.
 ### 5.6 Publish an urgent security fix (skip the cooldown for one package)
 
 ```powershell
-.\Update-Requirement.ps1 -MinimumPackageAgeDays 0      # only if the fix is newer than the cooldown
+# requests (or requests>=2.32.4) in requirements.in, then:
+.\Update-Requirement.ps1 -ExpeditePackage requests==2.32.4 -ExpediteReason "CVE-2026-1234 fix"
+.\Update-Wheelhouse.ps1                                  # the proposal carries the expedite
+# or, for a pin that is already in requirements.txt:
 .\Update-Wheelhouse.ps1 -ExpeditePackage requests==2.32.4 -ExpediteReason "CVE-2026-1234 fix"
 ```
 
-Only the expedited pin skips the cooldown (your user name and the reason are logged); every other
-check still applies, and any other too-new pin is rejected and retried later. Don't use
-`Update-Wheelhouse.ps1 -MinimumPackageAgeDays 0` - it lifts the cooldown for every package in
-the run.
+The resolve skips the cooldown for that one version only and records it in the proposal, so the
+publish skips it too. Your user name and the reason are logged; every other check still applies,
+and any other too-new pin is set aside or rejected and retried later. Don't use
+`-MinimumPackageAgeDays 0` - it lifts the cooldown for every package in the run.
+
+In the UI: a line set aside only because it is too new shows **Expedite** in the Add tab's
+*Packages with problems* table; give a reason, and it is resolved again with the cooldown skipped
+for that version.
 
 ### 5.7 Quarantine, delete or restore a package
 
@@ -727,7 +753,10 @@ would start another job or change the wheelhouse are greyed out and their clicks
 
 Opens first. The state at a glance - packages, open and overdue vulnerabilities, waived, yanked,
 unverified, quarantined (click a tile to see them) - a **Needs attention** list where each item
-leads to the place to handle it, and the weekly check's last run and task.
+leads to the place to handle it, and the weekly check's last run and task. When a published
+version has had no completed audit for `AuditMaxAgeDays`, the list says so; the UI started the
+weekly check in the background when it started (see `AuditMaxAgeDays` in
+[4. Configuration](#4-configuration)).
 
 ### 6.2 Packages
 
@@ -848,8 +877,9 @@ with unsaved changes asks first.
 
 ![Jobs tab](Images/Jobs.png)
 
-Every background job, named by its action (*Add packages*, *Publish packages*, *Audit packages*,
-*Scan packages*, *Fix package*, *Remove packages*, *Clear list*). A small *show* / *hide* link
+Every background job, named by its action (*Add packages*, *Publish packages*, *Expedite
+name==version*, *Audit packages*, *Scan packages*, *Fix package*, *Remove packages*, *Remove
+problem packages*, *Clear list*). A small *show* / *hide* link
 under the name lists the packages or files the job worked on. Each job has a live log (**Open
 log**, or the pill in the top bar) and **Cancel**. A job ends as *Succeeded*, *Needs attention*
 (findings or rejected packages) or *Failed*.
@@ -876,7 +906,7 @@ shows the details.
 | `whm.ps1` (root) | One command for everything (5.0) | `whm help` |
 | `Client Install\Test-PythonEnvironment.ps1` | Optional, on clients: is anything installed affected? (3.4) | `-Project`, `-Python`, `-AdvisoriesPath`, `-InstalledJson` |
 | `Jobs\Update-Requirement.ps1` | `requirements.in` -> `requirements.txt`; lines that cannot be resolved are set aside with the reason | `-RequirementsInPath`, `-RequirementsTxtPath`, `-PythonVersion`, `-Platform`, `-MinimumPackageAgeDays`, `-ExpeditePackage`, `-ExpediteReason`, `-NoSetAside` |
-| `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins; audit what is published; take out wheels missing/changed on the share | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-OverwritePackage`, `-AutoQuarantine On|Off`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
+| `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins (and hold back those whose dependency failed); overwrite chosen published versions; take out wheels missing/changed on the share | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-OverwritePackage`, `-AutoQuarantine On|Off`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
 | `Jobs\Invoke-WheelhousePipeline.ps1` | `Update-Wheelhouse.ps1` + one alert | as above, plus `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
 | `Jobs\Test-Wheelhouse.ps1` | Weekly check of everything published, with alert | `-AutoQuarantine On|Off`, `-VulnerabilityServices`, `-SmtpServer`, `-MailTo`, `-MailFrom` |
 | `Jobs\Test-WheelhousePackage.ps1` | Audit all or chosen pins, no alert | `-Package name==ver,...` |
@@ -924,13 +954,13 @@ is deleted after `ReportRetentionMonths`.
 | `Report_Rejected_<ts>.json` | Update-Wheelhouse | Every rejected pin with category and reason |
 | `Report_Scan_<ts>.json` | Every Defender scan (intake and on-demand) | Status, scanned paths, detections |
 | `Report_Integrity_<ts>.json` | Integrity check | What did not match the manifest |
+| `Alert_<ts>.html` | Send-VulnerabilityAlert | Saved alert (no SMTP server) |
 
 **Integrity check speed.** The weekly check hashes every wheel. An update only hashes wheels
 whose size or modification time changed since they were last verified (kept in
 `C:\WheelHouseManager\state\`, not on the share), so it holds the write lock for seconds even
 for a large wheelhouse; a missing wheel is always noticed. A change that keeps size and timestamp
 is caught by the next weekly check.
-| `Alert_<ts>.html` | Send-VulnerabilityAlert | Saved alert (no SMTP server) |
 
 Next to `reports\`, the wheelhouse holds `catalog.json` (current state, latest check results and
 vulnerability findings per package version) and `events.jsonl` (history). Neither is deleted by the
@@ -970,7 +1000,8 @@ All scripts use the same codes - useful for Task Scheduler and your own automati
 | `Wheelhouse integrity check failed - refusing to continue ...` | A published wheel changed or disappeared. See `Report_Integrity_*.json` and section 5.5. |
 | `manifest.json exists but could not be parsed` / `denylist.json exists but could not be parsed` / `quarantine.json could not be parsed` | The file is damaged; it is never treated as empty. Restore it from backup or fix the JSON by hand. |
 | `Wheelhouse has no requirement group files yet, and no local requirements were supplied` | First run: add packages to `requirements.in`, run `Update-Requirement.ps1`, then `Update-Wheelhouse.ps1`. |
-| `Update-Requirement.ps1` writes `requirements.rejected.txt` | A package has no wheel for your Python/platform (or its `Requires-Python` excludes it). Remove it or constrain its version in `requirements.in`. |
+| `Update-Requirement.ps1` writes `requirements.rejected.txt` | Nothing usable came out of the resolve (uv failed without naming a line, or pip could not run); `requirements.txt` is unchanged. The log and the Add tab list every line with its status. Fix the line(s) named there and resolve again. |
+| Add tab: a line under *Packages with problems* | The resolve set it aside (reason shown). Change or remove it, **Remove All**, or **Expedite** it when it is only too new. |
 | `Python was not found on this machine` | Install Python on the manager server and make sure `python` is on `PATH`. |
 | `Start-MpScan is not available` / Defender scan result `Error` | Run elevated; check that Microsoft Defender is active. |
 | `-ExpeditePackage needs -ExpediteReason` | Add `-ExpediteReason "..."`. |
