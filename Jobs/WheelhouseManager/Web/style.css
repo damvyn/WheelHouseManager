@@ -170,6 +170,8 @@ details > summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
 .kv { display: grid; gap: 4px; margin: 8px 0 12px; }
 /* Add tab: the proposal behind requirements.txt and its approval buttons. */
 .approval { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
+.review-block { margin-top: 14px; }
+.review-block h3 { margin: 0 0 4px; font-size: 1rem; }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 /* Overview tab */
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; margin-bottom: 14px; }

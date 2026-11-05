@@ -2437,6 +2437,35 @@ Describe 'WheelhouseManager' {
             @(Get-ChildItem -Path (Get-WheelhouseJournalFolder -WheelhousePath $wheelhouse) -Filter '*.json').Count | Should -Be 0
         }
 
+        It 'overwrites a published version with a copy checked again, and refuses one that differs' {
+            $wheelhouse = Get-TestWheelhouse
+            $work = Get-TestFolder
+            $global:WhmReleases['six'] = New-TestRelease -Name 'six' -Version '1.16.0'
+            # The published six is exactly PyPI's file.
+            [System.IO.File]::WriteAllText((Join-Path $wheelhouse 'six-1.16.0-py3-none-any.whl'), $global:WhmReleases['six'].Content)
+            $manifest = Read-WheelhouseManifest -WheelhousePath $wheelhouse
+            foreach ($entry in $manifest) { if ($entry.name -eq 'six') { $entry.sha256 = (Get-FileHash -Path (Join-Path $wheelhouse $entry.file) -Algorithm SHA256).Hash } }
+            Save-WheelhouseManifest -Manifest $manifest -WheelhousePath $wheelhouse
+            $global:WhmReleases['attrs'] = New-TestRelease -Name 'attrs' -Version '23.1.0'
+            $syncParams = @{
+                WheelhousePath = $wheelhouse; ReportsFolder = $work; LocalRequirementsPath = ''; PythonVersion = '3.14'; Platform = 'win_amd64'
+                MinimumAgeDays = 10; Services = @('osv'); DenylistPath = (Join-Path $work 'denylist.json'); StagingRoot = (Join-Path $work 'staging')
+                Overwrite = @{ six = '1.16.0'; attrs = '23.1.0'; newpkg = '1.0' }
+            }
+            $result = Invoke-WheelhouseSync @syncParams
+
+            # attrs on the share is not PyPI's file: refused, the published copy stays.
+            $result.Outcome | Should -Be 'Attention'
+            @($result.Rejected | ForEach-Object { "$($_.Package):$($_.Category)" }) -join ',' | Should -Be 'attrs:integrity'
+            @($result.Notices | Where-Object { $_.Kind -eq 'IntakeBlocked' }).Count | Should -Be 1
+            @(Get-ChildItem -Path (Join-Path $wheelhouse '_replaced') -Recurse -File | ForEach-Object { $_.Name }) -join ',' | Should -Be 'six-1.16.0-py3-none-any.whl'
+            @(Read-WheelhouseEvent -WheelhousePath $wheelhouse -Package 'six' | Where-Object { $_.action -eq 'Overwritten' }).Count | Should -Be 1
+            (Get-Content -Path (Join-Path $wheelhouse 'requirements-1.txt')) -join ',' | Should -Be 'six==1.16.0,attrs==23.1.0'
+            # Audited like a new package.
+            @($result.AuditResults | Where-Object { $_.Stage -eq 'PreDownload' }).Count | Should -BeGreaterThan 0
+            @(Get-ChildItem -Path (Join-Path $work 'staging') -Force).Count | Should -Be 0
+        }
+
         It 'holds back every package that needs a rejected dependency, across groups and up the chain' {
             $wheelhouse = Get-TestWheelhouse
             $work = Get-TestFolder
@@ -2851,6 +2880,216 @@ Describe 'WheelhouseManager' {
             $result = Set-RequirementInText -Path $path -Text ''
             @($result.Requirements).Count | Should -Be 0
             Get-Content -Path $path -Raw | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Resolving every requirement in one run' {
+        BeforeAll {
+            # uv's error output for the cases seen in practice (one line each, as uv prints them
+            # without a terminal).
+            $global:WhmUvErrors = @{
+                pynndescent = @('error: No solution found when resolving dependencies', '  cause: Because there is no version of pynndescent==0.7.0 and you require pynndescent==0.7.0, we can conclude that your requirements are unsatisfiable.', '', 'hint: `pynndescent` was filtered by `exclude-newer` to only include packages uploaded before 2026-10-26T20:18:46.6713228Z. The requested version, v0.7.0, was published at 2026-10-27T17:36:38.091Z. Consider using `exclude-newer-package` to override the cutoff for this package.')
+                zarr        = @('error: No solution found when resolving dependencies', '  cause: Because there is no version of zarr==3.4.2 and you require zarr==3.4.2, we can conclude that your requirements are unsatisfiable.', '', 'hint: `zarr` was filtered by `exclude-newer` to only include packages uploaded before 2026-10-26T20:22:05.5817297Z. The requested version, v3.4.2, was published at 2026-10-27T15:31:08.148Z. Consider using `exclude-newer-package` to override the cutoff for this package.')
+                trimap      = @('error: No solution found when resolving dependencies', '  cause: Because annoy==1.17.3 has no usable wheels and only annoy<=1.17.3 is available, we can conclude that annoy>=1.17.3 cannot be used.', '         And because trimap==1.2.0 depends on annoy>=1.17.3 and you require trimap==1.2.0, we can conclude that your requirements are unsatisfiable.', '', 'hint: Wheels are required for `annoy` because building from source is disabled for all packages (i.e., with `--no-build`)')
+                sdfsdf      = @('error: No solution found when resolving dependencies', '  cause: Because sdfsdf was not found in the package registry and you require sdfsdf, we can conclude that your requirements are unsatisfiable.')
+            }
+            function New-TestRequirement {
+                param([string[]]$Spec)
+                foreach ($item in $Spec) { [PSCustomObject]@{ name = (($item -split '[=<>!~ ]')[0]).ToLowerInvariant(); spec = $item; source = 'input' } }
+            }
+        }
+        AfterAll {
+            Remove-Variable -Name WhmUvErrors, WhmUvCalls, WhmPipUnavailable -Scope Global -ErrorAction SilentlyContinue
+        }
+        BeforeEach {
+            $global:WhmUvCalls = [System.Collections.Generic.List[string]]::new()
+            # A fake uv: fails for the first requirement it has an error for, else pins the rest.
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-UvCompile -MockWith {
+                $specs = @(Get-Content -LiteralPath $InputPath | Where-Object { $_ })
+                $constraintText = if ($ConstraintPath) { (Get-Content -LiteralPath $ConstraintPath) -join ',' } else { '' }
+                $global:WhmUvCalls.Add((($specs -join ',') + ' | ' + $constraintText))
+                foreach ($spec in $specs) {
+                    $name = (($spec -split '[=<>!~ ]')[0]).ToLowerInvariant()
+                    if ($global:WhmUvErrors.ContainsKey($name)) { return @{ ExitCode = 1; Output = $global:WhmUvErrors[$name] } }
+                }
+                Set-Content -LiteralPath $OutputPath -Value @($specs | ForEach-Object { if ($_ -match '==') { $_ } else { "$_==1.0" } })
+                return @{ ExitCode = 0; Output = @() }
+            }
+        }
+
+        It 'names the requirement uv blames and explains why' {
+            [string[]]$named = Get-UvRequiredName -Output $global:WhmUvErrors['trimap']
+            $named -join ',' | Should -Be 'trimap'
+            $cooldown = Get-UvResolveReason -Name 'pynndescent' -Output $global:WhmUvErrors['pynndescent'] -MinimumAgeDays 10
+            $cooldown.Kind | Should -Be 'cooldown'
+            $cooldown.Expedite | Should -Be 'pynndescent==0.7.0'
+            $cooldown.Reason | Should -Be 'too new: pynndescent==0.7.0 was uploaded on 2026-10-27; the cooldown of 10 day(s) allows it from 2026-11-06'
+            $wheel = Get-UvResolveReason -Name 'trimap' -Output $global:WhmUvErrors['trimap'] -Target 'Python 3.14 / win_amd64'
+            $wheel.Kind | Should -Be 'no-wheel'
+            $wheel.Reason | Should -Match '^annoy==1\.17\.3 has no wheel for Python 3\.14 / win_amd64 .* - trimap needs it$'
+            (Get-UvResolveReason -Name 'sdfsdf' -Output $global:WhmUvErrors['sdfsdf']).Kind | Should -Be 'not-found'
+        }
+
+        It 'sets aside every requirement that cannot be resolved and resolves the rest' {
+            $out = Join-Path (Get-TestFolder) 'requirements.txt'
+            $requirements = @(New-TestRequirement -Spec @('fonttools==4.67.0', 'pynndescent==0.7.0', 'zarr==3.4.2', 'numpy', 'trimap==1.2.0', 'sdfsdf'))
+            $result = Invoke-RequirementResolve -Requirement $requirements -OutputPath $out -PythonVersion '3.14' -Platform 'win_amd64' -MinimumAgeDays 10 -WheelCheck $false
+            $result.Ok | Should -Be $true
+            @($result.SetAside | ForEach-Object { $_.name }) -join ',' | Should -Be 'pynndescent,zarr,trimap,sdfsdf'
+            @($result.SetAside | ForEach-Object { $_.kind }) -join ',' | Should -Be 'cooldown,cooldown,no-wheel,not-found'
+            @($result.Resolved | ForEach-Object { $_.name }) -join ',' | Should -Be 'fonttools,numpy'
+            (Get-Content -LiteralPath $out) -join ',' | Should -Be 'fonttools==4.67.0,numpy==1.0'
+            # One uv run per problem, then the one that succeeds.
+            $global:WhmUvCalls.Count | Should -Be 5
+        }
+
+        It 'keeps the first of two requirements that only conflict with each other' {
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-UvCompile -MockWith {
+                $specs = @(Get-Content -LiteralPath $InputPath | Where-Object { $_ })
+                if ($specs -contains 'alpha==1.0' -and $specs -contains 'beta==2.0') {
+                    return @{ ExitCode = 1; Output = @('  cause: Because beta==2.0 depends on alpha>=2 and you require alpha==1.0, we can conclude that you require beta!=2.0. And because you require beta==2.0, we can conclude that your requirements are unsatisfiable.') }
+                }
+                Set-Content -LiteralPath $OutputPath -Value $specs
+                return @{ ExitCode = 0; Output = @() }
+            }
+            $out = Join-Path (Get-TestFolder) 'requirements.txt'
+            $result = Invoke-RequirementResolve -Requirement @(New-TestRequirement -Spec @('alpha==1.0', 'beta==2.0', 'gamma==3.0')) -OutputPath $out -PythonVersion '3.14' -Platform 'win_amd64' -WheelCheck $false
+            $result.Ok | Should -Be $true
+            @($result.SetAside).Count | Should -Be 1
+            @($result.SetAside)[0].name | Should -Be 'beta'
+            @($result.SetAside)[0].reason | Should -Match '^conflicts with alpha==1\.0: because beta==2\.0 depends on alpha>=2'
+            (Get-Content -LiteralPath $out) -join ',' | Should -Be 'alpha==1.0,gamma==3.0'
+        }
+
+        It 'excludes a pin pip cannot use so uv picks another version' {
+            $global:WhmPipUnavailable = @('numpy==1.26.4')
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-UvCompile -MockWith {
+                $constraintText = if ($ConstraintPath) { (Get-Content -LiteralPath $ConstraintPath) -join ',' } else { '' }
+                $global:WhmUvCalls.Add($constraintText)
+                $version = if ($constraintText -match 'numpy!=1\.26\.4') { '2.3.1' } else { '1.26.4' }
+                Set-Content -LiteralPath $OutputPath -Value @("numpy==$version")
+                return @{ ExitCode = 0; Output = @() }
+            }
+            Mock -ModuleName WheelhouseManager -CommandName Test-RequirementWheelAvailability -MockWith {
+                $pins = Read-RequirementFile -FilePath $RequirementsFilePath
+                $bad = @($global:WhmPipUnavailable | Where-Object { $pins["$(($_ -split '==')[0])"] -eq ($_ -split '==')[1] })
+                @{ Passed = ($bad.Count -eq 0); Unavailable = $bad; Error = $null }
+            }
+            $out = Join-Path (Get-TestFolder) 'requirements.txt'
+            $result = Invoke-RequirementResolve -Requirement @(New-TestRequirement -Spec @('numpy')) -OutputPath $out -PythonVersion '3.14' -Platform 'win_amd64' -ConstraintLine @('six!=1.0')
+            $result.Ok | Should -Be $true
+            @($result.SetAside).Count | Should -Be 0
+            (Get-Content -LiteralPath $out) | Should -Be 'numpy==2.3.1'
+            $global:WhmUvCalls[1] | Should -Be 'six!=1.0,numpy!=1.26.4'
+
+            # A requirement pinned to the unusable version itself is set aside with that reason.
+            $global:WhmUvCalls.Clear()
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-UvCompile -MockWith {
+                $constraintText = if ($ConstraintPath) { (Get-Content -LiteralPath $ConstraintPath) -join ',' } else { '' }
+                if ($constraintText -match 'numpy!=1\.26\.4') { return @{ ExitCode = 1; Output = @('cause: Because you require numpy==1.26.4 and you require numpy!=1.26.4, we can conclude that your requirements are unsatisfiable.') } }
+                Set-Content -LiteralPath $OutputPath -Value @('numpy==1.26.4')
+                return @{ ExitCode = 0; Output = @() }
+            }
+            $pinned = Invoke-RequirementResolve -Requirement @(New-TestRequirement -Spec @('numpy==1.26.4')) -OutputPath $out -PythonVersion '3.14' -Platform 'win_amd64'
+            $pinned.Ok | Should -Be $true
+            @($pinned.SetAside)[0].kind | Should -Be 'no-wheel'
+            @($pinned.SetAside)[0].reason | Should -Match '^numpy==1\.26\.4 has no usable wheel for Python 3\.14 / win_amd64'
+            @($pinned.Resolved).Count | Should -Be 0
+        }
+
+        It 'stops without a result when uv fails without naming a requirement that fails on its own' {
+            Mock -ModuleName WheelhouseManager -CommandName Invoke-UvCompile -MockWith { @{ ExitCode = 2; Output = @('error: Failed to fetch: https://pypi.org/simple/numpy/') } }
+            $result = Invoke-RequirementResolve -Requirement @(New-TestRequirement -Spec @('numpy')) -OutputPath (Join-Path (Get-TestFolder) 'r.txt') -PythonVersion '3.14' -Platform 'win_amd64' -WheelCheck $false
+            # On its own numpy fails too, so it is set aside - with uv's message as the reason.
+            $result.Ok | Should -Be $true
+            @($result.SetAside)[0].kind | Should -Be 'conflict'
+        }
+
+        It 'starts from the pins asked for earlier and ignores a line requirements.txt already covers' {
+            $folder = Get-TestFolder
+            $txt = Join-Path $folder 'requirements.txt'
+            Set-Content -Path $txt -Value @('certifi==2026.1.1', '    # via requests', 'numpy==2.3.1', '    # via -r requirements.in', 'requests==2.32.3', '    # via -r requirements.in', 'zarr==3.4.1', '    # via -r requirements.in')
+            $aside = @([PSCustomObject]@{ name = 'trimap'; spec = 'trimap==1.2.0'; source = 'input'; reason = 'x'; kind = 'no-wheel'; expedite = '' },
+                [PSCustomObject]@{ name = 'ruff'; spec = 'ruff==0.17.3'; source = 'input'; reason = 'y'; kind = 'cooldown'; expedite = 'ruff==0.17.3' })
+            $inputSet = Get-RequirementResolveInput -InLine @('# header', 'numpy>=2', 'zarr==3.4.2', 'ruff', 'pandas') -RequirementsTxtPath $txt -SetAside $aside -Denylist @([PSCustomObject]@{ name = 'requests'; version = '2.32.3'; reason = 'bad'; source = 'manual' })
+            # requests is denylisted, certifi only a dependency, numpy covered, zarr asked for at another version.
+            @($inputSet.Requirements | ForEach-Object { "$($_.source):$($_.spec)" }) -join ',' | Should -Be 'kept:numpy==2.3.1,input:zarr==3.4.2,input:ruff,input:pandas'
+            @($inputSet.Ignored | ForEach-Object { $_.pin }) -join ',' | Should -Be 'numpy==2.3.1'
+            # ruff is asked for again, so its set-aside entry goes; trimap stays.
+            @($inputSet.SetAside | ForEach-Object { $_.name }) -join ',' | Should -Be 'trimap'
+        }
+
+        It 'takes out exactly the pins asked for' {
+            $txt = Join-Path (Get-TestFolder) 'requirements.txt'
+            Set-Content -Path $txt -Value @('certifi==2026.1.1', '    # via requests', 'requests==2.32.3', '    # via -r requirements.in')
+            [string[]]$removed = Remove-RequirementTxtPin -Path $txt -Name 'requests' -Exact
+            $removed -join ',' | Should -Be 'requests'
+            (Get-Content -Path $txt) -join '|' | Should -Be 'certifi==2026.1.1|    # via requests'
+        }
+
+        It 'records the set-aside requirements next to requirements.txt' {
+            $txt = Join-Path (Get-TestFolder) 'requirements.txt'
+            Write-RequirementResolveStatus -RequirementsTxtPath $txt -SetAside @([PSCustomObject]@{ name = 'zarr'; spec = 'zarr==3.4.2'; source = 'input'; reason = 'too new'; kind = 'cooldown'; expedite = 'zarr==3.4.2' })
+            $status = Read-RequirementResolveStatus -RequirementsTxtPath $txt
+            $status.failed | Should -Be $false
+            @($status.set_aside).Count | Should -Be 1
+            @($status.set_aside)[0].expedite | Should -Be 'zarr==3.4.2'
+            Write-RequirementResolveStatus -RequirementsTxtPath $txt -SetAside @()
+            Read-RequirementResolveStatus -RequirementsTxtPath $txt | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Narrowing a proposal and overwriting published wheels' {
+        It 'keeps the approval for a part of the approved list, and only for a part' {
+            $folder = Get-TestFolder
+            $txt = Join-Path $folder 'requirements.txt'
+            $path = Join-Path $folder 'proposal.json'
+            Set-Content -Path $txt -Value @('numpy==2.3.1', 'requests==2.32.3')
+            $proposal = New-WheelhouseProposal -RequirementsPath $txt -Path $path -Expedite @{ requests = '2.32.3' } -ExpediteReason 'needed now'
+            $null = Approve-WheelhouseProposal -Id $proposal.id -By 'CONTOSO\boss' -Mode SeparateApprover -Path $path
+            Set-Content -Path $txt -Value @('numpy==2.3.1')
+            $narrowed = Update-WheelhouseProposalSubset -RequirementsPath $txt -LeftOut @('requests==2.32.3') -Path $path
+            $narrowed.state | Should -Be 'Approved'
+            $narrowed.approved_by | Should -Be 'CONTOSO\boss'
+            @($narrowed.pins) -join ',' | Should -Be 'numpy==2.3.1'
+            $narrowed.expedite.Count | Should -Be 0
+            (Resolve-WheelhouseProposalForPublish -RequirementsPath $txt -Mode SeparateApprover -User 'CONTOSO\me' -Path $path).Allowed | Should -Be $true
+            # A pin the approval never covered.
+            Set-Content -Path $txt -Value @('numpy==2.3.1', 'pandas==2.2.3')
+            Update-WheelhouseProposalSubset -RequirementsPath $txt -Path $path | Should -BeNullOrEmpty
+        }
+
+        It 'replaces a published wheel with a verified identical copy and keeps the old one' {
+            $wheelhouse = Get-TestWheelhouse
+            $staging = Get-TestFolder
+            $file = 'six-1.16.0-py3-none-any.whl'
+            Copy-Item -Path (Join-Path $wheelhouse $file) -Destination (Join-Path $staging $file)
+            $intake = @{ Packages = @{ six = '1.16.0' }; Verified = @{ six = @(Get-Item -Path (Join-Path $staging $file)) }; StagingPath = $staging; Scan = $null; Rejected = @(); AuditResults = @() }
+            $result = Publish-OverwriteIntake -Intake $intake -WheelhousePath $wheelhouse -DenylistPath (Join-Path $wheelhouse 'denylist.json')
+            $result.Accepted['six'] | Should -Be '1.16.0'
+            @($result.Rejected).Count | Should -Be 0
+            Test-Path -Path (Join-Path $result.Folder $file) | Should -Be $true
+            Test-Path -Path (Join-Path $wheelhouse $file) | Should -Be $true
+            Test-Path -Path $staging | Should -Be $false
+            @(Get-ChildItem -Path $wheelhouse -Filter '*.partial').Count | Should -Be 0
+            # The manifest is unchanged and still matches.
+            $manifest = Read-WheelhouseManifest -WheelhousePath $wheelhouse
+            # Assigned first: Test-ManifestIntegrity returns its list -NoEnumerate.
+            $integrity = Test-ManifestIntegrity -Manifest $manifest -WheelhousePath $wheelhouse
+            $integrity.Count | Should -Be 0
+            $events = Get-Content -Path (Join-Path $wheelhouse 'events.jsonl') | ForEach-Object { $_ | ConvertFrom-Json }
+            @($events | Where-Object { $_.action -eq 'Overwritten' -and $_.package -eq 'six' }).Count | Should -Be 1
+
+            # A download that differs from the manifest is refused; the published copy stays.
+            $staging = Get-TestFolder
+            Set-Content -Path (Join-Path $staging $file) -Value 'other bytes'
+            $before = (Get-FileHash -Path (Join-Path $wheelhouse $file)).Hash
+            $intake = @{ Packages = @{ six = '1.16.0' }; Verified = @{ six = @(Get-Item -Path (Join-Path $staging $file)) }; StagingPath = $staging; Scan = $null; Rejected = @(); AuditResults = @() }
+            $refused = Publish-OverwriteIntake -Intake $intake -WheelhousePath $wheelhouse -DenylistPath (Join-Path $wheelhouse 'denylist.json')
+            $refused.Accepted.Count | Should -Be 0
+            @($refused.Rejected)[0].Category | Should -Be 'integrity'
+            @($refused.Rejected)[0].Reason | Should -Match 'differs from the sha256 in the manifest'
+            (Get-FileHash -Path (Join-Path $wheelhouse $file)).Hash | Should -Be $before
         }
     }
 
@@ -3454,6 +3693,74 @@ Describe 'WheelhouseManager' {
             $publish = Invoke-WheelhouseUiApi -Method POST -Path '/api/wheelhouse/update' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"confirm":true}')
             $publish.Status | Should -Be 202
             $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Wheelhouse.ps1'
+        }
+
+        It 'lists problems and every pin with its status for the review' {
+            $m = Get-TestManager
+            $txt = Join-Path $m.Root 'requirements.txt'
+            Set-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1') -Updates @{ LocalRequirementsPath = $txt }
+            # six==1.16.0 and attrs==23.1.0 are in the test wheelhouse.
+            Set-Content -Path $txt -Value @('attrs==24.2.0', '    # via -r requirements.in', 'requests==2.32.3', '    # via -r requirements.in', 'six==1.16.0', '    # via requests', 'urllib3==2.5.0', '    # via requests')
+            Write-RequirementResolveStatus -RequirementsTxtPath $txt -SetAside @([PSCustomObject]@{ name = 'zarr'; spec = 'zarr==3.4.2'; source = 'input'; reason = 'too new'; kind = 'cooldown'; expedite = 'zarr==3.4.2' })
+            $body = (Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root).Body
+            @($body.rows | ForEach-Object { "$($_.name):$($_.status)" }) -join ',' | Should -Be 'attrs:new_version,requests:new,six:added,urllib3:new'
+            @((@($body.rows) | Where-Object { $_.name -eq 'requests' }).needs) -join ',' | Should -Be 'six,urllib3'
+            @((@($body.rows) | Where-Object { $_.name -eq 'attrs' }).published_versions) -join ',' | Should -Be '23.1.0'
+            @($body.problems).Count | Should -Be 1
+            @($body.problems)[0].spec | Should -Be 'zarr==3.4.2'
+            @(@($body.problems)[0].requested_by) -join ',' | Should -Be 'User input'
+            $body.resolve_failure | Should -BeNullOrEmpty
+
+            # A pin the latest publish rejected moves from the review rows to the problems.
+            $reports = Join-Path $m.Wheelhouse 'reports'
+            New-Item -ItemType Directory -Path $reports -Force | Out-Null
+            Set-Content -Path (Join-Path $reports 'Report_Rejected_20261105_100000.json') -Value '[{"Group":"requirements-2","Package":"urllib3","Version":"2.5.0","Kind":"new","Category":"vulnerability","Reason":"known vulnerability (OSV): GHSA-1"}]'
+            $body = (Invoke-WheelhouseUiApi -Method GET -Path '/api/requirements' -ManagerRoot $m.Root).Body
+            @($body.rows | ForEach-Object { $_.name }) -join ',' | Should -Be 'attrs,requests,six'
+            @($body.problems | ForEach-Object { $_.spec }) -join ',' | Should -Be 'zarr==3.4.2,urllib3==2.5.0'
+
+            # Remove All: the set-aside entry goes, and the rejected pin leaves requirements.txt.
+            $removed = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/problems/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')
+            $removed.Status | Should -Be 200
+            @($removed.Body.set_aside) -join ',' | Should -Be 'zarr==3.4.2'
+            @($removed.Body.removed) -join ',' | Should -Be 'urllib3'
+            Read-RequirementResolveStatus -RequirementsTxtPath $txt | Should -BeNullOrEmpty
+            (Get-Content -Path $txt) -join '|' | Should -Not -Match 'urllib3'
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/problems/remove' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{}')).Status | Should -Be 409
+        }
+
+        It 'expedites a set-aside requirement that is only too new' {
+            $m = Get-TestManager
+            $txt = Join-Path $m.Root 'requirements.txt'
+            Set-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1') -Updates @{ LocalRequirementsPath = $txt }
+            Set-Content -Path $txt -Value ''
+            Write-RequirementResolveStatus -RequirementsTxtPath $txt -SetAside @(
+                [PSCustomObject]@{ name = 'zarr'; spec = 'zarr==3.4.2'; source = 'input'; reason = 'too new'; kind = 'cooldown'; expedite = 'zarr==3.4.2' },
+                [PSCustomObject]@{ name = 'trimap'; spec = 'trimap==1.2.0'; source = 'input'; reason = 'no wheel'; kind = 'no-wheel'; expedite = '' })
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/expedite' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"zarr","reason":"x"}')).Status | Should -Be 400
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/expedite' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"trimap","reason":"needed for the demo"}')).Status | Should -Be 404
+            $global:WhmUiJobSteps | Should -BeNullOrEmpty
+            $ok = Invoke-WheelhouseUiApi -Method POST -Path '/api/requirements/expedite' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"name":"zarr","reason":"needed for the demo"}')
+            $ok.Status | Should -Be 202
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Requirement.ps1 -ExpeditePackage zarr==3.4.2 -ExpediteReason needed for the demo'
+            (Get-Content -Path (Join-Path $m.Root 'requirements.in')) -join '|' | Should -Match 'zarr==3\.4\.2'
+        }
+
+        It 'publishes only the ticked pins and overwrites the ticked published ones' {
+            $m = Get-TestManager
+            $txt = Join-Path $m.Root 'requirements.txt'
+            Set-WheelhouseSetting -SettingsPath (Join-Path (Join-Path $m.Root 'config') 'settings.psd1') -Updates @{ LocalRequirementsPath = $txt }
+            Set-Content -Path $txt -Value @('numpy==2.3.1', '    # via -r requirements.in', 'pandas==2.2.3', '    # via -r requirements.in', 'six==1.16.0', '    # via -r requirements.in')
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/wheelhouse/update' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"confirm":true,"leave_out":["requests"]}')).Status | Should -Be 400
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/wheelhouse/update' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"confirm":true,"overwrite":["numpy==2.3.1"]}')).Status | Should -Be 404
+            (Invoke-WheelhouseUiApi -Method POST -Path '/api/wheelhouse/update' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"confirm":true,"overwrite":["six==1.16.0 -x"]}')).Status | Should -Be 400
+            $global:WhmUiJobSteps | Should -BeNullOrEmpty
+            (Get-Content -Path $txt) -join '|' | Should -Match 'pandas'
+
+            $publish = Invoke-WheelhouseUiApi -Method POST -Path '/api/wheelhouse/update' -ManagerRoot $m.Root -Body (ConvertFrom-TestJson '{"confirm":true,"leave_out":["pandas"],"overwrite":["six==1.16.0"]}')
+            $publish.Status | Should -Be 202
+            $global:WhmUiJobSteps -join '|' | Should -Be 'Update-Wheelhouse.ps1 -OverwritePackage six==1.16.0'
+            (Get-Content -Path $txt) -join '|' | Should -Be 'numpy==2.3.1|    # via -r requirements.in|six==1.16.0|    # via -r requirements.in'
         }
 
         It 'saves on/off settings' {

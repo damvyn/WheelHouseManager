@@ -540,3 +540,120 @@ function Publish-StagedWheel {
         Created = $created
     }
 }
+
+function Publish-OverwriteIntake {
+    # Overwrite: replaces published wheels with the copies Invoke-CandidateIntake just
+    # downloaded and checked again (audit, PyPI sha256, Defender). PyPI never changes a file
+    # once uploaded, so each verified file must also match the sha256 the manifest recorded
+    # for it - otherwise it is rejected (category 'integrity') and the published copy stays.
+    # Under the write lock (taken here unless -LockHeld): each file is copied in as
+    # <file>.partial, checked, and swapped in with File.Replace, which moves the previous copy
+    # to <wheelhouse>\_replaced\<time>\ - never deleted, and the file name always holds one
+    # of the two identical copies, so no journal is needed. Manifest and group files do not
+    # change; the history records 'Overwritten' and the intake scan is recorded as the
+    # version's scan. Always deletes the staging folder. Returns @{ Accepted = @{name=version};
+    # Rejected = [...] (categories integrity, publish); Replaced = file names; Folder }.
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Intake,
+
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [string]$DenylistPath = (Get-WheelhouseDenylistPath),
+
+        [switch]$LockHeld,
+
+        [ValidateRange(0, 3600)]
+        [int]$TimeoutSeconds = 300
+    )
+
+    $accepted = @{}
+    $rejected = [System.Collections.Generic.List[object]]::new()
+    $replacedFiles = [System.Collections.Generic.List[string]]::new()
+    $verified = $Intake.Verified
+    $versions = $Intake.Packages
+    $folder = Join-Path (Join-Path $WheelhousePath '_replaced') (Get-Date -Format 'yyyyMMdd_HHmmss')
+    try {
+        if (-not $verified -or $verified.Count -eq 0 -or -not $PSCmdlet.ShouldProcess($WheelhousePath, 'Overwrite published wheels')) {
+            return @{ Accepted = $accepted; Rejected = $rejected.ToArray(); Replaced = $replacedFiles.ToArray(); Folder = $null }
+        }
+        $lock = if ($LockHeld) { $null } else { Open-WheelhouseWrite -WheelhousePath $WheelhousePath -TimeoutSeconds $TimeoutSeconds -DenylistPath $DenylistPath }
+        try {
+            $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
+            $changes = [System.Collections.Generic.List[object]]::new()
+            foreach ($name in @($verified.Keys | Sort-Object)) {
+                $problem = $null
+                $plan = [System.Collections.Generic.List[object]]::new()
+                foreach ($file in $verified[$name]) {
+                    $entry = @($manifest | Where-Object { $_.file -eq $file.Name })[0]
+                    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+                    if (-not $entry) { $problem = "$($file.Name) is not in the wheelhouse under this name - nothing to overwrite"; break }
+                    if (-not [string]::Equals([string]$entry.sha256, $hash, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $problem = "the copy downloaded from PyPI ($hash) differs from the sha256 in the manifest ($($entry.sha256)) - the published copy stays; find out why"
+                        break
+                    }
+                    $plan.Add([PSCustomObject]@{ Source = $file.FullName; Name = $file.Name; Hash = $hash })
+                }
+                if ($problem) {
+                    $rejected.Add([PSCustomObject]@{ Name = $name; Version = $versions[$name]; Category = 'integrity'; Reason = "overwrite refused: $problem" })
+                    continue
+                }
+                $done = [System.Collections.Generic.List[string]]::new()
+                try {
+                    foreach ($item in $plan) {
+                        $destination = Join-Path $WheelhousePath $item.Name
+                        $partial = "$destination.partial"
+                        try {
+                            Copy-Item -LiteralPath $item.Source -Destination $partial -Force -ErrorAction Stop
+                            if ((Get-FileHash -LiteralPath $partial -Algorithm SHA256 -ErrorAction Stop).Hash -ne $item.Hash) { throw "the copy of '$($item.Name)' in the wheelhouse does not match the verified file." }
+                            if (Test-Path -LiteralPath $destination -PathType Leaf) {
+                                if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+                                [System.IO.File]::Replace($partial, $destination, (Join-Path $folder $item.Name))
+                            }
+                            else {
+                                Move-Item -LiteralPath $partial -Destination $destination -ErrorAction Stop
+                            }
+                            $done.Add($item.Name)
+                        }
+                        finally {
+                            if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue }
+                        }
+                    }
+                }
+                catch {
+                    # Files already swapped hold identical content, so nothing is rolled back.
+                    $rejected.Add([PSCustomObject]@{ Name = $name; Version = $versions[$name]; Category = 'publish'; Reason = "overwrite failed after $($done.Count) file(s): $($_.Exception.Message)" })
+                    foreach ($fileName in $done) { $replacedFiles.Add($fileName) }
+                    continue
+                }
+                foreach ($fileName in $done) { $replacedFiles.Add($fileName) }
+                $accepted[$name] = $versions[$name]
+                $changes.Add([PSCustomObject]@{
+                        Name    = $name
+                        Version = $versions[$name]
+                        State   = 'Published'
+                        Action  = 'Overwritten'
+                        Detail  = "downloaded again and checked like a new package (audit, sha256 against PyPI and the manifest$(if ($Intake.Scan) { ', Defender' })); $($done -join ', ') replaced, the previous copy is in $folder"
+                    })
+                Write-Log "  Overwritten: $name==$($versions[$name]) ($($done -join ', ')); the previous copy is in $folder" 'OK'
+            }
+            if ($changes.Count -gt 0) {
+                $intakeScan = $null
+                if ($Intake.Scan -and $Intake.Scan.Status -in 'Clean', 'Threat') {
+                    $intakeScan = [PSCustomObject]@{ Status = 'Clean'; ScannedPaths = @($replacedFiles | ForEach-Object { Join-Path $WheelhousePath $_ }); Threats = @() }
+                }
+                Set-WheelhouseCatalogState -WheelhousePath $WheelhousePath -Change $changes.ToArray() -ScanResult $intakeScan
+            }
+        }
+        finally {
+            Exit-WheelhouseLock -Lock $lock
+        }
+    }
+    finally {
+        if ($Intake.StagingPath) { Remove-Item -Path $Intake.StagingPath -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    return @{ Accepted = $accepted; Rejected = $rejected.ToArray(); Replaced = $replacedFiles.ToArray(); Folder = $(if ($replacedFiles.Count -gt 0) { $folder } else { $null }) }
+}

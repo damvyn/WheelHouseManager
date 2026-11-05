@@ -109,6 +109,12 @@
 .PARAMETER ExpediteReason
     Why the cooldown is skipped; logged with the user name.
 
+.PARAMETER OverwritePackage
+    name==version pins of published versions to download again, check like new packages
+    (audit, sha256 against PyPI, Defender) and put in place of the published copy. The new
+    copy must match the sha256 in the manifest; the previous copy is moved to
+    <wheelhouse>\_replaced\<time>\. Group files and the manifest do not change.
+
 .PARAMETER AutoQuarantine
     On or Off for this run, overriding the AutoQuarantine setting (default On): whether a
     wheel removed or changed outside the manager is taken out automatically, or stops the run.
@@ -164,6 +170,8 @@ param(
 
     [string]$ExpediteReason,
 
+    [string[]]$OverwritePackage,
+
     [ValidateSet('On', 'Off')]
     [string]$AutoQuarantine
 )
@@ -192,6 +200,12 @@ try {
         Write-Log "Cooldown is skipped for $(($expedite.Keys | Sort-Object | ForEach-Object { "$_==$($expedite[$_])" }) -join ', ') - requested by $user. Reason: $ExpediteReason" 'WARN'
     }
 
+    $overwrite = @{}
+    foreach ($pin in @(ConvertTo-WheelhousePin -Pin @($OverwritePackage | Where-Object { $_ }))) { $overwrite[$pin.Name] = $pin.Version }
+    if ($overwrite.Count -gt 0) {
+        Write-Log "To overwrite (download again, check, replace the published copy): $(($overwrite.Keys | Sort-Object | ForEach-Object { "$_==$($overwrite[$_])" }) -join ', ')" 'WARN'
+    }
+
     Confirm-PythonAndTooling
 
     $syncParams = @{
@@ -204,6 +218,7 @@ try {
         Services              = $cfg.VulnerabilityServices
         Expedite              = $expedite
         ExpediteReason        = [string]$ExpediteReason
+        Overwrite             = $overwrite
         RequireDefenderScan   = [bool]$cfg.RequireDefenderScanAtIntake
         SkipDefenderScan      = -not (ConvertTo-WheelhouseBoolean $cfg.DefenderScanAtIntake)
         # -AutoQuarantine On|Off wins over the setting (a bool).
