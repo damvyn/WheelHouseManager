@@ -32,12 +32,13 @@ CI (`.github/workflows/powershell-tests.yml`) runs on `windows-latest` under **b
 - `Common`: logging, atomic writes, `Invoke-NativeCommand`, name/version/pin validation, locks (`Open-WheelhouseWrite`), exit codes;
 - `Settings`;
 - `Requirements`;
+- `Resolve`: `Invoke-RequirementResolve`, the resolve loop of `Update-Requirement.ps1` - when uv fails it sets aside the requirement uv's error names (`Get-UvRequiredName` / `Get-UvResolveReason`: cooldown with an `expedite` pin, no wheel, not found, conflict) and resolves the rest again; pins pip finds unusable become `name!=version` constraints first. The set-aside entries go to `Input\requirements.status.json` (`set_aside`) and the Add tab's problems table. `Get-RequirementResolveInput` keeps the asked-for pins of the current requirements.txt and ignores a new line it already covers;
 - `Manifest`;
 - `Catalog`: `<wheelhouse>\catalog.json` (per-version state, latest audit/scan/PyPI results, vulnerability findings with severity, due date, waiver and alert state; the weekly check's heartbeat) and `events.jsonl` (history);
 - `Journal`: `<wheelhouse>\.journal\` crash safety for publish/remove/restore;
 - `Audit`;
 - `Vulnerability`: severity from OSV (`Get-VulnerabilitySeverity`, cached in `<wheelhouse>\reports\osv-cache.json`), CVSS 3 scoring, due days (`Get-WheelhouseDueDayTable`), waivers (`config\waivers.json`);
-- `Intake`: `Invoke-CandidateIntake` (checks, no lock) and `Publish-CandidateIntake` (write lock);
+- `Intake`: `Invoke-CandidateIntake` (checks, no lock), `Publish-CandidateIntake` (write lock) and `Publish-OverwriteIntake` (overwrite a published version with a copy checked again: same sha256 as the manifest, old copy to `<wheelhouse>\_replaced\`);
 - `Sync`: `Invoke-WheelhouseSync`, the whole update run;
 - `Alert`;
 - `Run`: start/stop, transcript, report retention;
@@ -62,7 +63,7 @@ A new function must also be added to `FunctionsToExport` in `WheelhouseManager.p
 Functions `throw`; only scripts `exit`.
 
 Script roles:
-- `Update-Requirement.ps1`: `uv pip compile` turns `Input\requirements.in` into a candidate file. It is then checked with a `pip install --dry-run` against the target Python version and platform (`Test-RequirementWheelAvailability`), and only then becomes `Input\requirements.txt`. uv on its own accepts sdist-only packages and ignores the upper `Requires-Python` bound, which is why the pip check exists.
+- `Update-Requirement.ps1`: `uv pip compile` turns `Input\requirements.in` (plus the asked-for pins of the current requirements.txt) into a candidate file, setting aside every requirement it cannot resolve (`Invoke-RequirementResolve`; `-NoSetAside` fails instead, for remediation). It is then checked with a `pip install --dry-run` against the target Python version and platform (`Test-RequirementWheelAvailability`), and only then becomes `Input\requirements.txt`. uv on its own accepts sdist-only packages and ignores the upper `Requires-Python` bound, which is why the pip check exists.
 - `Update-Wheelhouse.ps1` frames the run (transcript, tooling check, exit code); `Invoke-WheelhouseSync` does the work:
   1. under the write lock: journal repair, integrity check against `manifest.json`, take out wheels removed/changed on the share (`Resolve-WheelhouseIntegrityProblem`, `AutoQuarantine`), move untracked wheels to `_untracked\` (`Move-UntrackedWheelFile`), catalog reconcile, heartbeat warning, group snapshot;
   2. an in-memory merge plan of `Input\requirements.txt` into the `requirements-N.txt` groups;

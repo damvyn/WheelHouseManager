@@ -160,7 +160,7 @@
     shown: {},
     // The Add tab is rebuilt every time it is shown: an unsaved edit of requirements.in (null
     // when there is none), the publish checkbox and the lines a save refused live here.
-    add: { draft: null, publish: false, problems: null }
+    add: { draft: null, publish: false, problems: null, selection: null, selectionFor: null }
   };
 
   // ---------------------------------------------------------------- header / tabs
@@ -683,7 +683,7 @@
     root.append(
       h('div', { class: 'card' },
         h('h2', {}, '1. Add packages'),
-        h('p', { class: 'muted' }, 'This is requirements.in: one requirement per line, for example numpy or pandas>=2.0. Edit it here and click Add and resolve: Update-Requirement.ps1 resolves it (with the cooldown) together with the pins still waiting below into requirements.txt. Nothing is downloaded yet: review the result below first. When the resolve succeeds, requirements.in is emptied - its packages are then listed below. When it fails, the box keeps the lines so you can fix them.'),
+        h('p', { class: 'muted' }, 'This is requirements.in: one requirement per line, for example numpy or pandas>=2.0. Edit it here and click Add and resolve: Update-Requirement.ps1 resolves it (with the cooldown) together with the packages already listed below into requirements.txt. Nothing is downloaded yet: review the result below first. Every line is dealt with in one run - a line that cannot be resolved is listed below with the reason, the rest is resolved. Afterwards requirements.in is emptied.'),
         specs,
         h('p', {}, h('label', {}, publishNow, ' Also publish right away (skips the review step)')),
         h('div', { class: 'toolbar' }, go, undo, info),
@@ -735,20 +735,20 @@
         card.classList.add('next-step');
         card.append(h('p', { class: 'next-hint' }, showNextStep === 'fix'
           ? 'Fix prepared. Next: review what changes below, then publish it to the wheelhouse.'
-          : 'Resolved. Next: review the pins below, then publish them to the wheelhouse.'));
+          : 'Resolved. Next: review the packages below, then publish them to the wheelhouse.'));
         setTimeout(function () { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 50);
       } else {
         card.classList.remove('next-step');
       }
       card.append(h('h2', {}, '2. Review and publish'),
         h('p', { class: 'muted' }, 'Resolved pins in ' + (data.path || 'requirements.txt') + (data.modified_utc ? ' (changed ' + fmtDate(data.modified_utc) + ')' : '') +
-          '. Publishing runs Update-Wheelhouse.ps1: every new pin is checked against the denylist, audited, checked for the cooldown and for yanked releases, downloaded into a staging folder, verified against the sha256 published on PyPI and scanned with Defender. Only then is it copied into the wheelhouse. Pins already in the wheelhouse are skipped.'));
-      // The latest "Add and resolve" failed: what to fix in step 1, and no publishing until then.
+          '. Publishing runs Update-Wheelhouse.ps1 for the ticked packages: each one is checked against the denylist, audited, checked for the cooldown and for yanked releases, downloaded into a staging folder, verified against the sha256 published on PyPI and scanned with Defender. Only then is it copied into the wheelhouse.'));
+      // The latest "Add and resolve" produced nothing: what to fix in step 1.
       var failure = data.resolve_failure && data.resolve_failure.failed ? data.resolve_failure : null;
       if (failure) {
         var lines = [].concat(failure.packages || []);
         card.append(h('div', { class: 'banner' }, h('strong', {}, 'The latest resolve failed' + (failure.time_utc ? ' (' + fmtDate(failure.time_utc) + ')' : '') + '. '), failure.message || '',
-          ' Fix the lines in step 1 and click Add and resolve again; publishing stays off until then.'));
+          ' requirements.txt was not changed. Fix the lines in step 1 and click Add and resolve again.'));
         if (lines.length) {
           card.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
             h('thead', {}, h('tr', {}, h('th', {}, 'Line in step 1'), h('th', {}, 'Status'))),
@@ -757,72 +757,148 @@
             })))));
         }
       }
-      if (!data.pin_count) {
-        card.append(h('div', { class: 'empty' }, 'requirements.txt is empty - add packages above first.'));
+      var problems = [].concat(data.problems || []);
+      if (problems.length) { card.append(renderProblemTable(problems)); }
+      var rows = [].concat(data.rows || []);
+      if (!rows.length) {
+        card.append(h('div', { class: 'empty' }, problems.length
+          ? 'No package is ready to publish. Remove the problem packages above, or add packages in step 1.'
+          : 'requirements.txt is empty - add packages above first.'));
         return;
       }
-      // Only what publishing would add; pins already in the wheelhouse are only counted.
-      var pending = [].concat(data.pending || []);
+      var sel = reviewSelection(rows, data.modified_utc);
+      card.append(renderReviewTable(rows, sel));
       var whole = h('details', {}, h('summary', {}, 'Show the whole requirements.txt (' + data.pin_count + ' pin(s))'), h('pre', { class: 'log review' }, data.text));
-      if (data.published_count > 0) {
-        card.append(h('p', {}, data.published_count + ' pin(s) of requirements.txt are already in the wheelhouse and are not listed here.'));
-      }
-      if (pending.length === 0) {
-        card.append(h('div', { class: 'empty' }, 'Everything in requirements.txt is already in the wheelhouse - there is nothing to publish. Add packages above to resolve new ones.'), whole);
-        return;
-      }
-      var rejectedCount = pending.filter(function (p) { return p.rejected; }).length;
-      card.append(h('div', { class: 'table-wrap scroll-list' }, h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, 'Not yet in the wheelhouse'), h('th', {}, 'Requested by'), h('th', {}, 'Status'), rejectedCount ? h('th', {}, '') : null)),
-        h('tbody', {}, pending.map(function (p) {
-          // Only a pin the latest publish rejected can be taken out of requirements.txt here; a
-          // dependency of another requirement goes away only with that requirement.
-          var action = null;
-          if (p.rejected) {
-            action = p.direct
-              ? h('button', { class: 'btn small danger', type: 'button', 'data-idle': true, title: 'Take ' + p.name + ' (and what only it needs) out of requirements.txt', onclick: function () { removeRequirement(p); } }, 'Remove')
-              : h('span', { class: 'muted', title: 'Not asked for: another package depends on it' }, 'dependency');
-          }
-          var status = !p.rejected ? badge('new', 'ok')
-            : p.retryable ? [badge('waiting for cooldown', 'warn'), ' ', p.rejected] : [badge('rejected', 'bad'), ' ', p.rejected];
-          var by = [].concat(p.requested_by || []);
-          return h('tr', {}, h('td', { class: 'mono' }, p.name + '==' + p.version),
-            h('td', {}, by.length ? by.map(function (b, i) { return [i ? ', ' : '', b === 'User input' ? h('strong', {}, b) : h('span', { class: 'mono' }, b)]; }) : h('span', { class: 'muted' }, '-')),
-            h('td', {}, status),
-            rejectedCount ? h('td', { class: 'num' }, action) : null);
-        })))));
-      // A rejected pin is not counted for publishing; one rejected only for the cooldown is,
-      // because it passes once the cooldown is over.
-      var publishable = pending.filter(function (p) { return !p.rejected || p.retryable; }).length;
-      var blocked = pending.filter(function (p) { return p.rejected && !p.retryable; }).length;
-      var waiting = rejectedCount - blocked;
-      if (blocked > 0) {
-        card.append(h('p', { class: 'muted' }, blocked + ' pin(s) were rejected by the latest publish for the reason shown and are not counted for publishing. Click Remove to take them out of requirements.txt.'));
-      }
-      if (waiting > 0) {
-        card.append(h('p', { class: 'muted' }, waiting + ' pin(s) are newer than the cooldown. Publishing again adds them once the cooldown has passed; Remove takes them out if you do not want to wait.'));
-      }
-      var clearable = pending.length > 0;
-      card.append(renderApproval(data.approval, failure ? 0 : publishable, clearable, !!failure), whole);
+      card.append(renderApproval(data.approval, sel, [].concat(data.pending || []).length > 0, !!failure), whole);
     }).catch(function (err) { clear(card); card.append(h('div', { class: 'empty' }, err.message)); });
   }
 
-  // Takes a pin (and the pins only it needed) out of requirements.txt.
-  function removeRequirement(p) {
-    confirmDialog('Remove ' + p.name + '?', h('div', {},
-      h('p', {}, h('span', { class: 'mono' }, p.name + '==' + p.version), ' is taken out of requirements.txt, together with the dependencies only it needed, so it is no longer waiting to be published.'),
-      h('p', { class: 'muted' }, 'Nothing in the wheelhouse changes.')), 'Remove', true).then(function (ok) {
-      if (!ok) { return; }
-      api('POST', '/api/requirements/remove', { name: p.name }).then(function (data) {
-        if (data.job) { watchJob(data.job.id, false); } else { toast(p.name + ' removed.'); loadRequirements(); }
+  function requestedByCell(list) {
+    var by = [].concat(list || []);
+    return h('td', {}, by.length ? by.map(function (b, i) { return [i ? ', ' : '', b === 'User input' ? h('strong', {}, b) : h('span', { class: 'mono' }, b)]; }) : h('span', { class: 'muted' }, '-'));
+  }
+
+  // First table: what cannot be published as it is - set aside by the resolve, or rejected
+  // by the latest publish. Remove All drops them; Expedite retries one that is only too new.
+  function renderProblemTable(problems) {
+    var removeAll = h('button', { class: 'btn danger', type: 'button', 'data-idle': true, title: 'Take every package listed here out of the list' }, 'Remove All');
+    removeAll.addEventListener('click', function () {
+      api('POST', '/api/requirements/problems/remove', {}).then(function () {
+        toast(problems.length + ' problem package(s) removed.');
+        loadRequirements();
       }).catch(fail);
     });
+    return h('div', { class: 'review-block' },
+      h('h3', {}, 'Packages with problems ', badge(String(problems.length), 'bad')),
+      h('p', { class: 'muted' }, 'These are not published. Remove All takes them out of the list (a rejected package together with the dependencies only it needed). A package that is only too new can be expedited: it is resolved again with the cooldown skipped for that one version.'),
+      h('div', { class: 'table-wrap scroll-list' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Requested by'), h('th', {}, 'Status'))),
+        h('tbody', {}, problems.map(function (p) {
+          var kind = p.kind === 'cooldown' ? 'warn' : 'bad';
+          var label = { cooldown: 'too new', 'no-wheel': 'no wheel', 'not-found': 'not found', 'no-version': 'no version', conflict: 'conflict', rejected: 'rejected' }[p.kind] || 'problem';
+          var expedite = p.expedite
+            ? [' ', h('button', { class: 'btn small', type: 'button', 'data-idle': true, title: 'Resolve ' + p.spec + ' again with the cooldown skipped for ' + p.expedite, onclick: function () { expediteProblem(p); } }, 'Expedite')]
+            : null;
+          var reason = String(p.reason || '').replace(/^too new: /, '');
+          return h('tr', {}, h('td', { class: 'mono' }, p.spec), requestedByCell(p.requested_by), h('td', {}, badge(label, kind), ' ', reason, expedite));
+        })))),
+      h('div', { class: 'toolbar after-output' }, removeAll));
+  }
+
+  function expediteProblem(p) {
+    var reason = h('input', { type: 'text', class: 'wide', placeholder: 'Why? e.g. needed for project X (recorded)' });
+    confirmDialog('Expedite ' + p.expedite + '?', h('div', {},
+      h('p', {}, h('span', { class: 'mono' }, p.spec), ' goes back to step 1 and is resolved again with the cooldown skipped for ', h('span', { class: 'mono' }, p.expedite), ' only. The publish skips its cooldown too; every other check still applies.'),
+      reason), 'Expedite', false).then(function (ok) {
+      if (!ok) { return; }
+      startJobRequest(api('POST', '/api/requirements/expedite', { name: p.name, reason: reason.value }));
+    });
+  }
+
+  // Which review rows are ticked: new packages by default, packages already in the
+  // wheelhouse not (ticking one overwrites it). Kept while requirements.txt stays the same.
+  function reviewSelection(rows, version) {
+    if (!state.add.selection || state.add.selectionFor !== version) {
+      state.add.selection = {};
+      state.add.selectionFor = version;
+      rows.forEach(function (r) { state.add.selection[pinKey(r)] = r.status !== 'added'; });
+    }
+    var picked = state.add.selection;
+    var byName = {};
+    rows.forEach(function (r) { byName[r.name] = r; });
+    var listeners = [];
+    function isOn(r) { return !!picked[pinKey(r)]; }
+    // Ticking a new package ticks the new packages it needs; unticking it unticks those no
+    // other ticked package needs, and the ticked packages that need it (they cannot be
+    // published without it). Packages already in the wheelhouse are never changed by this.
+    function set(r, on) {
+      picked[pinKey(r)] = on;
+      if (r.status === 'added') { return; }
+      if (on) {
+        [].concat(r.needs || []).forEach(function (n) { var d = byName[n]; if (d && d.status !== 'added' && !isOn(d)) { set(d, true); } });
+      } else {
+        rows.forEach(function (p) { if (p.status !== 'added' && isOn(p) && [].concat(p.needs || []).indexOf(r.name) >= 0) { set(p, false); } });
+        [].concat(r.needs || []).forEach(function (n) {
+          var d = byName[n];
+          if (!d || d.status === 'added' || !isOn(d)) { return; }
+          var stillNeeded = rows.some(function (p) { return p !== d && isOn(p) && p.status !== 'added' && [].concat(p.needs || []).indexOf(n) >= 0; });
+          if (!stillNeeded) { set(d, false); }
+        });
+      }
+    }
+    function changed() { listeners.forEach(function (f) { f(); }); }
+    return {
+      rows: rows,
+      isOn: isOn,
+      toggle: function (r, on) { set(r, on); changed(); },
+      all: function (on) { rows.forEach(function (r) { picked[pinKey(r)] = on; }); changed(); },
+      onChange: function (f) { listeners.push(f); },
+      publishCount: function () { return rows.filter(isOn).length; },
+      overwrite: function () { return rows.filter(function (r) { return r.status === 'added' && isOn(r); }).map(pinKey); },
+      leaveOut: function () { return rows.filter(function (r) { return r.status !== 'added' && !isOn(r); }).map(function (r) { return r.name; }); },
+      newCount: function () { return rows.filter(function (r) { return r.status !== 'added' && isOn(r); }).length; }
+    };
+  }
+
+  // Second table: every package without a problem, with a checkbox. Publish takes the ticked ones.
+  function renderReviewTable(rows, sel) {
+    var allBox = h('input', { type: 'checkbox', title: 'Select or clear all' });
+    allBox.addEventListener('change', function () { sel.all(allBox.checked); });
+    var body = h('tbody');
+    function statusCell(r, on) {
+      if (r.status === 'added') {
+        return on ? [badge('overwrite', 'warn'), ' already in the wheelhouse - downloaded, checked and replaced again']
+          : [badge('already added', null), ' ', h('span', { class: 'muted' }, 'tick it to overwrite')];
+      }
+      var label = r.status === 'new_version' ? badge('new version', 'ok') : badge('new', 'ok');
+      var other = r.status === 'new_version' ? h('span', { class: 'muted' }, ' wheelhouse has ' + [].concat(r.published_versions || []).join(', ')) : null;
+      return [label, other, on ? null : h('span', { class: 'muted' }, ' - not published, taken out of the list')];
+    }
+    function draw() {
+      clear(body);
+      allBox.checked = rows.every(sel.isOn);
+      allBox.indeterminate = !allBox.checked && rows.some(sel.isOn);
+      rows.forEach(function (r) {
+        var on = sel.isOn(r);
+        var box = h('input', { type: 'checkbox', checked: on, title: r.status === 'added' ? 'Overwrite this version' : 'Publish this package' });
+        box.addEventListener('change', function () { sel.toggle(r, box.checked); });
+        body.append(h('tr', { class: on ? 'selected' : '' }, h('td', {}, box), h('td', { class: 'mono' }, pinKey(r)), requestedByCell(r.requested_by), h('td', {}, statusCell(r, on))));
+      });
+    }
+    sel.onChange(draw);
+    draw();
+    return h('div', { class: 'review-block' },
+      h('h3', {}, 'Packages to publish'),
+      h('p', { class: 'muted' }, 'Ticked packages are published. Unticking a package also unticks the new packages only it needs and the packages that need it; an unticked new package is taken out of requirements.txt when you publish. A package already in the wheelhouse is only published when you tick it: it is then downloaded and checked again and replaces the published copy.'),
+      h('div', { class: 'table-wrap scroll-list' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, allBox), h('th', {}, 'Name'), h('th', {}, 'Requested by'), h('th', {}, 'Status'))),
+        body)));
   }
 
   // The proposal behind requirements.txt and the buttons. With the default approval mode the
   // person who publishes is recorded and there is nothing to approve separately; the
   // SeparateApprover mode (decision D3) keeps Approve / Reject for a second person.
-  function renderApproval(a, publishable, clearable, resolveFailed) {
+  function renderApproval(a, sel, clearable, resolveFailed) {
     var box = h('div', { class: 'approval' });
     var p = a.proposal;
     var separate = a.mode === 'SeparateApprover';
@@ -882,14 +958,25 @@
       });
       buttons.append(propose);
     }
-    var publish = h('button', { class: 'btn primary', type: 'button', 'data-idle': true, disabled: !a.can_publish || publishable === 0 },
-      resolveFailed ? 'Fix the resolve first' : publishable === 0 ? 'Nothing to publish' : 'Publish ' + publishable + ' pin(s)');
+    var publish = h('button', { class: 'btn primary', type: 'button', 'data-idle': true });
+    function updatePublish() {
+      var n = sel.publishCount();
+      publish.disabled = !a.can_publish || n === 0 || resolveFailed;
+      publish.textContent = resolveFailed ? 'Fix the resolve first' : n === 0 ? 'Nothing selected' : 'Publish ' + n + ' package(s)';
+    }
+    sel.onChange(updatePublish);
+    updatePublish();
     publish.addEventListener('click', function () {
-      confirmDialog('Publish ' + publishable + ' pin(s)?', h('div', {},
-        h('p', {}, 'Every pin that is not yet in the wheelhouse goes through all checks; a package that fails one is rejected with the reason and nothing about it is published.'),
+      var leaveOut = sel.leaveOut();
+      var overwrite = sel.overwrite();
+      var newCount = sel.newCount();
+      confirmDialog('Publish ' + sel.publishCount() + ' package(s)?', h('div', {},
+        newCount ? h('p', {}, newCount + ' new package(s) go through all checks; a package that fails one is rejected with the reason and nothing about it is published.') : null,
+        overwrite.length ? h('p', {}, overwrite.length + ' package(s) already in the wheelhouse are downloaded and checked again and replace the published copy (which is kept in the _replaced folder): ', h('span', { class: 'mono' }, overwrite.join(', '))) : null,
+        leaveOut.length ? h('p', {}, leaveOut.length + ' unticked package(s) are taken out of requirements.txt and not published: ', h('span', { class: 'mono' }, leaveOut.join(', '))) : null,
         h('p', { class: 'muted' }, 'Recorded as published by ' + a.current_user + '.')), 'Publish', false).then(function (ok) {
         if (!ok) { return; }
-        startJobRequest(api('POST', '/api/wheelhouse/update', { confirm: true }));
+        startJobRequest(api('POST', '/api/wheelhouse/update', { confirm: true, leave_out: leaveOut, overwrite: overwrite })).then(function () { state.add.selection = null; loadRequirements(); });
       });
     });
     buttons.append(publish);

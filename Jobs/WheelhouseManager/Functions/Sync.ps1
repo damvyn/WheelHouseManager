@@ -17,6 +17,8 @@ function Invoke-WheelhouseSync {
     #      Get-DependentRejection) is held back; then Publish-CandidateIntake per group (write
     #      lock for the seconds the publish takes). Only the candidates are audited and
     #      scanned - published versions are the weekly check's job;
+    #   O. -Overwrite: published versions downloaded and checked again, then swapped in for
+    #      the published copy when the sha256 matches the manifest (Publish-OverwriteIntake);
     #   R. remediation: quarantine the vulnerable version once no group lists it any more
     #      and its replacement is published (write lock);
     #   D. first-time setup only: adopt the wheels the folder already held (write lock);
@@ -58,6 +60,10 @@ function Invoke-WheelhouseSync {
         [hashtable]$Expedite = @{},
 
         [string]$ExpediteReason = '',
+
+        # name -> version of published versions to download again, check like new packages
+        # and put in place of the published copy (Publish-OverwriteIntake).
+        [hashtable]$Overwrite = @{},
 
         [switch]$RequireDefenderScan,
 
@@ -233,7 +239,7 @@ function Invoke-WheelhouseSync {
         # Existing groups first, then planned new groups in number order.
         $targetGroups = @($groupFiles) + @($additionsByGroup.Keys | Where-Object { $groupFiles -notcontains $_ } |
                 Sort-Object { Get-GroupFileNumber -Path $_ })
-        if ($targetGroups.Count -eq 0) {
+        if ($targetGroups.Count -eq 0 -and $Overwrite.Count -eq 0) {
             Write-Log 'Run Update-Requirement.ps1 and re-run this script with -LocalRequirementsPath to create the first group.' 'ERROR'
             throw 'Wheelhouse has no requirement group files yet, and no local requirements were supplied to bootstrap one.'
         }
@@ -403,6 +409,59 @@ function Invoke-WheelhouseSync {
             # A run that stopped between the checks and the publish leaves no staged files.
             foreach ($run in $groupRuns) {
                 if ($run.Intake -and $run.Intake.StagingPath) { Remove-Item -Path $run.Intake.StagingPath -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+        }
+
+        # -------------------------------------------------------------------
+        # O. Overwrite published versions with a copy checked again
+        # -------------------------------------------------------------------
+        $overwritePins = @{}
+        foreach ($key in @($Overwrite.Keys | Sort-Object)) {
+            $name = Get-NormalizedPackageName $key
+            $version = [string]$Overwrite[$key]
+            if (@($manifest | Where-Object { $_.name -eq $name -and $_.version -eq $version }).Count -eq 0) {
+                Write-Log "Overwrite: $name==$version is not in the wheelhouse - nothing to overwrite." 'WARN'
+                continue
+            }
+            $overwritePins[$name] = $version
+        }
+        if ($overwritePins.Count -gt 0) {
+            Write-Log "--- Overwrite: $(($overwritePins.Keys | Sort-Object | ForEach-Object { "$_==$($overwritePins[$_])" }) -join ', ') - downloaded again and checked like new packages ---"
+            $overwriteParams = @{
+                Packages            = $overwritePins
+                GroupName           = 'overwrite'
+                ReportsFolder       = $ReportsFolder
+                Services            = $Services
+                MinimumAgeDays      = $MinimumAgeDays
+                PythonVersion       = $PythonVersion
+                Platform            = $Platform
+                Denylist            = $denylist
+                # These versions passed the cooldown when they were published.
+                Expedite            = $overwritePins
+                RequireDefenderScan = [bool]$RequireDefenderScan
+                SkipDefenderScan    = [bool]$SkipDefenderScan
+                StagingRoot         = $StagingRoot
+            }
+            $overwriteIntake = Invoke-CandidateIntake @overwriteParams
+            foreach ($result in $overwriteIntake.AuditResults) { $auditResults.Add($result) }
+            $overwritten = Publish-OverwriteIntake -Intake $overwriteIntake -WheelhousePath $WheelhousePath -DenylistPath $DenylistPath -TimeoutSeconds $LockTimeoutSeconds
+            foreach ($item in @($overwriteIntake.Rejected) + @($overwritten.Rejected)) {
+                if ($null -eq $item) { continue }
+                Write-Log "  Not overwritten: $($item.Name)==$($item.Version) - $($item.Reason) -> the published copy stays" 'ERROR'
+                $rejectedAll.Add([PSCustomObject]@{
+                        Group      = 'overwrite'
+                        Package    = $item.Name
+                        Version    = $item.Version
+                        Kind       = 'overwrite'
+                        Category   = $item.Category
+                        Reason     = $item.Reason
+                        Dependency = $null
+                    })
+                if ($item.Category -in 'integrity', 'defender') {
+                    $notices.Add((New-WheelhouseNotice -Kind 'IntakeBlocked' -Package $item.Name -Version $item.Version -Message $item.Reason))
+                }
+                if ($item.Category -eq 'audit-error') { $auditIncomplete = $true }
+                $overallPassed = $false
             }
         }
 

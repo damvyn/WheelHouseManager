@@ -749,38 +749,54 @@ in place and only the table scrolls. A banner warns when the weekly check has no
 
 **1. Add packages.** The box is `requirements.in` itself, one requirement per line. Edit it and
 click **Add and resolve**: the whole box replaces `requirements.in` and is resolved, together with
-the pins still waiting in step 2 (new packages are added, duplicates are ignored) - nothing is
-downloaded yet. While a job runs, the box and the button are locked.
+the packages already waiting in step 2 - nothing is downloaded yet. While a job runs, the box and
+the button are locked.
 
-- Nothing is saved while a line has a problem (not a valid requirement, a package listed twice,
-  or blocked by the denylist); the lines to fix are listed under the box.
+- One resolve deals with **every** line: a line that cannot be resolved (too new for the
+  cooldown, no usable wheel for the target Python, not on PyPI, a version conflict) is **set
+  aside** with the reason and the rest is resolved without it. You no longer fix one line and
+  resolve again for the next one - all problems are listed together in step 2.
+- A version pip cannot use for the target (uv ignores upper `Requires-Python` bounds) is excluded
+  first so uv can pick another one; only when no version fits is the line set aside.
+- A line for a package that step 2 already lists at a version the line accepts is ignored (the
+  listed pin stays). A line that asks for another version replaces it.
+- Nothing is saved while a line has a problem the box can check itself (not a valid
+  requirement, a package listed twice, or blocked by the denylist); those lines are listed under
+  the box.
 - An edit you have not saved yet stays in the box when you switch tabs (*Not saved yet*);
   **Discard changes** shows the file as it is again.
-- When the resolve succeeds, `requirements.in` is emptied and the box with it: the packages are
-  now in step 2. When it fails, the lines stay in the box so you can fix them.
+- After the resolve, `requirements.in` is emptied and the box with it: the packages are now in
+  step 2 - in one of its two tables.
 - *Also publish right away* resolves and publishes in one go, skipping the review step.
 
-**2. Review and publish.** Lists only the resolved pins that are **not yet in the wheelhouse**
-(pins already published are only counted; the whole `requirements.txt` is behind *Show the whole
-requirements.txt*), with **Requested by** (*User input* for your own lines, otherwise the
-packages that need it, from the `# via` lines uv writes) and the status: *new* or *rejected last
-time* with the reason. When resolving succeeds, the page scrolls to step 2 and highlights it.
+**2. Review and publish.** Two tables, both with **Name** (`fonttools==4.67.0`), **Requested by**
+(*User input* for your own lines, otherwise the packages that need it, from the `# via` lines uv
+writes) and **Status**. When resolving succeeds, the page scrolls to step 2 and highlights it.
 
-- When the latest resolve **failed**, step 2 says why and lists every line of step 1 with its
-  status (not found on PyPI, version does not exist, no usable wheel, named in a version
-  conflict). Publishing is off (*Fix the resolve first*) until a resolve succeeds.
+- **Packages with problems** - only shown when there are any: the lines the resolve set aside, and
+  pins the latest publish rejected, each with the reason. **Remove All** takes them all out (a
+  rejected pin together with the pins only it needed) and the table disappears. A package that is
+  only too new has **Expedite**: give a reason, and it is resolved again with the cooldown
+  skipped for that one version (the publish skips it too; every other check still applies).
+- **Packages to publish** - every other pin, with a checkbox (the header box ticks or clears all):
+  - *new* - not in the wheelhouse; ticked by default.
+  - *new version* - another version of it is in the wheelhouse; ticked by default.
+  - *already added* - exactly this version is in the wheelhouse; not ticked. Tick it to
+    **overwrite** it: it is downloaded again, checked like a new package (audit, sha256 against
+    PyPI, Defender), and replaces the published copy. The new copy must have the sha256 the
+    manifest recorded (PyPI never changes a file), otherwise the overwrite is refused; the
+    previous copy is kept in `<wheelhouse>\_replaced\<time>\`.
+  - Unticking a package also unticks the new packages only it needs and the packages that need it
+    (they cannot be published without it); ticking it ticks what it needs. *Already added*
+    packages are never changed by this.
+- **Publish N package(s)** publishes the ticked packages. Unticked new packages are taken out of
+  `requirements.txt` first. The approval carries over to the smaller list (approving a list
+  approves any part of it); with `ApprovalMode = SeparateApprover` a list that is not part of the
+  approved one needs approval again.
+- When the latest resolve produced **nothing** (uv failed without naming a line), step 2 says why
+  and lists every line of step 1 with its status; `requirements.txt` did not change.
 - After a publish in which every pin of `requirements.txt` got into the wheelhouse,
-  `requirements.txt` is emptied. If a pin was rejected (or waits for the cooldown), the file
-  stays, so the pin stays listed here with Remove and Clear list.
-
-- **Publish N pin(s)** runs every check, then publishes. It counts only pins that can pass: a pin
-  the latest publish rejected is not counted, except one rejected only for the cooldown (*waiting
-  for cooldown*) - its own, or that of a dependency it was held back for - which publishing adds
-  once the cooldown has passed. When only rejected pins are
-  left, the button reads *Nothing to publish*.
-- **Remove** on a rejected pin takes it out of `requirements.txt`, together with the pins only it
-  needed (from the `# via` lines uv writes). A rejected pin marked *dependency* is needed by
-  another package and goes away only with it.
+  `requirements.txt` is emptied. A rejected pin stays, listed with the problems.
 - **Clear list** empties `requirements.txt`, so nothing waits any more (the wheelhouse does not
   change).
 - With the default approval mode there is no separate Approve step - publishing records who
@@ -859,8 +875,8 @@ shows the details.
 | `Setup.ps1` (repo) | Deploy or upgrade the manager, check it, optionally schedule the weekly check | `-DestinationPath`, `-WheelhousePath`, `-RegisterScheduledTask`, `-TaskCredential`, `-TaskDays`, `-TaskTime`, `-SkipDoctor` |
 | `whm.ps1` (root) | One command for everything (5.0) | `whm help` |
 | `Client Install\Test-PythonEnvironment.ps1` | Optional, on clients: is anything installed affected? (3.4) | `-Project`, `-Python`, `-AdvisoriesPath`, `-InstalledJson` |
-| `Jobs\Update-Requirement.ps1` | `requirements.in` -> `requirements.txt` | `-RequirementsInPath`, `-RequirementsTxtPath`, `-PythonVersion`, `-Platform`, `-MinimumPackageAgeDays` |
-| `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins; audit what is published; take out wheels missing/changed on the share | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-AutoQuarantine On|Off`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
+| `Jobs\Update-Requirement.ps1` | `requirements.in` -> `requirements.txt`; lines that cannot be resolved are set aside with the reason | `-RequirementsInPath`, `-RequirementsTxtPath`, `-PythonVersion`, `-Platform`, `-MinimumPackageAgeDays`, `-ExpeditePackage`, `-ExpediteReason`, `-NoSetAside` |
+| `Jobs\Update-Wheelhouse.ps1` | Check and publish new pins; audit what is published; take out wheels missing/changed on the share | `-LocalRequirementsPath` (`""` = no merge), `-ExpeditePackage`, `-ExpediteReason`, `-OverwritePackage`, `-AutoQuarantine On|Off`, `-MinimumPackageAgeDays`, `-PythonVersion`, `-Platform`, `-VulnerabilityServices` |
 | `Jobs\Invoke-WheelhousePipeline.ps1` | `Update-Wheelhouse.ps1` + one alert | as above, plus `-SmtpServer`, `-To`, `-From`, `-OutputHtmlPath` |
 | `Jobs\Test-Wheelhouse.ps1` | Weekly check of everything published, with alert | `-AutoQuarantine On|Off`, `-VulnerabilityServices`, `-SmtpServer`, `-MailTo`, `-MailFrom` |
 | `Jobs\Test-WheelhousePackage.ps1` | Audit all or chosen pins, no alert | `-Package name==ver,...` |

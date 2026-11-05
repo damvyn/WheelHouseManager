@@ -126,6 +126,7 @@ try {
             RequirementsInPath  = $cfg.RequirementsInPath
             RequirementsTxtPath = $cfg.LocalRequirementsPath
             NoProposal          = $true
+            NoSetAside          = $true
             PreferCurrent       = $true
         }
         if ($plan.NeedsExpedite) { $resolveParams['MinimumPackageAgeDays'] = 0 }

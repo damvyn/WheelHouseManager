@@ -1098,14 +1098,18 @@ function Test-RequirementTxtDirect {
 function Remove-RequirementTxtPin {
     # Takes pins out of requirements.txt (with their annotation lines), and then every pin that
     # only the removed ones needed (from the "# via" annotations; a pin asked for directly is
-    # kept). Throws, before writing, when a name is not pinned. Returns the removed names.
+    # kept) - unless -Exact, which takes out only -Name (the Add tab's selection already
+    # decided about the dependencies). Throws, before writing, when a name is not pinned.
+    # Returns the removed names.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path,
 
         [Parameter(Mandatory)]
-        [string[]]$Name
+        [string[]]$Name,
+
+        [switch]$Exact
     )
 
     $sources = Read-RequirementDependent -FilePath $Path -IncludeSource
@@ -1118,6 +1122,7 @@ function Remove-RequirementTxtPin {
     }
     do {
         $more = $false
+        if ($Exact) { break }
         foreach ($key in @($sources.Keys)) {
             if ($drop.ContainsKey($key) -or -not $pins.ContainsKey($key)) { continue }
             $from = @($sources[$key])
@@ -1251,9 +1256,11 @@ function Get-RequirementResolveProblem {
 
 function Write-RequirementResolveStatus {
     # Records the outcome of the latest resolve next to requirements.txt
-    # (requirements.status.json): -Problem (from Get-RequirementResolveProblem) and -Message
-    # for a failure; without -Failed the file is removed. The UI shows it in "Review and
-    # publish" and keeps Publish disabled while it reports a failure.
+    # (requirements.status.json): -SetAside, the requirements Invoke-RequirementResolve set
+    # aside ({ name; spec; source; reason; kind; expedite }, shown as problems in "Review and
+    # publish" until they are removed or tried again), and for a resolve that produced no
+    # result -Failed with -Problem (from Get-RequirementResolveProblem) and -Message. With
+    # neither, the file is removed.
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
@@ -1264,22 +1271,30 @@ function Write-RequirementResolveStatus {
         [string]$Message = '',
 
         [AllowEmptyCollection()]
-        [object[]]$Problem = @()
+        [object[]]$Problem = @(),
+
+        [AllowEmptyCollection()]
+        [object[]]$SetAside = @()
     )
 
     $path = Join-Path (Split-Path -Path $RequirementsTxtPath -Parent) 'requirements.status.json'
     if (-not $PSCmdlet.ShouldProcess($path, 'Write the resolve status')) { return }
-    if (-not $Failed) {
+    $aside = @(foreach ($item in $SetAside) {
+            if (-not $item) { continue }
+            [ordered]@{ name = [string]$item.name; spec = [string]$item.spec; source = [string]$item.source; reason = [string]$item.reason; kind = [string]$item.kind; expedite = [string]$item.expedite }
+        })
+    if (-not $Failed -and $aside.Count -eq 0) {
         Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
         return
     }
     $packages = @(foreach ($item in $Problem) { [ordered]@{ spec = [string]$item.spec; ok = [bool]$item.ok; status = [string]$item.status } })
-    $record = [ordered]@{ failed = $true; time_utc = [DateTime]::UtcNow.ToString('o'); message = $Message; packages = $packages }
+    $record = [ordered]@{ failed = [bool]$Failed; time_utc = [DateTime]::UtcNow.ToString('o'); message = $Message; packages = $packages; set_aside = $aside }
     Write-TextFileAtomic -Path $path -Content (ConvertTo-Json -InputObject $record -Depth 5)
 }
 
 function Read-RequirementResolveStatus {
-    # The latest failed resolve recorded by Write-RequirementResolveStatus, or $null.
+    # The latest resolve recorded by Write-RequirementResolveStatus, or $null: failed (no
+    # result), its message and per-line problems, and set_aside.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -1290,11 +1305,17 @@ function Read-RequirementResolveStatus {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     try { $record = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
     catch { return $null }
+    # Plain assignments: one-element lists must stay lists in the JSON.
+    $packages = @(foreach ($item in @($record.packages)) { if ($item) { @{ spec = [string]$item.spec; ok = [bool]$item.ok; status = [string]$item.status } } })
+    $aside = @(foreach ($item in @($record.set_aside)) {
+            if ($item) { @{ name = [string]$item.name; spec = [string]$item.spec; source = [string]$item.source; reason = [string]$item.reason; kind = [string]$item.kind; expedite = [string]$item.expedite } }
+        })
     return @{
-        failed   = [bool]$record.failed
-        time_utc = (ConvertTo-IsoTimestamp $record.time_utc)
-        message  = [string]$record.message
-        packages = @(foreach ($item in @($record.packages)) { if ($item) { @{ spec = [string]$item.spec; ok = [bool]$item.ok; status = [string]$item.status } } })
+        failed    = [bool]$record.failed
+        time_utc  = (ConvertTo-IsoTimestamp $record.time_utc)
+        message   = [string]$record.message
+        packages  = $packages
+        set_aside = $aside
     }
 }
 

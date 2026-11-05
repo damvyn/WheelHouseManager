@@ -69,13 +69,16 @@ function Get-WheelhouseUiToolStatus {
     return $script:UiToolStatus
 }
 
-function Get-WheelhouseUiPendingPin {
-    # What publishing requirements.txt would add: its pins (-Pin, name -> version) that are not
-    # in the wheelhouse yet, as { name; version; rejected (the latest update's reason or $null);
-    # retryable (rejected only for the cooldown - its own, or a dependency's it waits for - so
-    # publishing again can pass); direct (asked for, per requirements.txt's "# via" annotations -
-    # otherwise only a dependency); requested_by ("User input" or the pins that need it) }. Without a
-    # reachable wheelhouse every pin is pending.
+function Get-WheelhouseUiReviewRow {
+    # Every pin of requirements.txt (-Pin, name -> version) for "Review and publish", as
+    # { name; version; status - 'new' (not in the wheelhouse), 'new_version' (another version
+    # is), 'added' (exactly this version is: publishing skips it unless it is overwritten);
+    # published_versions (the versions the wheelhouse has); rejected (the latest update's
+    # reason or $null); retryable (rejected only for the cooldown - its own, or a dependency's
+    # it waits for - so publishing again can pass); direct (asked for, per requirements.txt's
+    # "# via" annotations - otherwise only a dependency); requested_by ("User input" or the
+    # pins that need it); needs (the pins of requirements.txt it depends on) }. Without a
+    # reachable wheelhouse every pin is new.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -87,10 +90,15 @@ function Get-WheelhouseUiPendingPin {
     )
 
     $published = @{}
+    $versionsByName = @{}
     $rejected = @{}
     if ($Context.WheelhousePath -and (Test-Path -Path $Context.WheelhousePath -PathType Container)) {
         $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
-        foreach ($entry in $manifest) { $published["$($entry.name)==$($entry.version)"] = $true }
+        foreach ($entry in $manifest) {
+            $published["$($entry.name)==$($entry.version)"] = $true
+            if (-not $versionsByName.ContainsKey($entry.name)) { $versionsByName[$entry.name] = [System.Collections.Generic.List[string]]::new() }
+            if (-not $versionsByName[$entry.name].Contains([string]$entry.version)) { $versionsByName[$entry.name].Add([string]$entry.version) }
+        }
         $latest = Get-ChildItem -Path $Context.ReportsFolder -Filter 'Report_Rejected_*.json' -File -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending | Select-Object -First 1
         if ($latest) {
@@ -105,22 +113,80 @@ function Get-WheelhouseUiPendingPin {
     $sources = @{}
     $txtPath = [string]$Context.Settings.LocalRequirementsPath
     if ($txtPath -and (Test-Path -LiteralPath $txtPath -PathType Leaf)) { $sources = Read-RequirementDependent -FilePath $txtPath -IncludeSource }
+    $needs = @{}
+    foreach ($name in @($sources.Keys)) {
+        if (-not $Pin.ContainsKey($name)) { continue }
+        foreach ($parent in @($sources[$name])) {
+            if ($parent -match '^-' -or -not $Pin.ContainsKey($parent)) { continue }
+            if (-not $needs.ContainsKey($parent)) { $needs[$parent] = [System.Collections.Generic.List[string]]::new() }
+            $needs[$parent].Add($name)
+        }
+    }
     foreach ($name in ($Pin.Keys | Sort-Object)) {
         $key = "$name==$($Pin[$name])"
-        if ($published.ContainsKey($key)) { continue }
+        $status = if ($published.ContainsKey($key)) { 'added' } elseif ($versionsByName.ContainsKey($name)) { 'new_version' } else { 'new' }
         $reason = $(if ($rejected.ContainsKey($key)) { $rejected[$key] } else { $null })
         [string[]]$from = @()
         if ($sources.ContainsKey($name)) { $from = $sources[$name] }
         # "User input" for a line of requirements.in, otherwise the packages that need it.
+        # Plain assignments: one-element lists must stay lists in the JSON.
         $requestedBy = @(@(foreach ($item in $from) { if ($item -match '^-r\s') { 'User input' } else { $item } }) | Select-Object -Unique)
+        $needed = @(if ($needs.ContainsKey($name)) { $needs[$name] | Sort-Object -Unique })
+        $versions = @(if ($versionsByName.ContainsKey($name)) { $versionsByName[$name] | Sort-Object })
         @{
-            name      = $name
-            version   = [string]$Pin[$name]
-            rejected  = $reason
-            retryable = [bool]($reason -and $reason -match '^(needs \S+, which was rejected \()*cooldown')
-            direct    = [bool](Test-RequirementTxtDirect -Source $from)
-            requested_by = $requestedBy
+            name               = $name
+            version            = [string]$Pin[$name]
+            status             = $status
+            published_versions = $versions
+            rejected           = $reason
+            retryable          = [bool]($reason -and $reason -match '^(needs \S+, which was rejected \()*cooldown')
+            direct             = [bool](Test-RequirementTxtDirect -Source $from)
+            requested_by       = $requestedBy
+            needs              = $needed
         }
+    }
+}
+
+function Get-WheelhouseUiPendingPin {
+    # What publishing requirements.txt would add: the Get-WheelhouseUiReviewRow rows of the
+    # pins that are not in the wheelhouse yet.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Context,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [hashtable]$Pin
+    )
+
+    foreach ($row in @(Get-WheelhouseUiReviewRow -Context $Context -Pin $Pin)) { if ($row.status -ne 'added') { $row } }
+}
+
+function Get-WheelhouseUiProblem {
+    # The first table of "Review and publish": what cannot be published as it is - the
+    # requirements the latest resolve set aside, and the pins of requirements.txt the latest
+    # publish rejected (-Row from Get-WheelhouseUiReviewRow). Each { name; spec; requested_by;
+    # reason; kind; expedite (name==version whose cooldown Expedite skips, or ''); pinned
+    # (in requirements.txt) }.
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$SetAside = @(),
+
+        [AllowEmptyCollection()]
+        [object[]]$Row = @()
+    )
+
+    foreach ($item in $SetAside) {
+        if (-not $item) { continue }
+        $by = @('User input')
+        @{ name = [string]$item.name; spec = [string]$item.spec; requested_by = $by; reason = [string]$item.reason; kind = [string]$item.kind; expedite = [string]$item.expedite; pinned = $false }
+    }
+    foreach ($row in $Row) {
+        if (-not $row -or -not $row.rejected) { continue }
+        $by = @($row.requested_by)
+        @{ name = $row.name; spec = "$($row.name)==$($row.version)"; requested_by = $by; reason = [string]$row.rejected; kind = $(if ($row.retryable) { 'cooldown' } else { 'rejected' }); expedite = ''; pinned = $true }
     }
 }
 
@@ -884,16 +950,24 @@ function Get-WheelhouseUiRoute {
                 }
                 $pins = @{}
                 if ($text.Trim()) { $pins = Read-RequirementFile -FilePath $path }
-                $pending = @(Get-WheelhouseUiPendingPin -Context $Context -Pin $pins)
+                $rows = @(Get-WheelhouseUiReviewRow -Context $Context -Pin $pins)
+                $pending = @($rows | Where-Object { $_.status -ne 'added' })
+                $status = $(if ($path) { Read-RequirementResolveStatus -RequirementsTxtPath $path } else { $null })
+                $setAside = @(if ($status) { $status.set_aside })
+                $problems = @(Get-WheelhouseUiProblem -SetAside $setAside -Row $rows)
+                # The second table: every pin without a problem.
+                $review = @($rows | Where-Object { -not $_.rejected })
                 return @{ Status = 200; Body = @{
                         path            = $path
                         text            = $text
                         modified_utc    = $modified
                         pin_count       = $pins.Count
-                        pending         = @($pending)
-                        published_count = $pins.Count - @($pending).Count
+                        pending         = $pending
+                        rows            = $review
+                        problems        = $problems
+                        published_count = $pins.Count - $pending.Count
                         approval        = (Get-WheelhouseUiApproval -Context $Context -RequirementsPath $path)
-                        resolve_failure = $(if ($path) { Read-RequirementResolveStatus -RequirementsTxtPath $path } else { $null })
+                        resolve_failure = $(if ($status -and $status.failed) { $status } else { $null })
                     }
                 }
             }
@@ -961,6 +1035,59 @@ function Get-WheelhouseUiRoute {
                 $name = [string](Get-UiBodyValue -Body $Body -Name 'name')
                 if (-not (Test-WheelhousePackageName -Name $name)) { throw [System.ArgumentException]::new('Not a valid package name.') }
                 return (Invoke-WheelhouseUiRequirementRemoval -Context $Context -Name @($name) -Title 'Remove packages')
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/requirements/problems/remove$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                # "Remove All" under the problems table: the set-aside requirements are dropped,
+                # and the rejected pins (with what only they needed) leave requirements.txt.
+                $path = [string]$Context.Settings.LocalRequirementsPath
+                if (-not $path) { throw [System.InvalidOperationException]::new('LocalRequirementsPath is not set.') }
+                $status = Read-RequirementResolveStatus -RequirementsTxtPath $path
+                $dropped = @(if ($status) { @($status.set_aside) | ForEach-Object { $_.spec } })
+                if ($status -and $status.failed) { Write-RequirementResolveStatus -RequirementsTxtPath $path -Failed -Message $status.message -Problem @($status.packages) }
+                else { Write-RequirementResolveStatus -RequirementsTxtPath $path }
+                $pins = @{}
+                if ((Test-Path -LiteralPath $path -PathType Leaf) -and ([System.IO.File]::ReadAllText($path)).Trim()) { $pins = Read-RequirementFile -FilePath $path }
+                $names = @(Get-WheelhouseUiReviewRow -Context $Context -Pin $pins | Where-Object { $_.rejected } | ForEach-Object { $_.name })
+                $removed = @()
+                if ($names.Count -gt 0) { $removed = @((Invoke-WheelhouseUiRequirementRemoval -Context $Context -Name $names -Title 'Remove problem packages').Body.removed) }
+                if ($dropped.Count + $removed.Count -eq 0) { return @{ Status = 409; Body = @{ error = 'There is no problem package to remove.' } } }
+                return @{ Status = 200; Body = @{ set_aside = $dropped; removed = $removed; job = $null } }
+            }
+        }
+
+        @{
+            Method     = 'POST'
+            Pattern    = '^/api/requirements/expedite$'
+            Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
+            Handler    = {
+                param($Context, $Body, $Match)
+                # "Expedite" on a set-aside requirement that is only too new: it goes back into
+                # requirements.in and is resolved again with the cooldown skipped for that one
+                # version; the proposal records it, so the publish skips it too.
+                $name = Get-NormalizedPackageName ([string](Get-UiBodyValue -Body $Body -Name 'name'))
+                if (-not (Test-WheelhousePackageName -Name $name)) { throw [System.ArgumentException]::new('Not a valid package name.') }
+                $reason = ([string](Get-UiBodyValue -Body $Body -Name 'reason')).Trim()
+                if ($reason -notmatch '^[A-Za-z0-9 .,:;()/#+_-]{5,200}$') { throw [System.ArgumentException]::new('Write the reason as a short sentence (5-200 letters, digits and . , : ; ( ) / # + _ -).') }
+                $path = [string]$Context.Settings.LocalRequirementsPath
+                $status = $(if ($path) { Read-RequirementResolveStatus -RequirementsTxtPath $path } else { $null })
+                $entry = @(if ($status) { @($status.set_aside) | Where-Object { $_.name -eq $name -and $_.expedite } })[0]
+                if (-not $entry) { throw [System.Collections.Generic.KeyNotFoundException]::new("$name is not set aside for the cooldown.") }
+                $pin = @(ConvertTo-WheelhousePin -Pin @($entry.expedite))[0]
+                $added = Add-RequirementInLine -Path $Context.Settings.RequirementsInPath -Spec @($entry.spec) -Denylist @(Read-WheelhouseDenylist -Path $Context.DenylistPath)
+                $refused = @($added.Skipped | Where-Object { -not $_.Reason.Contains('already listed') })
+                if ($refused.Count -gt 0) { throw [System.InvalidOperationException]::new("$($entry.spec): $($refused[0].Reason)") }
+                $arguments = @('-ExpeditePackage', "$($pin.Name)==$($pin.Version)", '-ExpediteReason', $reason)
+                $job = Start-WheelhouseUiJob -Title "Expedite $($pin.Name)==$($pin.Version)" -Kind 'add' -Detail @($entry.spec) -Context $Context -Steps @(@{ Script = 'Update-Requirement.ps1'; Arguments = $arguments })
+                return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
         }
 
@@ -1084,12 +1211,43 @@ function Get-WheelhouseUiRoute {
             Method     = 'POST'
             Pattern    = '^/api/wheelhouse/update$'
             Wheelhouse = $true
+            Idle       = 'Another job is still running. Wait for it to finish or cancel it first.'
             Handler    = {
                 param($Context, $Body, $Match)
                 if ((Get-UiBodyValue -Body $Body -Name 'confirm') -ne $true) {
                     throw [System.ArgumentException]::new('Publishing needs an explicit confirmation.')
                 }
-                $job = Start-WheelhouseUiJob -Title 'Publish packages' -Kind 'update' -Context $Context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = @() })
+                # The Add tab publishes only the ticked rows: "leave_out" are pins of
+                # requirements.txt not to publish (taken out of it first), "overwrite" are
+                # published versions to download, check and replace again.
+                $leaveOut = @(foreach ($item in @(Get-UiBodyValue -Body $Body -Name 'leave_out')) { if ($item) { Get-NormalizedPackageName ([string]$item) } })
+                [string[]]$overwritePins = @(foreach ($item in @(Get-UiBodyValue -Body $Body -Name 'overwrite')) { if ($item) { [string]$item } })
+                if ($leaveOut.Count + $overwritePins.Count -gt 500) { throw [System.ArgumentException]::new('The selection is too large.') }
+                $txt = [string]$Context.Settings.LocalRequirementsPath
+                $pins = @{}
+                if ($txt -and (Test-Path -LiteralPath $txt -PathType Leaf) -and ([System.IO.File]::ReadAllText($txt)).Trim()) { $pins = Read-RequirementFile -FilePath $txt }
+                foreach ($name in $leaveOut) {
+                    if (-not (Test-WheelhousePackageName -Name $name) -or -not $pins.ContainsKey($name)) { throw [System.ArgumentException]::new("'$name' is not pinned in requirements.txt.") }
+                }
+                $overwrite = @(ConvertTo-WheelhousePin -Pin $overwritePins)
+                if ($overwrite.Count -gt 0) {
+                    $manifest = Read-WheelhouseManifest -WheelhousePath $Context.WheelhousePath
+                    foreach ($pin in $overwrite) {
+                        if (-not ($manifest | Where-Object { $_.name -eq $pin.Name -and $_.version -eq $pin.Version })) { throw [System.Collections.Generic.KeyNotFoundException]::new("$($pin.Name)==$($pin.Version) is not in the wheelhouse - there is nothing to overwrite.") }
+                    }
+                }
+                if ($leaveOut.Count -gt 0) {
+                    [string[]]$left = Remove-RequirementTxtPin -Path $txt -Name $leaveOut -Exact
+                    $leftText = @($left | ForEach-Object { "$_==$($pins[$_])" })
+                    $narrowed = Update-WheelhouseProposalSubset -RequirementsPath $txt -LeftOut $leftText -Path $Context.ProposalPath
+                    if (-not $narrowed -and ([System.IO.File]::ReadAllText($txt)).Trim() -and [string]$Context.Settings.ApprovalMode -eq 'SeparateApprover') {
+                        $null = New-WheelhouseProposal -RequirementsPath $txt -Kind 'manual' -Note "left out before publishing: $($leftText -join ', ')" -Path $Context.ProposalPath
+                        return @{ Status = 409; Body = @{ error = 'The packages you left out are out of requirements.txt now, and what is left needs approval again: another person has to approve the new proposal before it can be published.' } }
+                    }
+                }
+                $arguments = @()
+                if ($overwrite.Count -gt 0) { $arguments = @('-OverwritePackage', (@($overwrite | ForEach-Object { "$($_.Name)==$($_.Version)" }) -join ',')) }
+                $job = Start-WheelhouseUiJob -Title 'Publish packages' -Kind 'update' -Context $Context -Steps @(@{ Script = 'Update-Wheelhouse.ps1'; Arguments = $arguments })
                 return @{ Status = 202; Body = @{ job = (ConvertTo-WheelhouseUiJobSummary -Job $job) } }
             }
         }
