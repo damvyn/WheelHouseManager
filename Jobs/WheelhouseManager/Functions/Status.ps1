@@ -19,6 +19,10 @@ function Get-WheelhouseStatus {
         [ValidateRange(1, 3650)]
         [int]$FreshnessDays = 8,
 
+        # Older audits than this: an Attention item (whm and the UI then start one).
+        [ValidateRange(1, 3650)]
+        [int]$AuditMaxAgeDays = 7,
+
         [string]$ProposalPath = (Get-WheelhouseProposalPath)
     )
 
@@ -60,6 +64,10 @@ function Get-WheelhouseStatus {
     if ($checkOverdue) {
         & $add 'bad' $(if ($lastCheck) { "The weekly check last completed on $($lastCheck.ToString('yyyy-MM-dd')) - more than $FreshnessDays day(s) ago." } else { 'The weekly check has never completed for this wheelhouse.' }) 'schedule'
     }
+    $auditAge = Get-WheelhouseAuditAge -Catalog $catalog -MaxAgeDays $AuditMaxAgeDays -NowUtc $now
+    if ($auditAge.Stale) {
+        & $add 'warn' $auditAge.Message 'packages:unaudited'
+    }
     if ($unverified.Count -gt 0) {
         & $add 'bad' "$($unverified.Count) published version(s) have no completed audit in the last $FreshnessDays day(s) (Unverified)." 'packages:unaudited'
     }
@@ -86,9 +94,196 @@ function Get-WheelhouseStatus {
         Untracked    = $untracked.Count
         LastCheckUtc = [string]$catalog.ScheduledCheckUtc
         CheckOverdue = [bool]$checkOverdue
+        AuditStale   = [bool]$auditAge.Stale
+        OldestAuditUtc = $(if ($auditAge.OldestUtc) { $auditAge.OldestUtc.ToString('o') } else { '' })
         Proposal     = $proposal
         Attention    = $attention.ToArray()
     }
+}
+
+function Get-WheelhouseAuditAge {
+    # How old the audits of the published versions are: { Stale; OldestUtc (the oldest
+    # version's latest completed audit, $null when one was never audited); Never (versions
+    # without any completed audit); Published; Message }. Stale when a published version has
+    # had no completed audit for -MaxAgeDays. Updates audit only their new packages, so this
+    # is what tells whm and the UI to start a full audit.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Catalog,
+
+        [ValidateRange(1, 3650)]
+        [int]$MaxAgeDays = 7,
+
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
+
+    $published = @($Catalog.Records.Values | Where-Object { $_.state -eq 'Published' })
+    $oldest = $null
+    $never = 0
+    foreach ($record in $published) {
+        $last = $null
+        if ($record.checks -and $record.checks.audit -and $record.checks.audit.last_run) {
+            $last = ConvertTo-OptionalUtcDateTime -Value $record.checks.audit.last_run
+        }
+        if (-not $last) { $never++; continue }
+        if ($null -eq $oldest -or $last -lt $oldest) { $oldest = $last }
+    }
+    $stale = $published.Count -gt 0 -and ($never -gt 0 -or ($NowUtc - $oldest).TotalDays -gt $MaxAgeDays)
+    $message = ''
+    if ($stale) {
+        $message = if ($never -gt 0) {
+            "$never published version(s) have never been audited."
+        }
+        else {
+            "The oldest audit of a published version is from $($oldest.ToString('yyyy-MM-dd')) - more than $MaxAgeDays day(s) ago."
+        }
+        $message += ' Updates audit only their new packages - the weekly check audits the rest; whm and the UI start it now.'
+    }
+    return [PSCustomObject]@{
+        Stale     = [bool]$stale
+        OldestUtc = $oldest
+        Never     = $never
+        Published = $published.Count
+        Message   = $message
+    }
+}
+
+function Start-WheelhouseBackgroundAudit {
+    # Runs the weekly check (Test-Wheelhouse.ps1: integrity, denylist, yanked, audit of every
+    # published version, malicious packages; results into the catalog and the UI; alert by
+    # email, or Alert_*.html in the reports folder) now, without waiting for it:
+    #   - the registered Scheduled Task when there is one for this installation, so it runs
+    #     as its account exactly like a scheduled run;
+    #   - otherwise Test-Wheelhouse.ps1 as a hidden child process of this PowerShell, as the
+    #     current user.
+    # Alerts are stateful, so an early run sends nothing twice. Only one at a time:
+    # <manager root>\state\background-audit.json remembers the start; while that run is still
+    # going (at most -MaxHours) nothing new is started. Returns { Started; Via (Task|Process);
+    # ProcessId; Message }.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [string]$ManagerRoot = $script:ManagerRoot,
+
+        [ValidateRange(1, 48)]
+        [int]$MaxHours = 6
+    )
+
+    $stateFolder = Join-Path $ManagerRoot 'state'
+    $statePath = Join-Path $stateFolder 'background-audit.json'
+    $now = (Get-Date).ToUniversalTime()
+
+    $task = $null
+    try {
+        $registered = Get-WheelhouseScheduledCheck -ManagerRoot $ManagerRoot
+        if ($registered.Registered -and $registered.ForThisInstallation) { $task = $registered }
+    }
+    catch { Write-Verbose "No Scheduled Task available: $($_.Exception.Message)" }
+
+    if (Test-Path -LiteralPath $statePath) {
+        try {
+            $previous = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+            $since = ConvertTo-OptionalUtcDateTime -Value $previous.started_utc
+            $running = if ([string]$previous.via -eq 'Task') { [bool]($task -and $task.State -eq 'Running') }
+            else { [bool](Get-Process -Id ([int]$previous.pid) -ErrorAction SilentlyContinue) }
+            if ($running -and $since -and ($now - $since).TotalHours -lt $MaxHours) {
+                return [PSCustomObject]@{ Started = $false; Via = [string]$previous.via; ProcessId = $previous.pid; Message = "The weekly check is already running (started $($since.ToLocalTime().ToString('yyyy-MM-dd HH:mm')))." }
+            }
+        }
+        catch { Write-Verbose "Unreadable $statePath - starting a new check: $($_.Exception.Message)" }
+    }
+    if (-not $PSCmdlet.ShouldProcess($WheelhousePath, 'Run the weekly check now')) {
+        return [PSCustomObject]@{ Started = $false; Via = ''; ProcessId = $null; Message = 'Not started (WhatIf).' }
+    }
+    New-Item -ItemType Directory -Path $stateFolder -Force | Out-Null
+
+    if ($task) {
+        if ($task.State -eq 'Running') {
+            return [PSCustomObject]@{ Started = $false; Via = 'Task'; ProcessId = $null; Message = "The weekly check's Scheduled Task is already running." }
+        }
+        try {
+            Start-WheelhouseScheduledCheck
+            Write-JsonFile -Path $statePath -InputObject ([ordered]@{ via = 'Task'; pid = $null; started_utc = $now.ToString('o'); wheelhouse = $WheelhousePath })
+            return [PSCustomObject]@{ Started = $true; Via = 'Task'; ProcessId = $null; Message = "The weekly check's Scheduled Task was started now (as $($task.User)). Its results appear in the UI, and its alert is emailed or saved as Alert_*.html in the reports folder." }
+        }
+        catch { Write-Log "The Scheduled Task could not be started ($($_.Exception.Message)) - running the weekly check as this user instead." 'WARN' }
+    }
+
+    $script = Join-Path (Join-Path $ManagerRoot 'Jobs') 'Test-Wheelhouse.ps1'
+    if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
+        return [PSCustomObject]@{ Started = $false; Via = ''; ProcessId = $null; Message = "Cannot start the weekly check: $script not found." }
+    }
+    $startParams = @{
+        FilePath     = (Get-Process -Id $PID).Path
+        ArgumentList = "-NoProfile -ExecutionPolicy Bypass -File `"$script`" -WheelhousePath `"$WheelhousePath`""
+        PassThru     = $true
+    }
+    if ($PSVersionTable.PSEdition -ne 'Core' -or $IsWindows) { $startParams['WindowStyle'] = 'Hidden' }
+    $process = Start-Process @startParams
+    Write-JsonFile -Path $statePath -InputObject ([ordered]@{ via = 'Process'; pid = $process.Id; started_utc = $now.ToString('o'); wheelhouse = $WheelhousePath })
+    return [PSCustomObject]@{ Started = $true; Via = 'Process'; ProcessId = $process.Id; Message = "The weekly check (Test-Wheelhouse.ps1) was started in the background as $(if ($env:USERNAME) { $env:USERNAME } else { 'this user' }) (process $($process.Id)) - no Scheduled Task is registered for this installation. Its results appear in the UI, and its alert is emailed or saved as Alert_*.html in the reports folder." }
+}
+
+function Invoke-WheelhouseAuditFreshnessCheck {
+    # whm and the web UI call this on start: when the audits are older than -MaxAgeDays
+    # (Get-WheelhouseAuditAge), runs the weekly check now (Start-WheelhouseBackgroundAudit,
+    # unless -NoStart). Returns { Stale; Message; Started; StartMessage }. Never throws: a
+    # problem is returned in Message.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WheelhousePath,
+
+        [ValidateRange(1, 3650)]
+        [int]$MaxAgeDays = 7,
+
+        [switch]$NoStart,
+
+        [string]$ManagerRoot = $script:ManagerRoot
+    )
+
+    try {
+        $catalog = Read-WheelhouseCatalog -WheelhousePath $WheelhousePath
+        $age = Get-WheelhouseAuditAge -Catalog $catalog -MaxAgeDays $MaxAgeDays
+        $start = $null
+        if ($age.Stale -and -not $NoStart -and $PSCmdlet.ShouldProcess($WheelhousePath, 'Run the weekly check now')) {
+            $start = Start-WheelhouseBackgroundAudit -WheelhousePath $WheelhousePath -ManagerRoot $ManagerRoot
+        }
+        return [PSCustomObject]@{
+            Stale        = [bool]$age.Stale
+            Message      = $age.Message
+            Started      = [bool]($start -and $start.Started)
+            StartMessage = $(if ($start) { $start.Message } else { '' })
+        }
+    }
+    catch {
+        return [PSCustomObject]@{ Stale = $false; Message = "Could not check the age of the audits: $($_.Exception.Message)"; Started = $false; StartMessage = '' }
+    }
+}
+
+function Invoke-WheelhouseStartupAuditCheck {
+    # The audit-age check whm and the web UI run when they start: reads WheelhousePath and
+    # AuditMaxAgeDays from the settings, runs Invoke-WheelhouseAuditFreshnessCheck and logs
+    # what it found (WARN) and whether an audit was started. Returns its result, or $null
+    # when no wheelhouse is configured.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$ManagerRoot = $script:ManagerRoot
+    )
+
+    $settings = Get-WheelhouseDefaultSetting -ManagerRoot $ManagerRoot
+    $stored = Get-WheelhouseSetting -SettingsPath (Get-WheelhouseSettingsPath -ManagerRoot $ManagerRoot)
+    foreach ($key in @($stored.Keys)) { if ($null -ne $stored[$key] -and "$($stored[$key])" -ne '') { $settings[$key] = $stored[$key] } }
+    $wheelhouse = [string]$settings.WheelhousePath
+    if (-not $wheelhouse -or -not (Test-Path -LiteralPath $wheelhouse -PathType Container)) { return $null }
+    if (-not $PSCmdlet.ShouldProcess($wheelhouse, 'Check the age of the audits')) { return $null }
+    $check = Invoke-WheelhouseAuditFreshnessCheck -WheelhousePath $wheelhouse -MaxAgeDays ([int]$settings.AuditMaxAgeDays) -ManagerRoot $ManagerRoot
+    if ($check.Message) { Write-Log $check.Message 'WARN' }
+    if ($check.StartMessage) { Write-Log $check.StartMessage $(if ($check.Started) { 'OK' } else { 'WARN' }) }
+    return $check
 }
 
 function Get-WheelhouseAdvisoryItem {
@@ -357,7 +552,7 @@ function Test-WheelhouseHealth {
         else { & $report 'Interrupted operations' 'ok' 'none' }
 
         try {
-            $status = Get-WheelhouseStatus -WheelhousePath $wheelhouse -FreshnessDays ([int]$cfg.AuditFreshnessDays) -ProposalPath (Get-WheelhouseProposalPath -ManagerRoot $ManagerRoot)
+            $status = Get-WheelhouseStatus -WheelhousePath $wheelhouse -FreshnessDays ([int]$cfg.AuditFreshnessDays) -AuditMaxAgeDays ([int]$cfg.AuditMaxAgeDays) -ProposalPath (Get-WheelhouseProposalPath -ManagerRoot $ManagerRoot)
             if ($status.Published -eq 0) { & $report 'Weekly check' 'ok' 'Nothing is published yet.' }
             elseif ($status.CheckOverdue) { & $report 'Weekly check' 'bad' $(if ($status.LastCheckUtc) { "Last completed $(([string]$status.LastCheckUtc).Substring(0, 10)) - more than $($cfg.AuditFreshnessDays) day(s) ago." } else { 'Never completed.' }) 'Register the Scheduled Task (UI: Schedule tab, or Setup.ps1 -RegisterScheduledTask) and check its last result.' }
             else { & $report 'Weekly check' 'ok' "Last completed $(([string]$status.LastCheckUtc).Substring(0, 10))." }

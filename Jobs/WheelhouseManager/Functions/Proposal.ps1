@@ -349,3 +349,43 @@ function Set-WheelhouseProposalPublished {
     $proposal.outcome = $Outcome
     Save-WheelhouseProposal -Proposal $proposal -Action 'Published' -Path $Path
 }
+
+function Update-WheelhouseProposalSubset {
+    # After pins were left out of requirements.txt (the Add tab publishes only the ticked
+    # ones): when the current proposal is Proposed or Approved and covers every pin the file
+    # still has, it is moved to the smaller file - same id, same state and approver (approving
+    # a list approves any part of it), expedite and replace kept only for the pins left - and
+    # the history records it as 'Narrowed'. Returns the proposal, or $null when it does not
+    # cover the file (then the file needs a new proposal).
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RequirementsPath,
+
+        [AllowEmptyCollection()]
+        [string[]]$LeftOut = @(),
+
+        [string]$Path = (Get-WheelhouseProposalPath)
+    )
+
+    $proposal = Read-WheelhouseProposal -Path $Path
+    if (-not $proposal -or $proposal.state -notin 'Proposed', 'Approved') { return $null }
+    if (-not [string]::Equals([System.IO.Path]::GetFullPath($proposal.requirements_path), [System.IO.Path]::GetFullPath($RequirementsPath), [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $pins = @{}
+    if ((Test-Path -LiteralPath $RequirementsPath -PathType Leaf) -and ([System.IO.File]::ReadAllText($RequirementsPath)).Trim()) { $pins = Read-RequirementFile -FilePath $RequirementsPath }
+    $listed = @{}
+    foreach ($pin in $proposal.pins) { $listed[$pin] = $true }
+    foreach ($name in $pins.Keys) { if (-not $listed.ContainsKey("$name==$($pins[$name])")) { return $null } }
+    if (-not $PSCmdlet.ShouldProcess($proposal.id, 'Narrow to the pins left')) { return $null }
+
+    $expedite = [ordered]@{}
+    foreach ($name in $proposal.expedite.Keys) { if ($pins[$name] -eq $proposal.expedite[$name]) { $expedite[$name] = $proposal.expedite[$name] } }
+    $proposal.expedite = $expedite
+    if ($expedite.Count -eq 0) { $proposal.expedite_reason = '' }
+    $proposal.replace = @($proposal.replace | Where-Object { $pins[$_.name] -eq $_.to })
+    $proposal.pins = @($pins.Keys | Sort-Object | ForEach-Object { "$_==$($pins[$_])" })
+    $proposal.requirements_sha256 = Get-RequirementFileHash -Path $RequirementsPath
+    if ($LeftOut.Count -gt 0) { $proposal.note = (@($proposal.note, "left out before publishing: $($LeftOut -join ', ')") | Where-Object { $_ }) -join '; ' }
+    Save-WheelhouseProposal -Proposal $proposal -Action 'Narrowed' -Path $Path
+    return $proposal
+}

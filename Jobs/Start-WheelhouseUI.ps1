@@ -22,6 +22,11 @@
 .PARAMETER NoBrowser
     Print the URL but do not open the browser.
 
+.PARAMETER KeepInput
+    Keep Input\requirements.in and requirements.txt as they are. Without it they are emptied at
+    start (requirements.in keeps its comment header), so every UI session starts with a fresh
+    Add packages tab. Use it when a requirements.txt waits for a second person's approval.
+
 .EXAMPLE
     .\Start-WheelhouseUI.ps1
 
@@ -37,12 +42,19 @@ param(
     [ValidateRange(1024, 65535)]
     [int]$Port = 8765,
 
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+
+    [switch]$KeepInput
 )
 
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 try {
+    if (-not $KeepInput) {
+        $inputFiles = Resolve-WheelhouseParameter -BoundParameters @{} -Name RequirementsInPath, LocalRequirementsPath
+        [string[]]$reset = Reset-WheelhouseInput -RequirementsInPath ([string]$inputFiles.RequirementsInPath) -RequirementsTxtPath ([string]$inputFiles.LocalRequirementsPath)
+        if ($reset.Count -gt 0) { Write-Log "Fresh start: emptied $($reset -join ', ') (use -KeepInput to keep them)." }
+    }
     Start-WheelhouseUiServer -Port $Port -NoBrowser:$NoBrowser
 }
 catch {

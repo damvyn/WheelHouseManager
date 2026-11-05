@@ -32,12 +32,13 @@ CI (`.github/workflows/powershell-tests.yml`) runs on `windows-latest` under **b
 - `Common`: logging, atomic writes, `Invoke-NativeCommand`, name/version/pin validation, locks (`Open-WheelhouseWrite`), exit codes;
 - `Settings`;
 - `Requirements`;
+- `Resolve`: `Invoke-RequirementResolve`, the resolve loop of `Update-Requirement.ps1` - when uv fails it sets aside the requirement uv's error names (`Get-UvRequiredName` / `Get-UvResolveReason`: cooldown with an `expedite` pin, no wheel, not found, conflict) and resolves the rest again; pins pip finds unusable become `name!=version` constraints first. The set-aside entries go to `Input\requirements.status.json` (`set_aside`) and the Add tab's problems table. `Get-RequirementResolveInput` keeps the asked-for pins of the current requirements.txt and ignores a new line it already covers;
 - `Manifest`;
 - `Catalog`: `<wheelhouse>\catalog.json` (per-version state, latest audit/scan/PyPI results, vulnerability findings with severity, due date, waiver and alert state; the weekly check's heartbeat) and `events.jsonl` (history);
 - `Journal`: `<wheelhouse>\.journal\` crash safety for publish/remove/restore;
 - `Audit`;
 - `Vulnerability`: severity from OSV (`Get-VulnerabilitySeverity`, cached in `<wheelhouse>\reports\osv-cache.json`), CVSS 3 scoring, due days (`Get-WheelhouseDueDayTable`), waivers (`config\waivers.json`);
-- `Intake`: `Invoke-CandidateIntake` (checks, no lock) and `Publish-CandidateIntake` (write lock);
+- `Intake`: `Invoke-CandidateIntake` (checks, no lock), `Publish-CandidateIntake` (write lock) and `Publish-OverwriteIntake` (overwrite a published version with a copy checked again: same sha256 as the manifest, old copy to `<wheelhouse>\_replaced\`);
 - `Sync`: `Invoke-WheelhouseSync`, the whole update run;
 - `Alert`;
 - `Run`: start/stop, transcript, report retention;
@@ -62,12 +63,12 @@ A new function must also be added to `FunctionsToExport` in `WheelhouseManager.p
 Functions `throw`; only scripts `exit`.
 
 Script roles:
-- `Update-Requirement.ps1`: `uv pip compile` turns `Input\requirements.in` into a candidate file. It is then checked with a `pip install --dry-run` against the target Python version and platform (`Test-RequirementWheelAvailability`), and only then becomes `Input\requirements.txt`. uv on its own accepts sdist-only packages and ignores the upper `Requires-Python` bound, which is why the pip check exists.
+- `Update-Requirement.ps1`: `uv pip compile` turns `Input\requirements.in` (plus the asked-for pins of the current requirements.txt) into a candidate file, setting aside every requirement it cannot resolve (`Invoke-RequirementResolve`; `-NoSetAside` fails instead, for remediation). It is then checked with a `pip install --dry-run` against the target Python version and platform (`Test-RequirementWheelAvailability`), and only then becomes `Input\requirements.txt`. uv on its own accepts sdist-only packages and ignores the upper `Requires-Python` bound, which is why the pip check exists.
 - `Update-Wheelhouse.ps1` frames the run (transcript, tooling check, exit code); `Invoke-WheelhouseSync` does the work:
   1. under the write lock: journal repair, integrity check against `manifest.json`, take out wheels removed/changed on the share (`Resolve-WheelhouseIntegrityProblem`, `AutoQuarantine`), move untracked wheels to `_untracked\` (`Move-UntrackedWheelFile`), catalog reconcile, heartbeat warning, group snapshot;
   2. an in-memory merge plan of `Input\requirements.txt` into the `requirements-N.txt` groups;
-  3. per group, `Invoke-CandidateIntake` (no lock): denylist → audit → PyPI release data (yanked, cooldown `MinimumPackageAgeDays`, `-ExpeditePackage` skips it per pin) → download into `<manager root>\staging\` → sha256/yanked/upload-date check of each file against PyPI → Defender scan of the staged files; then `Publish-CandidateIntake` (write lock): denylist re-check → journal → `Publish-StagedWheel` (`.partial` copy, then rename) → manifest, then pins → catalog + history;
-  4. one batched audit of everything published before this run (`Invoke-PublishedAudit`: as few pip-audit runs as possible, not one per group file);
+  3. for every group, `Invoke-CandidateIntake` (no lock): denylist → audit → PyPI release data (yanked, cooldown `MinimumPackageAgeDays`, `-ExpeditePackage` skips it per pin) → download into `<manager root>\staging\` → sha256/yanked/upload-date check of each file against PyPI → Defender scan of the staged files (setting `DefenderScanAtIntake` off skips it); then `Get-DependentRejection` holds back every verified package that needs a rejected pin (the `# via` annotations of requirements.txt), in any group; then per group `Publish-CandidateIntake` (write lock): denylist re-check → journal → `Publish-StagedWheel` (`.partial` copy, then rename) → manifest, then pins → catalog + history;
+  4. no audit of what was published before - only candidates are audited and scanned. Published versions are re-audited by the weekly check, and `whm` / the UI run the weekly check early (its Scheduled Task, else `Test-Wheelhouse.ps1` in the background) when the oldest audit is older than `AuditMaxAgeDays` (`Invoke-WheelhouseStartupAuditCheck`);
   5. severities looked up on OSV (no lock), then all audit results into the catalog with severities, due dates and waivers, and `Resolve-MaliciousPackage` (`MAL-*`, `AutoQuarantine`) (write lock). The share is never virus-scanned by this tool - the file server's antivirus does that; new wheels are scanned at intake, on-demand scans use hash-checked local copies (`Invoke-WheelhouseCopyScan`).
 
   It emits `Wheelhouse.AuditResult` and `Wheelhouse.Notice` objects and **sends no alerts**.

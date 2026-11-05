@@ -72,7 +72,7 @@ Setup.ps1                                deploys the manager (section 7.1)
 whm.ps1                                  one command for everything (section 8.20)
 Jobs/
     Invoke-WheelhousePipeline.ps1        orchestrator: Update-Wheelhouse.ps1 -> Send-VulnerabilityAlert.ps1
-    Update-Requirement.ps1               resolve: requirements.in -> requirements.txt
+    Update-Requirement.ps1               resolve: requirements.in -> requirements.txt (sets aside what cannot be resolved)
     Update-Wheelhouse.ps1                the update run (thin: Invoke-WheelhouseSync does the work)
     Test-Wheelhouse.ps1                  scheduled re-check of everything published + alert
     Test-WheelhousePackage.ps1           audit all / chosen pins, no alert (UI "Audit")
@@ -107,7 +107,7 @@ is the repo root; tests pass explicit paths (`-ManagerRoot`, `-StagingRoot`, `-S
 | `config\settings.psd1` | Setup.ps1, `Set-WheelhouseSetting` (UI) | psd1, keys sorted, written atomically | Warning, defaults are used (`Get-WheelhouseSetting`) |
 | `config\denylist.json` | `Add-/Remove-WheelhouseDenylistEntry` | JSON array (section 11) | **Throws** - never read as empty |
 | `config\waivers.json` | `Add-/Remove-WheelhouseWaiver` (UI, under the write lock) | JSON array (section 11) | **Throws** - never read as empty |
-| `Input\requirements.in` | User, `Add-RequirementInLine` / `Remove-RequirementInLine` (UI) | pip requirements, unpinned allowed | uv fails |
+| `Input\requirements.in` | User, `Set-RequirementInText` (UI), `Set-RequirementInSpec` (remediation), `Clear-RequirementInFile` (after a successful `Update-Requirement.ps1` of the configured file) | pip requirements, unpinned allowed | uv fails |
 | `Input\requirements.txt` | Update-Requirement.ps1 (move of the candidate file) | uv output, exact pins | Unsupported lines are skipped with a warning |
 | `Input\requirements.candidate.txt` / `.rejected.txt` / `.constraints.tmp` | Update-Requirement.ps1 | transient / last rejected result / denylist as `!=` constraints | - |
 | `staging\<guid>\` | `Invoke-CandidateIntake` | downloads of one intake call; deleted in `finally` | - |
@@ -250,6 +250,28 @@ Each rule says where it is enforced. Breaking one is a bug even if tests pass.
     last verification is not hashed; missing files always count); `Test-Wheelhouse.ps1` hashes
     everything and refreshes the cache. The cache never lives on the share.
 
+30. **A package is never published without the pins it needs; a published one is never removed for
+    a dependency.** `Invoke-WheelhouseSync` checks every group before it publishes any, then holds
+    back (category `dependency`) each verified package whose dependency - from the `# via`
+    annotations of `requirements.txt` (`Read-RequirementDependent`) - was rejected in any group,
+    up the chain (`Get-DependentRejection`). *Why:* clients resolve from the whole share with
+    `no-index`; a parent without its dependency fails to install, or silently gets an older,
+    possibly vulnerable, version. Once published, a parent stays when its dependency later fails
+    a check (it is installed on clients and the fix is the dependency's new version); findings,
+    notices and the UI name it instead (`Get-CatalogDependent`, from the `requires[]` the catalog
+    reads once from each wheel's METADATA). Without annotations (`--no-annotate`) nothing is held
+    back and the run warns. The Add tab keeps the same rule when you choose what to publish:
+    unticking a package unticks the packages that need it (`needs`), so a left-out pin never
+    leaves a parent without it.
+
+31. **One resolve reports every problem; nothing is lost silently.** `Update-Requirement.ps1`
+    sets aside each requirement uv cannot resolve (`Invoke-RequirementResolve`) instead of failing
+    on the first, records them with their reason in `requirements.status.json` (`set_aside`) and
+    the Add tab lists them until they are removed or asked for again. A pin is only excluded by a
+    `name!=version` constraint when pip found it unusable. An overwrite (`-OverwritePackage`)
+    never changes what clients get: the new copy must hash to the manifest's sha256, and the old
+    copy is moved to `_replaced\`, never deleted.
+
 ---
 
 ## 5. Layers and dependency rules
@@ -301,7 +323,7 @@ flowchart TD
 ## 6. Module internals
 
 **Loading.** `WheelhouseManager.psm1` sets `$script:ManagerRoot` and dot-sources `Common`,
-`Settings`, `Requirements`, `Manifest`, `Catalog`, `Journal`, `Audit`, `Vulnerability`, `Intake`, `Sync`, `Alert`,
+`Settings`, `Requirements`, `Resolve`, `Manifest`, `Catalog`, `Dependency`, `Journal`, `Audit`, `Vulnerability`, `Intake`, `Sync`, `Alert`,
 `Run`, `Denylist`, `Package`, `Proposal`, `Remediation`, `Scan`, `Schedule`, `Status`, `Ui` (order is for readability; calls resolve at run time).
 `Ui.ps1` builds `$script:UiRoutes` at load time. The psd1's
 `FunctionsToExport` is the public surface; CI fails if a listed function is missing.
@@ -353,27 +375,47 @@ worker code if non-zero, else the alert's.
 
 ### 7.3 `Update-Requirement.ps1`
 Resolves `RequirementsInPath`, `RequirementsTxtPath` (setting `LocalRequirementsPath`),
-`PythonVersion`, `Platform`, `MinimumPackageAgeDays`.
-1. `uv pip compile <in> --exclude-newer "<N> days" --python-version <v> --python-platform
-   <ConvertTo-UvPythonPlatform> --only-binary :all: --custom-compile-command
-   .\Update-Requirement.ps1 [--constraints requirements.constraints.tmp] -o requirements.candidate.txt`
-   (constraints = `Get-DenylistConstraintLine`: exact denylisted versions as `name!=version`).
-2. `Test-RequirementWheelAvailability` (pip dry-run with the download's rules, every bad pin
-   listed via `Invoke-PipPinRetry`). uv ignores upper `Requires-Python` bounds; this catches them.
-3. Pass -> move candidate to `requirements.txt`, delete `.rejected.txt`. Fail -> move candidate to
-   `requirements.rejected.txt`, keep `requirements.txt`.
+`PythonVersion`, `Platform`, `MinimumPackageAgeDays`; also `-ExpeditePackage name==ver` +
+`-ExpediteReason`, `-NoSetAside` (remediation), `-NoProposal`, `-PreferCurrent` (kept; every
+resolve now prefers the current pins).
+1. Input (`Get-RequirementResolveInput`, configured requirements.in only): the pins of the
+   current requirements.txt that were asked for (`-r` in `# via`) as `name==version` (source
+   `kept`), then the lines of requirements.in (source `input`). A line whose package is pinned
+   at a version it accepts is ignored (logged); one that asks for another version replaces the
+   pin; one for a set-aside package retries it. Denylisted pins are dropped. Expedited pins:
+   `-ExpeditePackage` plus the current proposal's `expedite` when it matches requirements.txt.
+2. `Invoke-RequirementResolve` loop (Functions\Resolve.ps1), each round one of:
+   `Invoke-UvCompile` (`uv pip compile <work>\requirements.in --exclude-newer "<N> days"
+   --python-version <v> --python-platform <ConvertTo-UvPythonPlatform> --only-binary :all:
+   --custom-compile-command .\Update-Requirement.ps1 [--exclude-newer-package name=<now>]
+   [--constraints] -o requirements.candidate.txt`, the current requirements.txt copied there
+   first as preferences; constraints = `Get-DenylistConstraintLine` + `name<=ver` per expedited
+   pin + `name!=ver` per unusable pin) succeeds -> `Test-RequirementWheelAvailability`; unusable
+   pins -> `name!=ver` constraint, again; pass -> done.
+   uv fails -> `Get-UvRequiredName` ("you require X", "X was not found"): one -> set aside with
+   `Get-UvResolveReason` (kind cooldown [with `expedite` = name==ver from the exclude-newer
+   hint] / no-wheel / not-found / no-version / conflict); several or none -> each suspect
+   compiled alone, those failing alone are set aside; several that only fail together -> the
+   first is kept, the others set aside as `conflicts with`; none at all -> stop (`Error`).
+3. Result -> `requirements.txt` (empty when everything was set aside), `.rejected.txt` deleted;
+   `Write-RequirementResolveStatus -SetAside` (this run's + earlier ones still open);
+   requirements.in emptied; proposal with the expedited pins that were resolved. `Error` ->
+   candidate to `requirements.rejected.txt`, `requirements.txt` kept, status `failed` with
+   `Get-RequirementResolveProblem` per line.
 
-Exit: 0 written; 1 uv or the pip check rejected the result; 2 missing input / python / uv / platform.
+Exit: 0 written (possibly with set-aside lines); 1 no result, or `-NoSetAside` and something was
+set aside; 2 missing input / python / uv / platform, or `-ExpeditePackage` without a reason.
 
 ### 7.4 `Update-Wheelhouse.ps1` (the update run)
 Parameters: `WheelhousePath`, `LocalRequirementsPath` (`""` = no merge), `PythonVersion`,
 `Platform`, `MinimumPackageAgeDays`, `VulnerabilityServices`, `ExpeditePackage` (`name==ver`,
-array or comma string, parsed by `ConvertTo-WheelhousePin`), `ExpediteReason` (required with it).
-Also resolves `ReportRetentionMonths`, `RequireDefenderScanAtIntake`, `DueDays*`,
+array or comma string, parsed by `ConvertTo-WheelhousePin`), `ExpediteReason` (required with it),
+`OverwritePackage` (`name==ver` of published versions to download, check and swap in again).
+Also resolves `ReportRetentionMonths`, `DefenderScanAtIntake` (off -> `-SkipDefenderScan`), `RequireDefenderScanAtIntake`, `DueDays*`,
 `AuditFreshnessDays`. The script only frames the
 run (transcript, `Confirm-PythonAndTooling`, exit code); `Invoke-WheelhouseSync` does the work -
 sequence in [9.2](#92-the-update-run-invoke-wheelhousesync). Output: AuditResults then Notices. Exit: 0; 1
-rejection / vulnerable deployed audit / wheel taken out because it was missing or changed on the share;
+rejection / wheel taken out because it was missing or changed on the share;
 2 aborted (including a missing/changed wheel with `-AutoQuarantine Off`) or any audit `Error`; 3 lock
 busy. `-AutoQuarantine On|Off` overrides the setting for the run.
 
@@ -467,6 +509,8 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Add-RequirementToGroupFile` | append `name==version` (create file if needed) | file | worker, restore |
 | `ConvertTo-UvPythonPlatform` | pip platform tag -> uv triple; throws if unknown | string | Update-Requirement, settings validation |
 | `Invoke-PipPinRetry` | run pip over pins; drop the pin named in "No matching distribution found for X"; retry. A failure naming no pin -> `Error` | `@{ Succeeded; Failed; Error }` | wheel check, intake download |
+| `Read-RequirementDependent` | the `# via` annotations of a `uv pip compile` file (one-line and list style; `-r`/`-c` sources skipped, `-IncludeSource` keeps `-r <file>`) | hashtable name -> names of the pins that need it | sync run |
+| `Get-DependentRejection` | invariant 30: candidates (`-Candidates`) that need a rejected pin of exactly the `-Pins` version, transitively; reason `needs X==v, which was rejected (<reason>)` | `{Name; Version; Category dependency; Reason; Dependency}` | sync run |
 | `Test-RequirementWheelAvailability` | `pip install --dry-run --no-deps --ignore-installed --only-binary=:all: --python-version --platform --implementation cp --target <tmp>` | `@{ Passed; Unavailable; Error }` | Update-Requirement |
 
 ### 8.4 `Manifest.ps1`
@@ -512,6 +556,7 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Invoke-CandidateIntake` | first half of the gate: every check, no lock, nothing written to the wheelhouse (section 9.1) | `@{ Packages; Rejected (Name, Version, Reason, Category); AuditResults; Verified = @{name = staged FileInfo[]}; StagingPath }` | `Invoke-WheelhouseSync` |
 | `Publish-CandidateIntake` | second half: under the write lock, re-check the denylist, journal, copy, `Complete-WheelhousePublishJournal`, catalog + history; always deletes the staging folder | `@{ Accepted; Rejected; Published; Manifest }` | `Invoke-WheelhouseSync` |
 | `Publish-StagedWheel` | copy as `.partial`, re-hash, rename; identical untracked file kept, different one throws | `{Entry; Created}` | `Publish-CandidateIntake` |
+| `Publish-OverwriteIntake` | overwrite: under the write lock each verified file must match the manifest's sha256 (else rejected, `integrity`), then `.partial` + `File.Replace` with the old copy to `<wheelhouse>\_replaced\<time>\`; manifest and group files unchanged; history `Overwritten` + intake scan; no journal (the name always holds one of two identical copies) | `@{ Accepted; Rejected; Replaced; Folder }` | `Invoke-WheelhouseSync` (step O) |
 
 ### 8.7 `Alert.ps1`
 
@@ -561,7 +606,19 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Restore-WheelhousePackage` | section 9.5 (verify, journal, `Complete-WheelhouseRestoreJournal`, catalog + history); `-KeepDenylist` | UI |
 | `Test-PackageSpec` | allowed `requirements.in` line (name, extras, version operators; <= 200 chars) | `Add-RequirementInLine` |
 | `Add-RequirementInLine` | append valid, new, non-denylisted specs; `-Replace` swaps the line of a listed package (skipped entries say `Replaceable`) | UI add |
-| `Remove-RequirementInLine` | take packages' line(s) out of `requirements.in`; throws before writing if one is not listed (a dependency) | UI remove / clear |
+| `Remove-RequirementInLine` | take packages' line(s) out of `requirements.in`; throws before writing if one is not listed (a dependency) | scripts (the UI removes from requirements.txt now) |
+| `Set-RequirementInText` | replace `requirements.in` with the UI's edit box; refuses (writes nothing, returns `Problems` with line numbers) invalid specs, a package listed twice, outright denylisted packages | UI save |
+| `Clear-RequirementInFile` | keep only the comment lines of `requirements.in`; returns the requirements taken out | `Update-Requirement.ps1` after writing requirements.txt, when it resolved the configured `RequirementsInPath` |
+| `Get-RequirementCarryOver` | `name==version` of the requirements.txt pins not in the manifest, not listed in requirements.in and not denylisted (all pins when the wheelhouse is unreachable) | no longer used by `Update-Requirement.ps1` (`Get-RequirementResolveInput` replaced it) |
+| `Get-RequirementResolveInput` / `ConvertFrom-RequirementSpec` | what a resolve starts from: kept pins (asked for), new lines, ignored duplicates, set-aside entries still open (7.3) | `Update-Requirement.ps1` |
+| `Invoke-RequirementResolve` / `Invoke-UvCompile` / `Get-UvRequiredName` / `Get-UvResolveReason` | the resolve loop that sets aside each requirement uv cannot resolve (7.3) | `Update-Requirement.ps1` |
+| `Test-RequirementTxtDirect` | from `Read-RequirementDependent -IncludeSource` (which keeps the `-r <file>` entries): whether a pin was asked for; no annotation counts as asked for | `Get-WheelhouseUiReviewRow` (`direct`, `requested_by`), `Remove-RequirementTxtPin`, `Get-RequirementResolveInput` |
+| `Get-RequirementResolveProblem` | after a failed resolve: `{spec; ok; status}` per requirements.in line (PyPI name / exact version, `-Unavailable` from the wheel check, names in uv's error output) | `Update-Requirement.ps1` |
+| `Write-RequirementResolveStatus` / `Read-RequirementResolveStatus` | `Input\requirements.status.json` - `set_aside` (requirements the resolve set aside: name, spec, source, reason, kind, expedite) and a failed resolve (`failed`, message, per-line problems); removed when there is neither | `Update-Requirement.ps1` / `GET /api/requirements` (`problems`, `resolve_failure`), `POST /api/requirements/problems/remove` |
+| `Clear-PublishedRequirementTxt` | empty requirements.txt when every pin is in the manifest | `Update-Wheelhouse.ps1` (configured `LocalRequirementsPath` only) |
+| `Reset-WheelhouseInput` | empty requirements.in (keeps comments) and requirements.txt, remove `requirements.status.json` / `requirements.rejected.txt`; the proposal history stays | `Start-WheelhouseUI.ps1` unless `-KeepInput` |
+| `Remove-RequirementTxtPin` | take pins out of requirements.txt plus the pins only they needed (`-Exact`: only the named ones); throws before writing for a name not pinned | UI remove, Remove All, publish `leave_out` (`-Exact`) |
+| `Update-WheelhouseProposalSubset` | after pins were left out: a Proposed/Approved proposal that covers every pin left moves to the smaller file (same id, state, approver; expedite/replace filtered; history `Narrowed`); `$null` when it does not cover it | `POST /api/wheelhouse/update` (`leave_out`) |
 
 ### 8.11 `Scan.ps1`
 
@@ -600,12 +657,23 @@ request), `Get-WheelhouseUiToolStatus` (`Get-WheelhouseToolStatus` cached for 30
 | `Update-CatalogRecordFinding` | invariant 23: add / update / resolve / reopen findings; history `FindingNew`, `SeverityChanged`, `FindingResolved`, `FindingReopened` | `Update-CatalogAuditResult` |
 | `Set-CatalogFindingWaiver` | copy unexpired waivers onto open findings, take ended ones off; history `Waived` / `WaiverEnded` | audit recording, UI waiver routes |
 | `Get-CatalogFindingStatus` | `Resolved` / `Waived` / `Overdue` / `Open` | alerts, UI |
-| `Get-CatalogFindingAlert` | every finding of a published version with `Status`, `Level` and `AlertReason` (`New`, `Overdue`, `Reminder`, `WaiverExpired`, `Resolved` or `$null`), shaped for the alert; `-NowUtc`, `-ReminderDays` | scheduled check |
+| `Get-CatalogFindingAlert` | every finding of a published version with `Status`, `Level`, `AlertReason` (`New`, `Overdue`, `Reminder`, `WaiverExpired`, `Resolved` or `$null`) and `NeededBy` (`Get-CatalogDependent`), shaped for the alert; `-NowUtc`, `-ReminderDays` | scheduled check |
 | `Set-CatalogFindingNotified` | after delivery: record the alerted level, drop alerted resolved findings | scheduled check |
 | `Get-CatalogUnverifiedRecord` | published versions without a completed audit for `-FreshnessDays` (never-audited ones once published that long) | scheduled check |
 | `Get-CatalogMaliciousRecord` | published versions with an open, unwaived `MAL-*` finding: `{Record; Ids}` | `Resolve-MaliciousPackage`, scheduled check |
 | `Update-WheelhouseCatalog` | write lock (unless `-LockHeld`) + read + sync + `-Update { param($catalog) }` + save | scripts, journal repair, sync run |
 | `Set-WheelhouseCatalogState` | record operation results (`{Name; Version; State; Action; Detail}`) in history and catalog; failure only warns | publish, remove, restore |
+
+### 8.13a `Dependency.ps1`
+
+| Function | Purpose | Callers |
+|---|---|---|
+| `Read-WheelRequirement` | `Requires-Dist` of a wheel's `.dist-info/METADATA` (headers only), without `extra == ...` entries: `{name; spec; marker}`; throws for an unreadable wheel | `Update-CatalogRequirement` |
+| `Test-VersionSpecifier` | PEP 440 specifier (`==`, `!=`, `<`, `<=`, `>`, `>=`, `~=`, `===`, `.*`) -> `$true`/`$false`, `$null` when a clause cannot be evaluated | `Get-CatalogDependent` |
+| `Update-CatalogRequirement` | fill `requires[]` once per Published record (`requires_checked`); unreadable -> retried next time | `Sync-WheelhouseCatalog` |
+| `Get-CatalogDependent` | Published versions whose `requires[]` names the package with a specifier that accepts (or may accept) the version: `{Name; Version; Requirement}` | alerts, notices, UI history |
+| `Format-CatalogDependent` | `name==version (needs <requirement>)` | same |
+| `Add-WheelhouseNoticeDependent` | sets `NeededBy` and extends the message of Denylisted/Yanked/FileMissing/FileModified/Malicious notices | sync run, `Test-Wheelhouse.ps1` |
 
 ### 8.14 `Journal.ps1`
 
@@ -641,7 +709,7 @@ code), `Resolve-WheelhouseIntegrityProblem`, `Resolve-MaliciousPackage`, `Move-U
 
 | Function | Purpose | Callers |
 |---|---|---|
-| `Get-WheelhouseStatus` | counts (published, open/overdue/waived findings, yanked, quarantined, unverified, untracked), last weekly check, current proposal, and `Attention[] {Level; Text; Target}` worst first (`Target` = UI tab or `packages:<filter>`); counts from the manifest while no catalog exists; read only | `whm status`, UI overview, doctor |
+| `Get-WheelhouseStatus` | counts (published, open/overdue/waived findings, yanked, quarantined, unverified, untracked), last weekly check, `AuditStale`/`OldestAuditUtc` (`-AuditMaxAgeDays`), current proposal, and `Attention[] {Level; Text; Target}` worst first (`Target` = UI tab or `packages:<filter>`); counts from the manifest while no catalog exists; read only | `whm status`, UI overview, doctor |
 | `Export-WheelhouseAdvisory` | `<wh>\advisories.json`: every version with an open/waived vulnerability or a yank, every quarantined/removed one, each with `status` and `recommended` (highest problem-free published version that is newer) | `Save-WheelhouseCatalog` (every save; a failure only warns) |
 | `Get-WheelhouseAdvisoryItem` | the versions to warn about, with `status` and `recommended` - shared by advisories.json and index.html | `Export-WheelhouseAdvisory` |
 | `Export-WheelhouseIndexPage` | `<wh>\index.html`: static page (no script) - available packages and versions, group files with install lines, "do not use" list, last weekly check; all text HTML-encoded | `Export-WheelhouseAdvisory` |
@@ -734,7 +802,7 @@ previous ones; `$reject` moves a package from `$remaining` to `Rejected` with a 
 | 2 | `Test-PackageAge` (PyPI release data) | `pypi-metadata`, `yanked`, `cooldown` (with eligible date) | `-Expedite` pins skip cooldown; `Report_PackageAge-*` (without the `Release` objects) |
 | 3 | `pip download -d <staging> --no-deps --only-binary=:all: --python-version --platform --implementation cp` via `Invoke-PipPinRetry` | `no-wheel`, `download` | staging = `<StagingRoot>\<guid>` |
 | 4 | Each staged file vs. the release's PyPI file list: listed, sha256 equal, not yanked, own upload date vs. cooldown (unless expedited) | `integrity`, `yanked`, `cooldown`, `pypi-metadata` | files claimed by no package are discarded |
-| 5 | `Invoke-WheelhouseDefenderScan` of the staging folder | `defender` | `Threat`: reject the package whose file path the detection names; an unmatched detection rejects all staged; `Error`: reject all with `-RequireDefenderScan`, else warn; a file that vanished during the scan is rejected |
+| 5 | `Invoke-WheelhouseDefenderScan` of the staging folder (skipped with `-SkipDefenderScan`, setting `DefenderScanAtIntake` off: WARN, no scan result recorded) | `defender` | `Threat`: reject the package whose file path the detection names; an unmatched detection rejects all staged; `Error`: reject all with `-RequireDefenderScan`, else warn; a file that vanished during the scan is rejected |
 
 `Invoke-CandidateIntake` stops here: it returns the verified staged files and leaves the staging
 folder for `Publish-CandidateIntake`, which runs under the write lock:
@@ -766,17 +834,27 @@ A [write lock]  Read-WheelhouseDenylist; Read-WheelhouseManifest; isBootstrap = 
                     is missing or older than AuditFreshnessDays; Read-WheelhouseWaiver
                 Get-WheelhouseGroupFile + Read-RequirementFile per group (snapshot)
 B [no lock]     Read-RequirementFile(local); Get-RequirementMergePlan -> additions per group
-C per group (existing first, then new by number):
+C [no lock]     Read-RequirementDependent(local)  (no annotations -> warning, nothing held back)
+  per group (existing first, then new by number):
    [no lock]    candidates = additions + Compare-RequirementsAgainstManifest(listed vs manifest).Packages
                 Invoke-CandidateIntake (Expedite, RequireDefenderScan, StagingRoot)
+  [no lock]     Get-DependentRejection(every group's rejections, verified pins) -> moved from
+                Verified to Rejected (category dependency) in their group (invariant 30)
+  per group:
    [write lock] Publish-CandidateIntake (9.1 steps 6-10) -> manifest refreshed
    [no lock]    rejections -> list (+ IntakeBlocked notice for integrity/defender; audit-error => incomplete)
-   after all groups: Invoke-PublishedAudit -Stage Deployed over what was published before this
-                run (one set per "n-th version of a package", not one audit per group)
+  finally       staging folders of groups not published (a throw in between) are deleted
+   after all groups: (no audit of what was published before - the weekly check and the
+                background audit of 9.3a do that; only candidates were audited and scanned)
                 warn about unused -ExpeditePackage; write Report_Rejected_*
                 (B, if anything is added) Resolve-WheelhouseProposalForPublish -> refused: throw
                     (AwaitingApproval); a remediation proposal: its changed pins target the
                     groups listing the vulnerable version, with Replaces (swap)
+O [no lock]     -Overwrite pins still in the manifest: Invoke-CandidateIntake (group 'overwrite',
+                    cooldown skipped - they passed it when published)
+  [write lock]  Publish-OverwriteIntake: each verified file must match the manifest's sha256 ->
+                    .partial, File.Replace (old copy to _replaced\<time>\); history 'Overwritten'
+                    + intake scan; mismatch -> rejected (integrity) + IntakeBlocked notice
 R [write lock]  remediation: Remove-WheelhousePackage -Quarantine for each retire pin no group
                 lists any more whose replacement is published
 D [write lock]  if isBootstrap and something published: Merge-WheelhouseManifest -PreRunFiles @()
@@ -784,6 +862,7 @@ E [no lock]     Get-AuditResultSeverity(all audits)                      (OSV, c
   [write lock]  catalog: Sync + Update-CatalogAuditResult(all audits, Severity, DueDays, Waiver)
                 Resolve-MaliciousPackage -AutoQuarantine:$AutoQuarantine -> Malicious notices
                 (no scan of the share)
+Add-WheelhouseNoticeDependent(notices)                   (published packages that need them)
 Outcome: incomplete -> Error, any failure -> Attention, else Ok
 ```
 
@@ -808,7 +887,8 @@ Update-WheelhouseCatalog { Update-CatalogAuditResult(Severity, DueDays, Waiver);
     this block is skipped and the Vulnerable reports are alerted as before
 Get-CatalogMaliciousRecord -> Resolve-MaliciousPackage (AutoQuarantine on: write lock) -> Malicious notices
 Get-CatalogUnverifiedRecord(AuditFreshnessDays) -> Unverified notices
-Get-CatalogFindingAlert(OverdueReminderDays)
+Get-CatalogFindingAlert(OverdueReminderDays)            (each finding with NeededBy)
+Add-WheelhouseNoticeDependent(notices)
 Get-VulnerabilityAlertParameter(AuditResults, Notice, CheckError, Finding) -> & Send-VulnerabilityAlert.ps1
 delivered (or nothing to send) -> Update-WheelhouseCatalog { Set-CatalogFindingNotified }
 exit: incomplete or alert failed -> 2; open (unwaived) findings or notices -> 1; else 0
@@ -816,6 +896,19 @@ exit: incomplete or alert failed -> 2; open (unwaived) findings or notices -> 1;
 
 It changes the wheelhouse only for the automatic actions of invariant 26 (with `AutoQuarantine`);
 every other finding is reported and acting on it is an administrator decision.
+
+### 9.3a Audit age check (`whm`, web UI start)
+
+Updates audit and scan only their candidates. `Invoke-WheelhouseStartupAuditCheck` (whm before
+every command except help/audit/check/ui/doctor; `Start-WheelhouseUiServer` on start) reads
+`WheelhousePath` and `AuditMaxAgeDays` from the settings -> `Invoke-WheelhouseAuditFreshnessCheck`
+-> `Get-WheelhouseAuditAge` (stale when a Published record's `checks.audit.last_run` is missing or
+older than the limit) -> `Start-WheelhouseBackgroundAudit`: the weekly check (9.3, with its
+stateful alert) now - `Start-WheelhouseScheduledCheck` when `Get-WheelhouseScheduledCheck` finds the
+task registered for this installation (runs as its account), else `Test-Wheelhouse.ps1` as a hidden
+child process of the same PowerShell; `<manager root>\state\background-audit.json` (`via`, `pid`,
+`started_utc`) keeps it to one at a time (at most 6 h). Never throws; logs a WARN. `Get-WheelhouseStatus` adds the same message as an
+Attention item (Overview tab, `whm status`).
 
 ### 9.4 Alerting
 
@@ -826,7 +919,8 @@ pipeline is stateful too: it passes `Get-CatalogFindingAlert` as `-Finding` and 
 delivery; with `-Finding`, Vulnerable reports are kept only for `PreDownload` (blocked candidates).
 `Send-VulnerabilityAlert.ps1` -> `Get-VulnerabilityFinding` (group from the report name,
 `-candidates` suffix => blocked before download) -> HTML: notices table, findings table (deployed:
-line to remove + exact wheel files from the manifest; blocked: change `requirements.in`), errors
+line to remove + exact wheel files from the manifest + the published packages that need it;
+blocked: change `requirements.in`), errors
 list. Integrity failures abort before any alert (they surface as exit code 2 and
 `Report_Integrity_*`).
 
@@ -876,7 +970,8 @@ Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it wor
   one record per manifest version (`Published`) and per quarantine record (`Quarantined`), with
   the latest audit/scan results imported from the report files, and one `CatalogCreated` event.
 - Reconciled by every catalog write: state, files and groups follow manifest, group files and
-  quarantine; differences produce `Reconciled` or `Discovered` events.
+  quarantine; differences produce `Reconciled` or `Discovered` events. `requires[]` is read once
+  per published version from its wheel (`Update-CatalogRequirement`).
 - Operations record their own changes with a reason (`Published`, `Quarantined`, `Deleted`,
   `Restored`, `Recovered`, `UntrackedMoved`); checks record `AuditChanged`, `ScanChanged`,
   `PyPIChanged`; findings record `FindingNew`, `SeverityChanged`, `FindingResolved`,
@@ -913,7 +1008,7 @@ Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it wor
 | `GET /api/overview` | - | `Get-WheelhouseStatus` (counts, `attention[]`, last check) + the Scheduled Task's state | 200 |
 | `GET /api/state` | - | path, configured, reachable, defender, is_admin, python/platform, `tools` (python, pip-audit, uv), running job | 200 |
 | `GET /api/packages` | - | `Get-WheelhousePackage` (denylist, configured services) + `last_check_utc`, `check_overdue` (no completed weekly check within `AuditFreshnessDays`), `audit_freshness_days` | 200 |
-| `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks, findings) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
+| `GET /api/packages/<name>/<version>/history` | - | catalog record (state, groups, files, checks, findings, `needed_by`) + `Read-WheelhouseEvent` (newest 500) | 200 / 404 |
 | `GET /api/schedule` | - | `Get-WheelhouseScheduledCheck` + `last_check_utc` (catalog), `current_user`, `mapped_drive {drive; unc}` | 200 |
 | `POST /api/schedule` | `{days[], time 'HH:mm', user, password}` | `Register-WheelhouseScheduledCheck` (password -> SecureString at once) | 200 / 400 / 409 |
 | `POST /api/schedule/run`, `POST /api/schedule/remove` | - / `{confirm:true}` | `Start-` / `Unregister-WheelhouseScheduledCheck` | 200 / 400 / 404 / 409 |
@@ -926,11 +1021,15 @@ Jobs: Start-WheelhouseUiJob(title = the action only, -Detail = pins/files it wor
 | `POST /api/packages/scan` | `{all}` or `{files:[...]}` | job `Invoke-WheelhouseScan.ps1 [-File ...]` | 202 |
 | `GET /api/audits` | - | the newest 200 pip-audit reports (`Get-AuditReportInfo` names) as `ConvertTo-WheelhouseUiAuditReport` summaries | 200 |
 | `GET /api/audits/<file>` | - | one report with every package and advisory (`-IncludeDependency`); 404 for a file that is not an audit report | 200 |
-| `POST /api/requirements/remove` | `{name}` | `Invoke-WheelhouseUiRequirementRemoval` -> `Remove-RequirementInLine`; job `Update-Requirement.ps1` (title *Remove packages*), or requirements.txt emptied when requirements.in lists nothing | 200 |
-| `POST /api/requirements/clear` | `{}` | the same for every pending pin listed in requirements.in (`Get-WheelhouseUiPendingPin`, `direct`); title *Clear list*; 409 when none | 200 |
+| `POST /api/requirements/remove` | `{name}` | `Invoke-WheelhouseUiRequirementRemoval` -> `Remove-RequirementTxtPin` on requirements.txt, then a `manual` proposal of the changed file; no job | 200 `{removed, job:null}`, 404 not pinned |
+| `POST /api/requirements/clear` | `{}` | empties requirements.txt; 409 when no pin is pending | 200 |
 | `POST /api/packages/add` | `{specs:[...] (<= 100), publish:bool, replace:bool}` | `Add-RequirementInLine`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` only if `publish:true`) | 200 |
-| `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review, plus `pending` (pins not in the manifest, each with the reason from the latest `Report_Rejected_*` if any) and `published_count` | 200 `{path, text, modified_utc, pin_count}` |
-| `POST /api/wheelhouse/update` | `{confirm:true}` | job `Update-Wheelhouse.ps1` | 202 / 400 |
+| `GET /api/requirements/in` | - | `RequirementsInPath` (<= 1 MB), the Add tab's edit box | 200 `{path, text, modified_utc}` |
+| `POST /api/requirements/in` | `{text (<= 100 KB), publish:bool}` | `Set-RequirementInText`; job `Update-Requirement.ps1` (+ `Update-Wheelhouse.ps1` if `publish:true`); no job when no requirement is listed (requirements.txt unchanged); problems -> `saved:false` and nothing written | 200 `{saved, problems, job}` |
+| `GET /api/requirements` | - | resolved `LocalRequirementsPath` (<= 1 MB) for review: `rows` (`Get-WheelhouseUiReviewRow` of every pin without a problem: `status` new / new_version / added, `published_versions`, `direct`, `requested_by`, `needs` from the `# via` lines), `problems` (`Get-WheelhouseUiProblem`: set-aside requirements and pins the latest `Report_Rejected_*` rejected, with `reason`, `kind`, `expedite`), `pending` (pins not in the manifest), `published_count`, `resolve_failure` (only a failed resolve) | 200 `{path, text, modified_utc, pin_count, rows, problems}` |
+| `POST /api/requirements/problems/remove` | `{}` | Remove All: clears `set_aside` in `requirements.status.json`, `Invoke-WheelhouseUiRequirementRemoval` for the rejected pins | 200 `{set_aside, removed}`, 409 nothing to remove |
+| `POST /api/requirements/expedite` | `{name, reason}` (reason: plain sentence only) | a set-aside entry with `expedite`: its spec back into requirements.in (`Add-RequirementInLine`), job `Update-Requirement.ps1 -ExpeditePackage name==ver -ExpediteReason ...` | 202 / 400 / 404 |
+| `POST /api/wheelhouse/update` | `{confirm:true, leave_out:[name], overwrite:['name==ver']}` (Idle) | `leave_out` pins (must be in requirements.txt) leave it first (`Remove-RequirementTxtPin -Exact`) and the proposal is narrowed (`Update-WheelhouseProposalSubset`; under SeparateApprover a list it does not cover gets a new proposal -> 409); `overwrite` pins must be in the manifest; job `Update-Wheelhouse.ps1 [-OverwritePackage a==1,b==2]` | 202 / 400 / 404 / 409 |
 | `POST /api/packages/remove` | `{packages (<= 200), mode:'quarantine'\|'delete', reason (<= 400), confirm}` | `Remove-WheelhousePackage` per package; refused while a job runs | 200 `{results}` |
 | `GET /api/quarantine`, `POST /api/quarantine/restore` | `{id, keep_denylist}` | list / `Restore-WheelhousePackage` | 200 |
 | `GET /api/denylist`, `POST /api/denylist/add`, `POST /api/denylist/remove` | `{name, version, reason}` | list (+ `installed`) / add (`manual`) / remove | 200 / 400 / 404 |
@@ -1029,7 +1128,8 @@ UploadTimeUtc; Yanked; YankedReason}]`, `FirstUploadUtc`, `Yanked`, `YankedReaso
 
 **Catalog** (`catalog.json`): `{ schema: 1; updated_utc; scheduled_check_utc; packages: [record] }`.
 Record: `name`, `version`, `state` (`Published`/`Quarantined`/`Removed`), `state_since`, `state_reason`,
-`groups[]` (group file names), `files[]`, `published_utc`, `findings[]` (`id`, `aliases[]`, `summary`,
+`groups[]` (group file names), `files[]`, `published_utc`, `requires[]` (`{name; spec}` from the
+wheel's Requires-Dist, extras left out), `requires_checked`, `findings[]` (`id`, `aliases[]`, `summary`,
 `fix_versions[]`, `severity` Critical|High|Medium|Low|Unknown, `score`, `severity_source`,
 `first_seen`, `due`, `resolved_utc`, `waiver {reason; by; expires_utc}`|null, `notified`
 New|Overdue|Waived|Resolved|'', `notified_utc`), `checks`:
@@ -1232,7 +1332,7 @@ Which code runs for each user scenario (user steps are in the README):
 | Wheel copied in by hand | check or update: `Move-UntrackedWheelFile` -> `_untracked\<ts>\` |
 | File server antivirus removed/changed a wheel | check or update: `Assert-WheelhouseIntegrity -AllowChangedFiles` -> `Resolve-WheelhouseIntegrityProblem` -> `Remove-WheelhousePackage -LockHeld` |
 | Audit / scan from the UI | `POST /api/packages/audit` or `/scan` -> job -> `Test-WheelhousePackage.ps1` / `Invoke-WheelhouseScan.ps1` |
-| Add from the UI | `POST /api/packages/add` -> `Add-RequirementInLine` -> job `Update-Requirement.ps1`; then `GET /api/requirements` -> `POST /api/wheelhouse/update` |
+| Add from the UI | `GET /api/requirements/in` (edit box) -> `POST /api/requirements/in` -> `Set-RequirementInText` -> job `Update-Requirement.ps1` (7.3: kept pins + new lines, set-aside instead of failing, requirements.in emptied); then `GET /api/requirements` (`problems` = `Get-WheelhouseUiProblem`, `rows` = `Get-WheelhouseUiReviewRow` with status new / new_version / added and `needs`) -> `POST /api/requirements/problems/remove` (Remove All), `POST /api/requirements/expedite` (job `Update-Requirement.ps1 -ExpeditePackage`) -> `POST /api/wheelhouse/update` with `leave_out` (`Remove-RequirementTxtPin -Exact`, `Update-WheelhouseProposalSubset`) and `overwrite` (`-OverwritePackage`) |
 | Quarantine / delete / restore | `POST /api/packages/remove` / `/api/quarantine/restore` -> 9.5 |
 | Denylist edit | `/api/denylist/*` -> `Add-/Remove-WheelhouseDenylistEntry` |
 | Package table | `GET /api/packages` -> `Get-WheelhousePackage` -> `Get-PackageAuditStatus`, `Get-PackageScanStatus` |

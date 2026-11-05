@@ -34,16 +34,19 @@
         vulnerability audit, PyPI's yanked flag, the package-age (cooldown) check and
         the download into a staging folder outside the wheelhouse. Each downloaded file
         must match the sha256 PyPI publishes for it and pass a Microsoft Defender scan
-        before it is copied into the wheelhouse - clients never see an unchecked file.
-        Each package is judged on its own. A package that fails a step is rejected with
-        the reason (log + Report_Rejected_<timestamp>.json) and never holds back the
-        others. Only packages whose wheel was actually downloaded are written into the
+        (unless the setting DefenderScanAtIntake is off) before it is copied into the
+        wheelhouse - clients never see an unchecked file. A package that fails a step is
+        rejected with the reason (log + Report_Rejected_<timestamp>.json), and so is every
+        package that needs it (the "# via" lines of requirements.txt, category
+        "dependency"), in any group; the others are published. Every group is checked
+        before any is published. Only packages whose wheel was actually downloaded are written into the
         group file - a group file never lists a package that isn't in the wheelhouse.
         A rejected new package stays in the local requirements file and is simply
         tried again on the next run (e.g. once its cooldown has passed).
 
-      - Every group that already existed is then audited as deployed (vulnerability
-        check, no download).
+      - Only the new packages are audited and scanned. Published versions are re-audited
+        by the weekly check (Test-Wheelhouse.ps1), and whm / the web UI start an audit in
+        the background when the last one is older than AuditMaxAgeDays.
 
       - Downloads use pip's --no-deps: group files come from `uv pip compile`, so every
         transitive dependency is already pinned in them and goes through the same
@@ -106,6 +109,12 @@
 .PARAMETER ExpediteReason
     Why the cooldown is skipped; logged with the user name.
 
+.PARAMETER OverwritePackage
+    name==version pins of published versions to download again, check like new packages
+    (audit, sha256 against PyPI, Defender) and put in place of the published copy. The new
+    copy must match the sha256 in the manifest; the previous copy is moved to
+    <wheelhouse>\_replaced\<time>\. Group files and the manifest do not change.
+
 .PARAMETER AutoQuarantine
     On or Off for this run, overriding the AutoQuarantine setting (default On): whether a
     wheel removed or changed outside the manager is taken out automatically, or stops the run.
@@ -161,6 +170,8 @@ param(
 
     [string]$ExpediteReason,
 
+    [string[]]$OverwritePackage,
+
     [ValidateSet('On', 'Off')]
     [string]$AutoQuarantine
 )
@@ -168,7 +179,7 @@ param(
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays, ApprovalMode
+    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, DefenderScanAtIntake, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays, ApprovalMode
 
 $title = 'Wheelhouse maintenance script'
 $outcome = $null
@@ -189,6 +200,12 @@ try {
         Write-Log "Cooldown is skipped for $(($expedite.Keys | Sort-Object | ForEach-Object { "$_==$($expedite[$_])" }) -join ', ') - requested by $user. Reason: $ExpediteReason" 'WARN'
     }
 
+    $overwrite = @{}
+    foreach ($pin in @(ConvertTo-WheelhousePin -Pin @($OverwritePackage | Where-Object { $_ }))) { $overwrite[$pin.Name] = $pin.Version }
+    if ($overwrite.Count -gt 0) {
+        Write-Log "To overwrite (download again, check, replace the published copy): $(($overwrite.Keys | Sort-Object | ForEach-Object { "$_==$($overwrite[$_])" }) -join ', ')" 'WARN'
+    }
+
     Confirm-PythonAndTooling
 
     $syncParams = @{
@@ -201,7 +218,9 @@ try {
         Services              = $cfg.VulnerabilityServices
         Expedite              = $expedite
         ExpediteReason        = [string]$ExpediteReason
+        Overwrite             = $overwrite
         RequireDefenderScan   = [bool]$cfg.RequireDefenderScanAtIntake
+        SkipDefenderScan      = -not (ConvertTo-WheelhouseBoolean $cfg.DefenderScanAtIntake)
         # -AutoQuarantine On|Off wins over the setting (a bool).
         AutoQuarantine        = ConvertTo-WheelhouseBoolean $cfg.AutoQuarantine
         ApprovalMode          = [string]$cfg.ApprovalMode
@@ -209,6 +228,15 @@ try {
         AuditFreshnessDays    = [int]$cfg.AuditFreshnessDays
     }
     $result = Invoke-WheelhouseSync @syncParams
+
+    # The Add tab starts over once everything in requirements.txt is published. Only for the
+    # configured file - an explicit -LocalRequirementsPath is the caller's.
+    if (-not $PSBoundParameters.ContainsKey('LocalRequirementsPath') -and $cfg.LocalRequirementsPath) {
+        try {
+            if (Clear-PublishedRequirementTxt -Path $cfg.LocalRequirementsPath -WheelhousePath $cfg.WheelhousePath) { Write-Log 'Every pin of requirements.txt is published - requirements.txt was emptied.' 'OK' }
+        }
+        catch { Write-Log "Could not empty requirements.txt: $($_.Exception.Message)" 'WARN' }
+    }
 
     if ($result.Outcome -eq 'Error') {
         $exitCode = Get-WheelhouseExitCode -Outcome Error

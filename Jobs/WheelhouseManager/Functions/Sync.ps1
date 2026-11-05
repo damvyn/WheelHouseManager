@@ -12,9 +12,13 @@ function Invoke-WheelhouseSync {
     #      if that adds anything, the requirements file needs an approved proposal
     #      (Resolve-WheelhouseProposalForPublish, -ApprovalMode). A remediation proposal
     #      swaps its pins in the groups that list the vulnerable version instead;
-    #   C. per group: Invoke-CandidateIntake (no lock), then Publish-CandidateIntake (write
-    #      lock for the seconds the publish takes); then one batched audit of everything
-    #      published before this run (Invoke-PublishedAudit);
+    #   C. Invoke-CandidateIntake for every group (no lock); then every verified package
+    #      that needs a rejected pin (requirements.txt's "# via" annotations,
+    #      Get-DependentRejection) is held back; then Publish-CandidateIntake per group (write
+    #      lock for the seconds the publish takes). Only the candidates are audited and
+    #      scanned - published versions are the weekly check's job;
+    #   O. -Overwrite: published versions downloaded and checked again, then swapped in for
+    #      the published copy when the sha256 matches the manifest (Publish-OverwriteIntake);
     #   R. remediation: quarantine the vulnerable version once no group lists it any more
     #      and its replacement is published (write lock);
     #   D. first-time setup only: adopt the wheels the folder already held (write lock);
@@ -57,7 +61,14 @@ function Invoke-WheelhouseSync {
 
         [string]$ExpediteReason = '',
 
+        # name -> version of published versions to download again, check like new packages
+        # and put in place of the published copy (Publish-OverwriteIntake).
+        [hashtable]$Overwrite = @{},
+
         [switch]$RequireDefenderScan,
+
+        # No Defender scan of new downloads (setting DefenderScanAtIntake off).
+        [switch]$SkipDefenderScan,
 
         # Take out wheels removed or changed outside the manager instead of stopping.
         [bool]$AutoQuarantine = $true,
@@ -228,7 +239,7 @@ function Invoke-WheelhouseSync {
         # Existing groups first, then planned new groups in number order.
         $targetGroups = @($groupFiles) + @($additionsByGroup.Keys | Where-Object { $groupFiles -notcontains $_ } |
                 Sort-Object { Get-GroupFileNumber -Path $_ })
-        if ($targetGroups.Count -eq 0) {
+        if ($targetGroups.Count -eq 0 -and $Overwrite.Count -eq 0) {
             Write-Log 'Run Update-Requirement.ps1 and re-run this script with -LocalRequirementsPath to create the first group.' 'ERROR'
             throw 'Wheelhouse has no requirement group files yet, and no local requirements were supplied to bootstrap one.'
         }
@@ -248,31 +259,44 @@ function Invoke-WheelhouseSync {
             }
         }
 
-        foreach ($groupFile in $targetGroups) {
-            $groupName = [System.IO.Path]::GetFileNameWithoutExtension($groupFile)
-            Write-Log "--- Group: $groupName ($groupFile) ---"
-
-            $groupExisted = $listedByGroup.ContainsKey($groupFile)
-            $listed = if ($groupExisted) { $listedByGroup[$groupFile] } else { @{} }
-            $additions = if ($additionsByGroup.ContainsKey($groupFile)) { $additionsByGroup[$groupFile] } else { @{} }
-
-            # Pins the group already lists but whose wheel is not in the wheelhouse yet.
-            $missing = @{}
-            if ($listed.Count -gt 0) {
-                $compareParams = @{
-                    Required            = $listed
-                    Manifest            = $manifest
-                    ExpectedPythonTag   = $expectedPythonTag
-                    ExpectedPlatformTag = $Platform
-                }
-                $missing = (Compare-RequirementsAgainstManifest @compareParams).Packages
+        # Every group is checked first and published only afterwards: a package whose
+        # dependency (a "# via" annotation in requirements.txt) was rejected in any group is
+        # held back before anything is published, so clients never get a package without
+        # the dependency it needs.
+        $dependents = @{}
+        if ($localPackages.Count -gt 0) {
+            $dependents = Read-RequirementDependent -FilePath $LocalRequirementsPath
+            if ($dependents.Count -eq 0 -and $localPackages.Count -gt 1) {
+                Write-Log "$LocalRequirementsPath has no '# via' annotations (compiled with --no-annotate?): a package is not held back when one of its dependencies is rejected." 'WARN'
             }
-            Write-Log "$($listed.Count) package(s) listed, $($missing.Count) of them without a wheel yet; $($additions.Count) new candidate(s)."
+        }
+        $groupRuns = [System.Collections.Generic.List[object]]::new()
+        try {
+            foreach ($groupFile in $targetGroups) {
+                $groupName = [System.IO.Path]::GetFileNameWithoutExtension($groupFile)
+                Write-Log "--- Group: $groupName ($groupFile) ---"
 
-            $candidates = @{} + $missing
-            foreach ($name in $additions.Keys) { $candidates[$name] = $additions[$name] }
+                $groupExisted = $listedByGroup.ContainsKey($groupFile)
+                $listed = if ($groupExisted) { $listedByGroup[$groupFile] } else { @{} }
+                $additions = if ($additionsByGroup.ContainsKey($groupFile)) { $additionsByGroup[$groupFile] } else { @{} }
 
-            if ($candidates.Count -gt 0) {
+                # Pins the group already lists but whose wheel is not in the wheelhouse yet.
+                $missing = @{}
+                if ($listed.Count -gt 0) {
+                    $compareParams = @{
+                        Required            = $listed
+                        Manifest            = $manifest
+                        ExpectedPythonTag   = $expectedPythonTag
+                        ExpectedPlatformTag = $Platform
+                    }
+                    $missing = (Compare-RequirementsAgainstManifest @compareParams).Packages
+                }
+                Write-Log "$($listed.Count) package(s) listed, $($missing.Count) of them without a wheel yet; $($additions.Count) new candidate(s)."
+
+                $candidates = @{} + $missing
+                foreach ($name in $additions.Keys) { $candidates[$name] = $additions[$name] }
+                if ($candidates.Count -eq 0) { continue }
+
                 foreach ($name in ($candidates.Keys | Sort-Object)) {
                     $kind = if ($additions.ContainsKey($name)) { 'new' } else { 'listed, no wheel yet' }
                     Write-Log "  Candidate: $name==$($candidates[$name]) ($kind)" 'WARN'
@@ -290,10 +314,44 @@ function Invoke-WheelhouseSync {
                     Denylist            = $denylist
                     Expedite            = $Expedite
                     RequireDefenderScan = [bool]$RequireDefenderScan
+                    SkipDefenderScan    = [bool]$SkipDefenderScan
                     StagingRoot         = $StagingRoot
                 }
                 $intake = Invoke-CandidateIntake @intakeParams
                 foreach ($result in $intake.AuditResults) { $auditResults.Add($result) }
+                $groupRuns.Add([PSCustomObject]@{ GroupFile = $groupFile; GroupName = $groupName; Additions = $additions; Intake = $intake })
+            }
+
+            # Hold back every verified package that needs a rejected pin (whichever group
+            # rejected it), and the packages that need those in turn.
+            if ($dependents.Count -gt 0 -and $groupRuns.Count -gt 0) {
+                $verifiedPins = @{}
+                foreach ($run in $groupRuns) {
+                    foreach ($name in @($run.Intake.Verified.Keys)) { $verifiedPins[$name] = $run.Intake.Packages[$name] }
+                }
+                $heldParams = @{
+                    Rejected   = @($groupRuns | ForEach-Object { $_.Intake.Rejected })
+                    Dependents = $dependents
+                    Pins       = $localPackages
+                    Candidates = $verifiedPins
+                }
+                foreach ($item in @(Get-DependentRejection @heldParams)) {
+                    foreach ($run in $groupRuns) {
+                        if (-not $run.Intake.Verified.ContainsKey($item.Name) -or $run.Intake.Packages[$item.Name] -ne $item.Version) { continue }
+                        $run.Intake.Verified.Remove($item.Name)
+                        $run.Intake.Rejected = @($run.Intake.Rejected) + $item
+                        Write-Log "  Held back: $($item.Name)==$($item.Version) - $($item.Reason)" 'WARN'
+                    }
+                }
+            }
+
+            foreach ($run in $groupRuns) {
+                $groupFile = $run.GroupFile
+                $groupName = $run.GroupName
+                $additions = $run.Additions
+                $intake = $run.Intake
+                $run.Intake = $null
+                if ($groupRuns.Count -gt 1) { Write-Log "--- Publishing: $groupName ---" }
 
                 $publishParams = @{
                     Intake         = $intake
@@ -329,12 +387,13 @@ function Invoke-WheelhouseSync {
                     }
                     Write-Log "  Rejected: $($item.Name)==$($item.Version) - $($item.Reason) -> $action" 'ERROR'
                     $rejectedAll.Add([PSCustomObject]@{
-                            Group    = $groupName
-                            Package  = $item.Name
-                            Version  = $item.Version
-                            Kind     = $(if ($isNew) { 'new' } else { 'listed' })
-                            Category = $item.Category
-                            Reason   = $item.Reason
+                            Group      = $groupName
+                            Package    = $item.Name
+                            Version    = $item.Version
+                            Kind       = $(if ($isNew) { 'new' } else { 'listed' })
+                            Category   = $item.Category
+                            Reason     = $item.Reason
+                            Dependency = $(if ($item.PSObject.Properties['Dependency']) { $item.Dependency } else { $null })
                         })
                     # A download that differed from PyPI or was detected by Defender is a
                     # security event, not just a rejection.
@@ -345,24 +404,70 @@ function Invoke-WheelhouseSync {
                     $overallPassed = $false
                 }
             }
-
+        }
+        finally {
+            # A run that stopped between the checks and the publish leaves no staged files.
+            foreach ($run in $groupRuns) {
+                if ($run.Intake -and $run.Intake.StagingPath) { Remove-Item -Path $run.Intake.StagingPath -Recurse -Force -ErrorAction SilentlyContinue }
+            }
         }
 
-        # Audit what was published before this run, in as few pip-audit runs as possible
-        # (whatever the number of group files). What this run published was just audited
-        # as a candidate.
-        $justPublished = @{}
-        foreach ($entry in $publishedAll) { $justPublished["$($entry.name)==$($entry.version)"] = $true }
-        $deployedManifest = @($manifest | Where-Object { -not $justPublished.ContainsKey("$($_.name)==$($_.version)") })
-        if ($deployedManifest.Count -gt 0) {
-            $deployedResults = Invoke-PublishedAudit -Manifest $deployedManifest -Services $Services -Stage 'Deployed' -ReportsFolder $ReportsFolder
-            foreach ($result in $deployedResults) { $auditResults.Add($result) }
-            if ($deployedResults | Where-Object { $_.Status -ne 'Passed' }) {
-                Write-Log 'Published packages have known vulnerabilities (or an incomplete audit).' 'ERROR'
+        # -------------------------------------------------------------------
+        # O. Overwrite published versions with a copy checked again
+        # -------------------------------------------------------------------
+        $overwritePins = @{}
+        foreach ($key in @($Overwrite.Keys | Sort-Object)) {
+            $name = Get-NormalizedPackageName $key
+            $version = [string]$Overwrite[$key]
+            if (@($manifest | Where-Object { $_.name -eq $name -and $_.version -eq $version }).Count -eq 0) {
+                Write-Log "Overwrite: $name==$version is not in the wheelhouse - nothing to overwrite." 'WARN'
+                continue
+            }
+            $overwritePins[$name] = $version
+        }
+        if ($overwritePins.Count -gt 0) {
+            Write-Log "--- Overwrite: $(($overwritePins.Keys | Sort-Object | ForEach-Object { "$_==$($overwritePins[$_])" }) -join ', ') - downloaded again and checked like new packages ---"
+            $overwriteParams = @{
+                Packages            = $overwritePins
+                GroupName           = 'overwrite'
+                ReportsFolder       = $ReportsFolder
+                Services            = $Services
+                MinimumAgeDays      = $MinimumAgeDays
+                PythonVersion       = $PythonVersion
+                Platform            = $Platform
+                Denylist            = $denylist
+                # These versions passed the cooldown when they were published.
+                Expedite            = $overwritePins
+                RequireDefenderScan = [bool]$RequireDefenderScan
+                SkipDefenderScan    = [bool]$SkipDefenderScan
+                StagingRoot         = $StagingRoot
+            }
+            $overwriteIntake = Invoke-CandidateIntake @overwriteParams
+            foreach ($result in $overwriteIntake.AuditResults) { $auditResults.Add($result) }
+            $overwritten = Publish-OverwriteIntake -Intake $overwriteIntake -WheelhousePath $WheelhousePath -DenylistPath $DenylistPath -TimeoutSeconds $LockTimeoutSeconds
+            foreach ($item in @($overwriteIntake.Rejected) + @($overwritten.Rejected)) {
+                if ($null -eq $item) { continue }
+                Write-Log "  Not overwritten: $($item.Name)==$($item.Version) - $($item.Reason) -> the published copy stays" 'ERROR'
+                $rejectedAll.Add([PSCustomObject]@{
+                        Group      = 'overwrite'
+                        Package    = $item.Name
+                        Version    = $item.Version
+                        Kind       = 'overwrite'
+                        Category   = $item.Category
+                        Reason     = $item.Reason
+                        Dependency = $null
+                    })
+                if ($item.Category -in 'integrity', 'defender') {
+                    $notices.Add((New-WheelhouseNotice -Kind 'IntakeBlocked' -Package $item.Name -Version $item.Version -Message $item.Reason))
+                }
+                if ($item.Category -eq 'audit-error') { $auditIncomplete = $true }
                 $overallPassed = $false
             }
-            if ($deployedResults | Where-Object { $_.Status -eq 'Error' }) { $auditIncomplete = $true }
         }
+
+        # Only this run's candidates were audited and scanned. What was published before is
+        # re-audited by the weekly check (Test-Wheelhouse.ps1), and by the background audit
+        # whm and the UI start when the last one is older than AuditMaxAgeDays.
 
         foreach ($name in ($Expedite.Keys | Sort-Object)) {
             if (-not $expediteUsed.ContainsKey($name)) {
@@ -475,6 +580,12 @@ function Invoke-WheelhouseSync {
     }
     finally {
         Exit-WheelhouseLock -Lock $syncLock
+    }
+
+    # Name the published packages that need a version a notice is about (they stay published).
+    if ($notices.Count -gt 0) {
+        try { [void](Add-WheelhouseNoticeDependent -Notice $notices.ToArray() -Catalog (Read-WheelhouseCatalog -WheelhousePath $WheelhousePath)) }
+        catch { Write-Log "Could not look up the packages that depend on the reported versions: $($_.Exception.Message)" 'WARN' }
     }
 
     $outcome = if ($auditIncomplete) { 'Error' } elseif (-not $overallPassed) { 'Attention' } else { 'Ok' }

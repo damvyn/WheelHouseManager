@@ -35,6 +35,114 @@ function Read-RequirementFile {
     return $packages
 }
 
+function Read-RequirementDependent {
+    # Reads the "# via" annotations that `uv pip compile` writes under each pin and returns
+    # normalized name -> string[] of the normalized names of the pins that need it, e.g.
+    #     urllib3==2.8.0
+    #         # via requests
+    # gives @{ urllib3 = @('requests') }. Both annotation styles are read (one line, or
+    # "# via" followed by one "#   name" line per parent). Sources that are not pins
+    # (-r requirements.in, -c constraints.txt) are skipped - with -IncludeSource the
+    # "-r <file>" entries are kept as they are, so a caller can tell a pin that was asked for
+    # from one that is only a dependency. A file compiled with --no-annotate gives an empty table.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$FilePath,
+
+        [switch]$IncludeSource
+    )
+
+    $dependents = @{}
+    $current = $null
+    $inList = $false
+    $keepSource = [bool]$IncludeSource
+    $add = {
+        param([string]$Entry)
+        $token = ($Entry.Trim() -split '\s+')[0]
+        if ($keepSource -and $token -eq '-r') {
+            $source = ($Entry.Trim() -replace '\s+', ' ')
+            if (-not $dependents.ContainsKey($current)) { $dependents[$current] = @() }
+            if ($dependents[$current] -notcontains $source) { $dependents[$current] = @($dependents[$current]) + $source }
+            return
+        }
+        if (-not $token -or $token.StartsWith('-') -or $token -notmatch '^[A-Za-z0-9][A-Za-z0-9_.\-]*$') { return }
+        $parent = Get-NormalizedPackageName $token
+        if ($parent -eq $current) { return }
+        if (-not $dependents.ContainsKey($current)) { $dependents[$current] = @() }
+        if ($dependents[$current] -notcontains $parent) { $dependents[$current] = @($dependents[$current]) + $parent }
+    }
+    foreach ($rawLine in (Get-Content -Path $FilePath -ErrorAction Stop)) {
+        $line = $rawLine.Trim()
+        if ($line -match '^(?<name>[A-Za-z0-9][A-Za-z0-9_.\-]*)\s*(\[[^\]]*\])?\s*==') {
+            $current = Get-NormalizedPackageName $Matches['name']
+            $inList = $false
+            continue
+        }
+        if (-not $current -or -not $line.StartsWith('#')) {
+            if ($line -ne '' -and -not $line.StartsWith('--hash')) { $inList = $false }
+            continue
+        }
+        $comment = $line.TrimStart('#').Trim()
+        if ($comment -match '^via\s*$') { $inList = $true; continue }
+        if ($comment -match '^via\s+(?<entry>.+)$') { & $add $Matches['entry']; $inList = $false; continue }
+        if ($inList -and $comment) { & $add $comment }
+    }
+    return $dependents
+}
+
+function Get-DependentRejection {
+    # Packages that must be held back because a pin they need was rejected. -Rejected are
+    # rejection objects ({Name; Version; Reason}); -Dependents is Read-RequirementDependent's
+    # table; -Pins the versions requirements.txt resolved (name -> version) - only a rejection
+    # of exactly that version holds anything back; -Candidates the packages still on their
+    # way in (name -> version). Follows the chain upwards: a package that needs a held-back
+    # package is held back too. Returns [PSCustomObject]@{Name; Version; Category =
+    # 'dependency'; Reason; Dependency = 'name==version' of the rejected pin it needs}.
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Rejected = @(),
+
+        [hashtable]$Dependents = @{},
+
+        [hashtable]$Pins = @{},
+
+        [hashtable]$Candidates = @{}
+    )
+
+    $held = [System.Collections.Generic.List[object]]::new()
+    $done = @{}
+    $queue = [System.Collections.Generic.Queue[object]]::new()
+    foreach ($item in @($Rejected)) {
+        if ($null -eq $item) { continue }
+        $name = Get-NormalizedPackageName ([string]$item.Name)
+        if (-not $Pins.ContainsKey($name) -or [string]$Pins[$name] -ne [string]$item.Version -or $done.ContainsKey($name)) { continue }
+        $done[$name] = $true
+        $queue.Enqueue([PSCustomObject]@{ Name = $name; Version = [string]$item.Version; Reason = [string]$item.Reason })
+    }
+    while ($queue.Count -gt 0) {
+        $failed = $queue.Dequeue()
+        foreach ($parent in @($Dependents[$failed.Name] | Sort-Object)) {
+            if (-not $parent -or $done.ContainsKey($parent)) { continue }
+            if (-not $Candidates.ContainsKey($parent) -or -not $Pins.ContainsKey($parent) -or [string]$Candidates[$parent] -ne [string]$Pins[$parent]) { continue }
+            $done[$parent] = $true
+            $entry = [PSCustomObject]@{
+                Name       = $parent
+                Version    = [string]$Pins[$parent]
+                Category   = 'dependency'
+                Reason     = "needs $($failed.Name)==$($failed.Version), which was rejected ($($failed.Reason))"
+                Dependency = "$($failed.Name)==$($failed.Version)"
+            }
+            $held.Add($entry)
+            $queue.Enqueue($entry)
+        }
+    }
+    return $held.ToArray()
+}
+
 function Get-GroupFileNumber {
     # requirements-3.txt -> 3; the legacy requirements.txt -> 0; anything else -> -1.
     [CmdletBinding()]

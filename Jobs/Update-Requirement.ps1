@@ -16,13 +16,25 @@
       - uv ignores upper bounds on Requires-Python (e.g. "<3.14"), so the result is
         then checked with pip (`pip install --dry-run`, metadata only) - pip applies
         exactly the same rules as the later download.
-    Only a file that passes both is written to -RequirementsTxtPath. Otherwise the
-    existing requirements.txt is left untouched, the rejected result is saved next to
-    it as requirements.rejected.txt, and every unavailable package is listed.
+    One run finds every requirement that cannot be resolved (Invoke-RequirementResolve):
+    when uv fails, the requirement its error names is set aside with the reason (too new for
+    the cooldown, no usable wheel, not on PyPI, a conflict) and the rest is resolved again.
+    A pin pip cannot use is first excluded so uv can pick another version. What resolves is
+    written to -RequirementsTxtPath; the set-aside requirements are recorded in
+    requirements.status.json next to it and listed in the UI's "Review and publish" step
+    (Remove them, or Expedite one that is only too new). When nothing usable comes out (uv
+    fails without naming a requirement, pip cannot run), requirements.txt is left
+    untouched and the result is saved as requirements.rejected.txt.
 
-    Exit codes: 0 written; 1 the result was rejected (uv could not resolve it, or a
-    package has no usable wheel) - change requirements.in and run again; 2 the input
-    file, python or the platform mapping is missing.
+    When it resolved the configured requirements.in (settings RequirementsInPath), the pins
+    of the current requirements.txt that were asked for are resolved together with it
+    (requirements.txt grows until it is published), a new line for a package requirements.txt
+    already pins at a fitting version is ignored, and afterwards requirements.in is emptied
+    down to its comment lines: it only ever lists what is new.
+
+    Exit codes: 0 written (possibly with set-aside requirements); 1 nothing could be
+    resolved, or -NoSetAside and something was set aside - change requirements.in and run
+    again; 2 the input file, python, uv or the platform mapping is missing.
 
     If called with no path parameters, both default to the Input\ folder next to
     this script's deployment (WheelHouseManager\Input\requirements.in / .txt) -
@@ -42,13 +54,25 @@
     Target wheel platform tag (default: settings.psd1's Platform, else win_amd64).
 
 .PARAMETER PreferCurrent
-    Keep the versions of the current requirements.txt wherever they still fit, so only what
-    has to change changes (uv prefers the pins of an existing output file). Used by
-    Invoke-WheelhouseRemediation.ps1: a fix should not upgrade unrelated packages.
+    Kept for Invoke-WheelhouseRemediation.ps1. Every resolve now keeps the versions of the
+    current requirements.txt wherever they still fit, so only what has to change changes.
 
 .PARAMETER NoProposal
     Do not record a proposal for the result (Invoke-WheelhouseRemediation.ps1 records its
     own, with what to replace and retire).
+
+.PARAMETER NoSetAside
+    Fail (exit code 1, nothing written) instead of setting a requirement aside - for a fix,
+    whose one requirement must resolve.
+
+.PARAMETER ExpeditePackage
+    name==version pins whose cooldown is skipped in the resolve (uv --exclude-newer-package,
+    and the pin is kept at or below that version). The proposal records them, so the publish
+    skips their cooldown too. Needs -ExpediteReason. What the current proposal expedited
+    stays expedited.
+
+.PARAMETER ExpediteReason
+    Why the cooldown is skipped; recorded in the proposal.
 
 .PARAMETER MinimumPackageAgeDays
     Cooldown window passed to `uv pip compile --exclude-newer`. Defaults to the value
@@ -86,12 +110,18 @@ param(
 
     [switch]$PreferCurrent,
 
-    [switch]$NoProposal
+    [switch]$NoProposal,
+
+    [switch]$NoSetAside,
+
+    [string[]]$ExpeditePackage,
+
+    [string]$ExpediteReason
 )
 
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
-$paramNames = @('RequirementsInPath', 'RequirementsTxtPath', 'PythonVersion', 'Platform', 'MinimumPackageAgeDays')
+$paramNames = @('RequirementsInPath', 'RequirementsTxtPath', 'PythonVersion', 'Platform', 'MinimumPackageAgeDays', 'WheelhousePath')
 $whlParams = @{
     'BoundParameters' = $PSBoundParameters
     'Name' = $paramNames
@@ -127,73 +157,145 @@ catch {
 }
 
 # Resolve into a temporary file first - the real requirements.txt is only replaced
-# once the result has passed the wheel check below.
+# once the result has passed the wheel check.
 $targetFolder = Split-Path -Path $cfg.RequirementsTxtPath -Parent
 $candidatePath = Join-Path $targetFolder "requirements.candidate.txt"
 $rejectedPath = Join-Path $targetFolder "requirements.rejected.txt"
+$target = "Python $($cfg.PythonVersion) / $($cfg.Platform)"
+
+# requirements.in is emptied after every successful resolve of the configured file, so it
+# only lists what is new; requirements.txt keeps what was asked for before (until it is
+# published) and is resolved again together with it.
+$configuredIn = (Get-WheelhouseDefaultSetting).RequirementsInPath
+$configuredSetting = (Get-WheelhouseSetting)['RequirementsInPath']
+if ($configuredSetting) { $configuredIn = $configuredSetting }
+$clearInput = [bool]$configuredIn -and ([System.IO.Path]::GetFullPath($cfg.RequirementsInPath) -eq [System.IO.Path]::GetFullPath([string]$configuredIn))
+$denylist = @(Read-WheelhouseDenylist)
+[string[]]$inLines = @(Get-Content -LiteralPath $cfg.RequirementsInPath)
+$previous = $null
+try { $previous = Read-RequirementResolveStatus -RequirementsTxtPath $cfg.RequirementsTxtPath } catch { $previous = $null }
+$inputParams = @{
+    InLine              = $inLines
+    RequirementsTxtPath = $(if ($clearInput) { $cfg.RequirementsTxtPath } else { '' })
+    Denylist            = $denylist
+    SetAside            = $(if ($clearInput -and $previous) { @($previous.set_aside) } else { @() })
+}
+$resolveInput = Get-RequirementResolveInput @inputParams
+foreach ($item in $resolveInput.Ignored) { Write-Log "Already in requirements.txt as $($item.pin) - '$($item.spec)' is ignored." }
+$kept = @($resolveInput.Requirements | Where-Object { $_.source -eq 'kept' })
+if ($kept.Count -gt 0) { Write-Log "Kept from the current requirements.txt (asked for earlier, not published yet): $(($kept | ForEach-Object { $_.spec }) -join ', ')" }
+
+# Cooldown skipped for single packages: -ExpeditePackage, and what the current proposal
+# for requirements.txt expedited (it stays expedited while its pin is kept).
+$expedite = @{}
+$expediteWhy = [string]$ExpediteReason
+foreach ($pin in @(ConvertTo-WheelhousePin -Pin @($ExpeditePackage | Where-Object { $_ }))) { $expedite[$pin.Name] = $pin.Version }
+if ($expedite.Count -gt 0 -and [string]::IsNullOrWhiteSpace($expediteWhy)) {
+    Write-Log '-ExpeditePackage needs -ExpediteReason: say why the cooldown is skipped.' 'ERROR'
+    exit 2
+}
+if ($clearInput -and (Test-Path -LiteralPath $cfg.RequirementsTxtPath -PathType Leaf)) {
+    try {
+        $current = Read-WheelhouseProposal
+        if ($current -and $current.requirements_sha256 -eq (Get-RequirementFileHash -Path $cfg.RequirementsTxtPath)) {
+            foreach ($name in $current.expedite.Keys) { if (-not $expedite.ContainsKey($name)) { $expedite[$name] = [string]$current.expedite[$name] } }
+            if (-not $expediteWhy) { $expediteWhy = $current.expedite_reason }
+        }
+    }
+    catch { Write-Log "The current proposal could not be read ($($_.Exception.Message)); earlier expedited packages are not expedited again." 'WARN' }
+}
 
 $compileArgs = @(
-    "pip", "compile", $cfg.RequirementsInPath,
     "--exclude-newer", "$($cfg.MinimumPackageAgeDays) days",
     "--python-version", $cfg.PythonVersion,
     "--python-platform", $uvPlatform,
     "--only-binary", ":all:",
-    "--custom-compile-command", ".\Update-Requirement.ps1",
-    "-o", $candidatePath
+    "--custom-compile-command", ".\Update-Requirement.ps1"
 )
-
 # Steer the resolver away from versions on the denylist (config\denylist.json).
 # Intake rejects them anyway; this lets uv pick a different version where one fits.
-$constraintsPath = Join-Path $targetFolder "requirements.constraints.tmp"
-[string[]]$constraintLines = Get-DenylistConstraintLine -Denylist @(Read-WheelhouseDenylist)
-if ($constraintLines.Count -gt 0) {
-    Set-Content -Path $constraintsPath -Value $constraintLines -Encoding ascii
-    $compileArgs += @("--constraints", $constraintsPath)
-    Write-Log "Excluding $($constraintLines.Count) denylisted version(s) from resolution."
+[string[]]$constraintLines = Get-DenylistConstraintLine -Denylist $denylist
+if ($constraintLines.Count -gt 0) { Write-Log "Excluding $($constraintLines.Count) denylisted version(s) from resolution." }
+if ($expedite.Count -gt 0) {
+    $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    foreach ($name in ($expedite.Keys | Sort-Object)) {
+        $compileArgs += @('--exclude-newer-package', "$name=$now")
+        $constraintLines = @($constraintLines) + "$name<=$($expedite[$name])"
+    }
+    Write-Log "Cooldown skipped for $(($expedite.Keys | Sort-Object | ForEach-Object { "$_==$($expedite[$_])" }) -join ', '). Reason: $expediteWhy" 'WARN'
 }
 
-if ($PreferCurrent -and (Test-Path -LiteralPath $cfg.RequirementsTxtPath)) {
-    # uv keeps the pins of an existing output file where they still satisfy requirements.in.
-    Copy-Item -LiteralPath $cfg.RequirementsTxtPath -Destination $candidatePath -Force
-    Write-Log 'Keeping the current versions wherever they still fit (only what has to change changes).'
+$preferPath = ''
+if ((Test-Path -LiteralPath $cfg.RequirementsTxtPath -PathType Leaf) -and ([System.IO.File]::ReadAllText($cfg.RequirementsTxtPath)).Trim()) {
+    # uv keeps the pins of the current requirements.txt where they still fit.
+    $preferPath = Join-Path $targetFolder 'requirements.prefer.tmp'
+    Copy-Item -LiteralPath $cfg.RequirementsTxtPath -Destination $preferPath -Force
+    if ($PreferCurrent) { Write-Log 'Keeping the current versions wherever they still fit (only what has to change changes).' }
 }
-Write-Log "Resolving with uv (binary wheels only, $($cfg.PythonVersion) / $uvPlatform)..."
-Invoke-NativeCommand -FilePath uv -ArgumentList $compileArgs
-Remove-Item -Path $constraintsPath -Force -ErrorAction SilentlyContinue
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Log "uv pip compile FAILED (exit code $LASTEXITCODE). Review the output above." "ERROR"
-    Write-Log "Typical cause: a package (or a version range in requirements.in) has no binary wheel for Python $($cfg.PythonVersion) / $($cfg.Platform)." "ERROR"
-    Remove-Item -Path $candidatePath -Force -ErrorAction SilentlyContinue
+Write-Log "Resolving $(@($resolveInput.Requirements).Count) requirement(s) with uv (binary wheels only, $($cfg.PythonVersion) / $uvPlatform)..."
+$resolveParams = @{
+    Requirement    = @($resolveInput.Requirements)
+    OutputPath     = $candidatePath
+    Argument       = $compileArgs
+    ConstraintLine = $constraintLines
+    PreferPath     = $preferPath
+    PythonVersion  = $cfg.PythonVersion
+    Platform       = $cfg.Platform
+    MinimumAgeDays = [int]$cfg.MinimumPackageAgeDays
+}
+try { $resolved = Invoke-RequirementResolve @resolveParams }
+finally { if ($preferPath) { Remove-Item -LiteralPath $preferPath -Force -ErrorAction SilentlyContinue } }
+
+$setAside = @($resolved.SetAside)
+if ($resolved.Ok -and $setAside.Count -gt 0 -and $NoSetAside) {
+    $resolved = @{ Ok = $false; Resolved = @(); SetAside = $setAside; Error = "Could not resolve $(($setAside | ForEach-Object { "$($_.spec) ($($_.reason))" }) -join '; ')." }
+}
+if (-not $resolved.Ok) {
+    if (Test-Path -LiteralPath $candidatePath) { Move-Item -LiteralPath $candidatePath -Destination $rejectedPath -Force }
+    Write-Log "Could not resolve requirements.in: $($resolved.Error)" 'ERROR'
+    Write-Log "requirements.txt was NOT changed. Fix requirements.in and run this script again." 'ERROR'
+    try {
+        $problems = @(Get-RequirementResolveProblem -Lines $inLines -ToolOutput @([string]$resolved.Error) -Target $target)
+        foreach ($item in $setAside) { $problems += [PSCustomObject]@{ spec = $item.spec; ok = $false; status = $item.reason } }
+        Write-RequirementResolveStatus -RequirementsTxtPath $cfg.RequirementsTxtPath -Failed -Message ([string]$resolved.Error) -Problem $problems
+    }
+    catch { Write-Log "Could not record the resolve problems: $($_.Exception.Message)" 'WARN' }
     exit 1
 }
 
-Write-Log "Checking with pip that every resolved package has a usable wheel for Python $($cfg.PythonVersion) / $($cfg.Platform)..."
-$check = Test-RequirementWheelAvailability -RequirementsFilePath $candidatePath -PythonVersion $cfg.PythonVersion -Platform $cfg.Platform
-
-if (-not $check.Passed) {
-    Move-Item -Path $candidatePath -Destination $rejectedPath -Force
-    if ($check.Error) {
-        Write-Log $check.Error "ERROR"
-    }
-    if ($check.Unavailable.Count -gt 0) {
-        Write-Log "The following resolved package(s) cannot be downloaded for Python $($cfg.PythonVersion) / $($cfg.Platform) (no compatible wheel, or Requires-Python excludes $($cfg.PythonVersion)):" "ERROR"
-        foreach ($pin in $check.Unavailable) {
-            Write-Log "  - $pin" "ERROR"
-        }
-        Write-Log "Remove them from requirements.in, or constrain them there to a version that supports Python $($cfg.PythonVersion), then run this script again." "ERROR"
-    }
-    Write-Log "requirements.txt was NOT changed. The rejected result was saved for review: $rejectedPath" "ERROR"
-    exit 1
+if (@($resolved.Resolved).Count -gt 0) {
+    Move-Item -Path $candidatePath -Destination $cfg.RequirementsTxtPath -Force
+    Write-Log "requirements.txt written successfully: $($cfg.RequirementsTxtPath)" "OK"
 }
-
-Move-Item -Path $candidatePath -Destination $cfg.RequirementsTxtPath -Force
+else {
+    Write-TextFileAtomic -Path $cfg.RequirementsTxtPath -Content ''
+    Write-Log 'Nothing could be resolved - requirements.txt is empty.' 'WARN'
+}
 Remove-Item -Path $rejectedPath -Force -ErrorAction SilentlyContinue
 
-Write-Log "requirements.txt written successfully: $($cfg.RequirementsTxtPath)" "OK"
-if (-not $NoProposal) {
+# Set aside now, plus earlier set-aside requirements nobody removed or asked for again.
+$allAside = @($setAside) + @($resolveInput.SetAside)
+if ($setAside.Count -gt 0) {
+    Write-Log "$($setAside.Count) requirement(s) could not be resolved and were set aside - the rest is in requirements.txt. Review them in the Add tab (Remove, or Expedite one that is only too new):" 'WARN'
+    foreach ($item in $setAside) { Write-Log "  $($item.spec): $($item.reason)" 'WARN' }
+}
+Write-RequirementResolveStatus -RequirementsTxtPath $cfg.RequirementsTxtPath -SetAside $allAside
+if ($clearInput) {
     try {
-        [void](New-WheelhouseProposal -RequirementsPath $cfg.RequirementsTxtPath -Kind 'resolve')
+        [string[]]$cleared = Clear-RequirementInFile -Path $cfg.RequirementsInPath
+        if ($cleared.Count -gt 0) { Write-Log "requirements.in emptied - its requirement(s) are now in requirements.txt$(if ($setAside.Count -gt 0) { ' or set aside' })." 'OK' }
+    }
+    catch { Write-Log "Could not empty requirements.in: $($_.Exception.Message)" 'WARN' }
+}
+if (-not $NoProposal -and @($resolved.Resolved).Count -gt 0) {
+    try {
+        $pinned = Read-RequirementFile -FilePath $cfg.RequirementsTxtPath
+        $expedited = @{}
+        foreach ($name in $expedite.Keys) { if ($pinned[$name] -eq $expedite[$name]) { $expedited[$name] = $expedite[$name] } }
+        $proposalParams = @{ RequirementsPath = $cfg.RequirementsTxtPath; Kind = 'resolve' }
+        if ($expedited.Count -gt 0) { $proposalParams['Expedite'] = $expedited; $proposalParams['ExpediteReason'] = $expediteWhy }
+        [void](New-WheelhouseProposal @proposalParams)
     }
     catch {
         Write-Log "The proposal could not be recorded ($($_.Exception.Message)); publishing will propose the file itself." 'WARN'
