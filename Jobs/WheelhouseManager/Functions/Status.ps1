@@ -301,15 +301,17 @@ function Get-WheelhouseAdvisoryItem {
     $now = (Get-Date).ToUniversalTime()
     $records = @($Catalog.Records.Values)
     $problems = @{}
+    $openByKey = @{}
     foreach ($record in $records) {
-        $open = @($record.findings | Where-Object { $_ -and -not $_.resolved_utc })
+        $key = "$($record.name)==$($record.version)"
+        $openByKey[$key] = @($record.findings | Where-Object { $_ -and -not $_.resolved_utc })
         $yanked = $record.checks.pypi -and $record.checks.pypi.status -eq 'Yanked'
-        $problems["$($record.name)==$($record.version)"] = ($record.state -ne 'Published') -or $yanked -or $open.Count -gt 0
+        $problems[$key] = ($record.state -ne 'Published') -or $yanked -or $openByKey[$key].Count -gt 0
     }
     foreach ($record in ($records | Sort-Object name, version)) {
         $key = "$($record.name)==$($record.version)"
         if (-not $problems[$key]) { continue }
-        $open = @($record.findings | Where-Object { $_ -and -not $_.resolved_utc })
+        $open = $openByKey[$key]
         $statuses = @($open | ForEach-Object { Get-CatalogFindingStatus -Finding $_ -NowUtc $now })
         $status = if ($record.state -eq 'Quarantined') { 'quarantined' }
         elseif ($record.state -eq 'Removed') { 'removed' }
@@ -516,9 +518,7 @@ function Test-WheelhouseHealth {
     }
 
     if (-not $Offline) {
-        if ($PSVersionTable.PSEdition -ne 'Core') {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        }
+        Enable-WheelhouseTls12
         foreach ($site in @(@('PyPI', 'https://pypi.org/pypi/pip/json'), @('OSV', 'https://api.osv.dev/v1/vulns/GHSA-j8r2-6x86-q33q'))) {
             try {
                 [void](Invoke-RestMethod -Uri $site[1] -TimeoutSec 20 -ErrorAction Stop)

@@ -278,7 +278,7 @@ function Write-WheelhouseEvent {
 
     $line = ConvertTo-Json -Compress -InputObject ([ordered]@{
             ts      = (Get-Date).ToUniversalTime().ToString('o')
-            user    = $(if ($env:USERNAME) { $env:USERNAME } else { 'unknown' })
+            user    = (Get-WheelhouseUserName)
             action  = $Action
             package = $Package
             version = $Version

@@ -485,6 +485,8 @@ Columns: purpose | returns / side effects | callers. All are exported.
 | `Test-WheelhousePackageName` / `Test-WheelhousePackageVersion` / `Test-WheelhouseWheelFileName` | validate names, versions, bare wheel file names from outside | bool | UI, denylist, scan script |
 | `ConvertTo-WheelhousePin` | `name==version` pins from arrays and comma/semicolon lists; `ArgumentException` otherwise | `{Name; Version}` | Update-Wheelhouse, Test-WheelhousePackage |
 | `ConvertTo-HtmlSafe` | HTML-encode | string | alert HTML |
+| `Enable-WheelhouseTls12` | add TLS 1.2 on Windows PowerShell 5.1 (no-op on 7) | - | PyPI and OSV requests |
+| `Get-WheelhouseUserName` | `$env:USERNAME`, or `unknown` | string | history, journal, denylist, quarantine, waivers |
 | `Write-TextFileAtomic` | write `<path>.tmp`, move over target | file | JSON/settings/group rewrites |
 | `Write-JsonFile` | `ConvertTo-Json` (arrays stay arrays, null -> `[]`) + atomic write | file | manifest, reports, denylist, quarantine |
 | `Invoke-NativeCommand` | run exe, stderr merged as text, lines echoed; `-PassThru` returns lines (`-NoEnumerate`); `$LASTEXITCODE` kept | lines | pip, pip-audit, uv callers |
@@ -609,6 +611,7 @@ The resolve loop of `Update-Requirement.ps1` (sequence in 7.3). It never touches
 | `Get-WheelhouseDenylistPath` | `<root>\config\denylist.json` | defaults, UI |
 | `Read-WheelhouseDenylist` | entries (plain array - fine inside `@()`); damaged -> throws | worker, resolve, checks, UI |
 | `Get-DenylistMatch` | first entry blocking `name==version` (`*` = all) | intake, inventory, remove, add, notices |
+| `Format-DenylistMatch` | `(version, source): reason` of an entry | intake rejections, `Denylisted` notices |
 | `Add-WheelhouseDenylistEntry` | validate, replace same name+version, write sorted | remove, UI |
 | `Remove-WheelhouseDenylistEntry` | remove name+version, optionally only for `-OnlySource` | remove undo, restore, UI |
 | `Get-DenylistConstraintLine` | exact versions as `name!=version` (`-NoEnumerate`) | Update-Requirement |
@@ -633,10 +636,8 @@ The resolve loop of `Update-Requirement.ps1` (sequence in 7.3). It never touches
 | `Restore-WheelhousePackage` | section 9.5 (verify, journal, `Complete-WheelhouseRestoreJournal`, catalog + history); `-KeepDenylist` | UI |
 | `Test-PackageSpec` | allowed `requirements.in` line (name, extras, version operators; <= 200 chars) | `Add-RequirementInLine` |
 | `Add-RequirementInLine` | append valid, new, non-denylisted specs; `-Replace` swaps the line of a listed package (skipped entries say `Replaceable`) | UI add |
-| `Remove-RequirementInLine` | take packages' line(s) out of `requirements.in`; throws before writing if one is not listed (a dependency) | scripts (the UI removes from requirements.txt now) |
 | `Set-RequirementInText` | replace `requirements.in` with the UI's edit box; refuses (writes nothing, returns `Problems` with line numbers) invalid specs, a package listed twice, outright denylisted packages | UI save |
 | `Clear-RequirementInFile` | keep only the comment lines of `requirements.in`; returns the requirements taken out | `Update-Requirement.ps1` after writing requirements.txt, when it resolved the configured `RequirementsInPath` |
-| `Get-RequirementCarryOver` | `name==version` of the requirements.txt pins not in the manifest, not listed in requirements.in and not denylisted (all pins when the wheelhouse is unreachable) | no longer used by `Update-Requirement.ps1` (`Get-RequirementResolveInput` replaced it) |
 | `Test-RequirementTxtDirect` | from `Read-RequirementDependent -IncludeSource` (which keeps the `-r <file>` entries): whether a pin was asked for; no annotation counts as asked for | `Get-WheelhouseUiReviewRow` (`direct`, `requested_by`), `Remove-RequirementTxtPin`, `Get-RequirementResolveInput` |
 | `Get-RequirementResolveProblem` | after a failed resolve: `{spec; ok; status}` per requirements.in line (PyPI name / exact version, `-Unavailable` from the wheel check, names in uv's error output) | `Update-Requirement.ps1` |
 | `Write-RequirementResolveStatus` / `Read-RequirementResolveStatus` | `Input\requirements.status.json` - `set_aside` (requirements the resolve set aside: name, spec, source, reason, kind, expedite) and a failed resolve (`failed`, message, per-line problems); removed when there is neither | `Update-Requirement.ps1` / `GET /api/requirements` (`problems`, `resolve_failure`), `POST /api/requirements/problems/remove` |
@@ -654,6 +655,7 @@ The resolve loop of `Update-Requirement.ps1` (sequence in 7.3). It never touches
 | `Get-WheelhouseThreatDetection` | detections since a time, per resource, with threat name (mock seam) | scan |
 | `Invoke-WheelhouseCopyScan` | copy wheels to local staging, check SHA256 against the manifest, scan the copies, report the share files; changed/uncopyable wheels in `NotScanned` | `Wheelhouse.ScanResult` | Invoke-WheelhouseScan.ps1 |
 | `Invoke-WheelhouseDefenderScan` | scan local paths, match detections (5 s margin) by substring of the scanned path; `Threat` > `Error` > `Clean`; optional `Report_Scan_*`. Never given the share. | intake, `Invoke-WheelhouseCopyScan` |
+| `Save-WheelhouseScanReport` | save a scan result as `Report_Scan_<timestamp>.json` and set its `ReportPath` | `Invoke-WheelhouseDefenderScan`, `Invoke-WheelhouseCopyScan` |
 
 ### 8.13 `Ui.ps1`
 See [section 10](#10-web-ui). Functions: `Get-WheelhouseUiContext` (effective settings, read per

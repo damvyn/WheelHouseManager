@@ -498,7 +498,7 @@ function Remove-WheelhousePackage {
         $affectedGroups = @($allGroups | Where-Object {
                 (Read-RequirementFile -FilePath $_)[$normalized] -eq $Version
             })
-        $user = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
+        $user = Get-WheelhouseUserName
         # "Deleting" a version whose wheels are already gone (e.g. the file server's
         # antivirus took them) only takes it out of the group files and the manifest.
         $alreadyGone = (-not $Quarantine) -and -not ($entries | Where-Object { Test-Path -LiteralPath (Join-Path $WheelhousePath ([string]$_.file)) })
@@ -877,7 +877,7 @@ function Restore-WheelhousePackage {
         $data = [ordered]@{ id = $Id; name = [string]$record.name; version = [string]$record.version; record = $record; folder = $folder; keep_denylist = [bool]$KeepDenylist }
         $journal = New-WheelhouseJournal -WheelhousePath $WheelhousePath -Operation 'restore' -Data $data
         $denyRemoved = Complete-WheelhouseRestoreJournal -WheelhousePath $WheelhousePath -Data $data -DenylistPath $DenylistPath
-        $user = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
+        $user = Get-WheelhouseUserName
         $change = [PSCustomObject]@{
             Name    = [string]$record.name
             Version = [string]$record.version
@@ -990,41 +990,6 @@ function Add-RequirementInLine {
         Write-TextFileAtomic -Path $Path -Content ($lines -join "`r`n")
     }
     return @{ Added = $added.ToArray(); Replaced = $replaced.ToArray(); Skipped = $skipped.ToArray() }
-}
-
-function Remove-RequirementInLine {
-    # Takes packages out of requirements.in (every line that names one; names compare
-    # normalized) and returns the removed lines. Throws, before writing, when a package is
-    # not listed - it is then a dependency of another requirement.
-    [CmdletBinding(SupportsShouldProcess)]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path,
-
-        [Parameter(Mandatory)]
-        [string[]]$Name
-    )
-
-    $lines = [System.Collections.Generic.List[string]]::new()
-    if (Test-Path -LiteralPath $Path) { foreach ($item in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) { $lines.Add([string]$item) } }
-    $removed = [System.Collections.Generic.List[string]]::new()
-    foreach ($item in $Name) {
-        $found = $false
-        while ($true) {
-            $current = Get-RequirementInLine -Lines $lines.ToArray() -Name $item
-            if (-not $current) { break }
-            $found = $true
-            $removed.Add($current.Line.Trim())
-            $lines.RemoveAt($current.Index)
-        }
-        if (-not $found) {
-            throw [System.Collections.Generic.KeyNotFoundException]::new("'$(Get-NormalizedPackageName $item)' is not listed in requirements.in: another requirement depends on it. Remove or change that requirement instead.")
-        }
-    }
-    if ($PSCmdlet.ShouldProcess($Path, "Remove $($Name -join ', ')")) {
-        Write-TextFileAtomic -Path $Path -Content ($lines -join "`r`n")
-    }
-    Write-Output -NoEnumerate $removed.ToArray()
 }
 
 function Set-RequirementInText {
@@ -1143,48 +1108,6 @@ function Remove-RequirementTxtPin {
         Write-TextFileAtomic -Path $Path -Content ($kept -join "`r`n")
     }
     Write-Output -NoEnumerate ([string[]]@($drop.Keys | Sort-Object))
-}
-
-function Get-RequirementCarryOver {
-    # The pins of the current requirements.txt that are still waiting to be published (not in
-    # the manifest), as "name==version" lines to resolve again together with requirements.in -
-    # which is emptied after every resolve, so they would otherwise drop out of requirements.txt.
-    # Left out: names requirements.in lists itself, and versions the denylist blocks. Without
-    # a reachable wheelhouse every pin counts as waiting.
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$RequirementsInPath,
-
-        [Parameter(Mandatory)]
-        [string]$RequirementsTxtPath,
-
-        [AllowEmptyString()]
-        [string]$WheelhousePath,
-
-        [AllowEmptyCollection()]
-        [object[]]$Denylist = @()
-    )
-
-    $none = [string[]]@()
-    if (-not (Test-Path -LiteralPath $RequirementsTxtPath -PathType Leaf) -or -not ([System.IO.File]::ReadAllText($RequirementsTxtPath)).Trim()) { Write-Output -NoEnumerate $none; return }
-    $pins = Read-RequirementFile -FilePath $RequirementsTxtPath
-    $published = @{}
-    if ($WheelhousePath -and (Test-Path -LiteralPath $WheelhousePath -PathType Container)) {
-        $manifest = Read-WheelhouseManifest -WheelhousePath $WheelhousePath
-        foreach ($entry in $manifest) { $published["$(Get-NormalizedPackageName ([string]$entry.name))==$($entry.version)"] = $true }
-    }
-    $inLines = @()
-    if (Test-Path -LiteralPath $RequirementsInPath -PathType Leaf) { $inLines = @(Get-Content -LiteralPath $RequirementsInPath) }
-    $carry = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in ($pins.Keys | Sort-Object)) {
-        $version = [string]$pins[$name]
-        if ($published.ContainsKey("$name==$version")) { continue }
-        if (Get-RequirementInLine -Lines ([string[]]$inLines) -Name $name) { continue }
-        if (Get-DenylistMatch -Name $name -Version $version -Denylist $Denylist) { continue }
-        $carry.Add("$name==$version")
-    }
-    Write-Output -NoEnumerate $carry.ToArray()
 }
 
 function Clear-RequirementInFile {

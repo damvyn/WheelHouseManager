@@ -3093,7 +3093,7 @@ Describe 'WheelhouseManager' {
         }
     }
 
-    Context 'Requirement carry-over and cleanup' {
+    Context 'Requirement dependents and cleanup' {
         It 'reads the via annotations and tells asked-for pins from dependencies' {
             $txt = Join-Path (Get-TestFolder) 'requirements.txt'
             Set-Content -Path $txt -Value @('# header', 'Foo_Bar==1.0', '    # via', '    #   -r requirements.in', '    #   baz', 'baz==2.0', '    # via -r x.in', 'dep==3.0', '    # via Foo-Bar', 'plain==4.0')
@@ -3107,20 +3107,6 @@ Describe 'WheelhouseManager' {
             Test-RequirementTxtDirect -Source $sources['foo-bar'] | Should -Be $true
             Test-RequirementTxtDirect -Source $sources['dep'] | Should -Be $false
             Test-RequirementTxtDirect -Source @() | Should -Be $true
-        }
-
-        It 'carries over the pins that are not published, not listed again and not denylisted' {
-            $wheelhouse = Get-TestWheelhouse
-            $folder = Get-TestFolder
-            $in = Join-Path $folder 'requirements.in'
-            $txt = Join-Path $folder 'requirements.txt'
-            [IO.File]::WriteAllText($in, "# header`r`nrequests>=2.33")
-            Set-Content -Path $txt -Value @('six==1.16.0', 'requests==2.32.3', 'accelerate==1.15.0', 'torch==2.9.0')
-            $deny = @([PSCustomObject]@{ name = 'accelerate'; version = '1.15.0'; reason = 'Test'; source = 'quarantined' })
-
-            [string[]]$carry = Get-RequirementCarryOver -RequirementsInPath $in -RequirementsTxtPath $txt -WheelhousePath $wheelhouse -Denylist $deny
-
-            $carry -join '|' | Should -Be 'torch==2.9.0'
         }
 
         It 'empties requirements.in down to its comments' {
@@ -3199,29 +3185,6 @@ Describe 'WheelhouseManager' {
             Get-Content -Path $txt -Raw | Should -BeNullOrEmpty
             Test-Path -Path (Join-Path $folder 'requirements.status.json') | Should -Be $false
             Test-Path -Path (Join-Path $folder 'proposal-history.jsonl') | Should -Be $true
-        }
-    }
-
-    Context 'Remove-RequirementInLine' {
-        It 'removes the package by its normalized name and keeps the other lines' {
-            $path = Join-Path (Get-TestFolder) 'requirements.in'
-            [IO.File]::WriteAllText($path, "# comment`r`nnumpy>=2.0`r`nRequests == 2.32.3  # pinned`r`npandas")
-
-            [string[]]$removed = Remove-RequirementInLine -Path $path -Name 'requests'
-
-            $removed -join '|' | Should -Be 'Requests == 2.32.3  # pinned'
-            (Get-Content -Path $path) -join '|' | Should -Be '# comment|numpy>=2.0|pandas'
-        }
-
-        It 'removes several packages, and nothing when one of them is not listed' {
-            $path = Join-Path (Get-TestFolder) 'requirements.in'
-            [IO.File]::WriteAllText($path, "# comment`r`nnumpy>=2.0`r`npandas")
-            { Remove-RequirementInLine -Path $path -Name @('numpy', 'urllib3') } | Should -Throw '*depends on it*'
-            (Get-Content -Path $path) -join '|' | Should -Be '# comment|numpy>=2.0|pandas'
-
-            [string[]]$removed = Remove-RequirementInLine -Path $path -Name @('numpy', 'pandas')
-            $removed -join '|' | Should -Be 'numpy>=2.0|pandas'
-            (Get-Content -Path $path) -join '|' | Should -Be '# comment'
         }
     }
 

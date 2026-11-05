@@ -270,6 +270,18 @@ function Invoke-WheelhouseSync {
                 Write-Log "$LocalRequirementsPath has no '# via' annotations (compiled with --no-annotate?): a package is not held back when one of its dependencies is rejected." 'WARN'
             }
         }
+        # The intake settings every group (and the overwrite) shares.
+        $intakeBase = @{
+            ReportsFolder       = $ReportsFolder
+            Services            = $Services
+            MinimumAgeDays      = $MinimumAgeDays
+            PythonVersion       = $PythonVersion
+            Platform            = $Platform
+            Denylist            = $denylist
+            RequireDefenderScan = [bool]$RequireDefenderScan
+            SkipDefenderScan    = [bool]$SkipDefenderScan
+            StagingRoot         = $StagingRoot
+        }
         $groupRuns = [System.Collections.Generic.List[object]]::new()
         try {
             foreach ($groupFile in $targetGroups) {
@@ -303,20 +315,10 @@ function Invoke-WheelhouseSync {
                     if ($Expedite.ContainsKey($name) -and $Expedite[$name] -eq $candidates[$name]) { $expediteUsed[$name] = $true }
                 }
 
-                $intakeParams = @{
-                    Packages            = $candidates
-                    GroupName           = $groupName
-                    ReportsFolder       = $ReportsFolder
-                    Services            = $Services
-                    MinimumAgeDays      = $MinimumAgeDays
-                    PythonVersion       = $PythonVersion
-                    Platform            = $Platform
-                    Denylist            = $denylist
-                    Expedite            = $Expedite
-                    RequireDefenderScan = [bool]$RequireDefenderScan
-                    SkipDefenderScan    = [bool]$SkipDefenderScan
-                    StagingRoot         = $StagingRoot
-                }
+                $intakeParams = $intakeBase.Clone()
+                $intakeParams['Packages'] = $candidates
+                $intakeParams['GroupName'] = $groupName
+                $intakeParams['Expedite'] = $Expedite
                 $intake = Invoke-CandidateIntake @intakeParams
                 foreach ($result in $intake.AuditResults) { $auditResults.Add($result) }
                 $groupRuns.Add([PSCustomObject]@{ GroupFile = $groupFile; GroupName = $groupName; Additions = $additions; Intake = $intake })
@@ -395,13 +397,6 @@ function Invoke-WheelhouseSync {
                             Reason     = $item.Reason
                             Dependency = $(if ($item.PSObject.Properties['Dependency']) { $item.Dependency } else { $null })
                         })
-                    # A download that differed from PyPI or was detected by Defender is a
-                    # security event, not just a rejection.
-                    if ($item.Category -in 'integrity', 'defender') {
-                        $notices.Add((New-WheelhouseNotice -Kind 'IntakeBlocked' -Package $item.Name -Version $item.Version -Message $item.Reason))
-                    }
-                    if ($item.Category -eq 'audit-error') { $auditIncomplete = $true }
-                    $overallPassed = $false
                 }
             }
         }
@@ -427,21 +422,11 @@ function Invoke-WheelhouseSync {
         }
         if ($overwritePins.Count -gt 0) {
             Write-Log "--- Overwrite: $(($overwritePins.Keys | Sort-Object | ForEach-Object { "$_==$($overwritePins[$_])" }) -join ', ') - downloaded again and checked like new packages ---"
-            $overwriteParams = @{
-                Packages            = $overwritePins
-                GroupName           = 'overwrite'
-                ReportsFolder       = $ReportsFolder
-                Services            = $Services
-                MinimumAgeDays      = $MinimumAgeDays
-                PythonVersion       = $PythonVersion
-                Platform            = $Platform
-                Denylist            = $denylist
-                # These versions passed the cooldown when they were published.
-                Expedite            = $overwritePins
-                RequireDefenderScan = [bool]$RequireDefenderScan
-                SkipDefenderScan    = [bool]$SkipDefenderScan
-                StagingRoot         = $StagingRoot
-            }
+            $overwriteParams = $intakeBase.Clone()
+            $overwriteParams['Packages'] = $overwritePins
+            $overwriteParams['GroupName'] = 'overwrite'
+            # These versions passed the cooldown when they were published.
+            $overwriteParams['Expedite'] = $overwritePins
             $overwriteIntake = Invoke-CandidateIntake @overwriteParams
             foreach ($result in $overwriteIntake.AuditResults) { $auditResults.Add($result) }
             $overwritten = Publish-OverwriteIntake -Intake $overwriteIntake -WheelhousePath $WheelhousePath -DenylistPath $DenylistPath -TimeoutSeconds $LockTimeoutSeconds
@@ -457,12 +442,17 @@ function Invoke-WheelhouseSync {
                         Reason     = $item.Reason
                         Dependency = $null
                     })
-                if ($item.Category -in 'integrity', 'defender') {
-                    $notices.Add((New-WheelhouseNotice -Kind 'IntakeBlocked' -Package $item.Name -Version $item.Version -Message $item.Reason))
-                }
-                if ($item.Category -eq 'audit-error') { $auditIncomplete = $true }
-                $overallPassed = $false
             }
+        }
+
+        # Every rejection needs attention. A download that differed from PyPI or was detected
+        # by Defender is a security event, not just a rejection; a failed audit is an error.
+        foreach ($row in $rejectedAll) {
+            if ($row.Category -in 'integrity', 'defender') {
+                $notices.Add((New-WheelhouseNotice -Kind 'IntakeBlocked' -Package $row.Package -Version $row.Version -Message $row.Reason))
+            }
+            if ($row.Category -eq 'audit-error') { $auditIncomplete = $true }
+            $overallPassed = $false
         }
 
         # Only this run's candidates were audited and scanned. What was published before is

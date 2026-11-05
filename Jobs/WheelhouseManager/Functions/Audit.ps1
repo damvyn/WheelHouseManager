@@ -303,11 +303,7 @@ function Get-PyPIReleaseInfo {
         [string]$Version
     )
 
-    # Windows PowerShell 5.1 on older .NET Framework defaults to TLS 1.0/1.1, which
-    # pypi.org rejects - every check would then fail closed.
-    if ($PSVersionTable.PSEdition -ne 'Core') {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    }
+    Enable-WheelhouseTls12
 
     $response = Invoke-RestMethod -Uri "https://pypi.org/pypi/$Name/$Version/json" -ErrorAction Stop
     $files = @(foreach ($url in @($response.urls)) {
@@ -455,8 +451,7 @@ function Get-DeployedPackageNotice {
 
         $blocked = Get-DenylistMatch -Name $name -Version $version -Denylist $Denylist
         if ($blocked) {
-            $why = if ($blocked.reason) { ": $($blocked.reason)" } else { '' }
-            $notices.Add((New-WheelhouseNotice -Kind 'Denylisted' -Package $name -Version $version -File $files -Message "Blocked by the denylist ($($blocked.version), $($blocked.source))$why, but still published."))
+            $notices.Add((New-WheelhouseNotice -Kind 'Denylisted' -Package $name -Version $version -File $files -Message "Blocked by the denylist $(Format-DenylistMatch -Entry $blocked), but still published."))
         }
 
         if ($SkipYanked) { continue }
@@ -579,9 +574,7 @@ function Get-PyPIProjectRelease {
         [string]$Name
     )
 
-    if ($PSVersionTable.PSEdition -ne 'Core') {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    }
+    Enable-WheelhouseTls12
     $response = Invoke-RestMethod -Uri "https://pypi.org/pypi/$([uri]::EscapeDataString($Name))/json" -TimeoutSec 60 -ErrorAction Stop
     foreach ($property in $response.releases.PSObject.Properties) {
         $files = @(@($property.Value) | Where-Object { $_ })

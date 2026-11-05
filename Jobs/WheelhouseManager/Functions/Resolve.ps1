@@ -37,8 +37,8 @@ function Invoke-UvCompile {
 }
 
 function Get-UvRequiredName {
-    # The requirements uv's error output blames: every "you require X" (normalized names,
-    # in the order uv names them). Empty when the output names none.
+    # The requirements uv's error output blames: every "you require X", then every "X was not
+    # found in the package registry" (normalized, each once). Empty when the output names none.
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
@@ -48,13 +48,15 @@ function Get-UvRequiredName {
 
     $text = (@($Output) -join ' ') -replace '\s+', ' '
     $names = [System.Collections.Generic.List[string]]::new()
-    foreach ($match in [regex]::Matches($text, '(?i)you require (?<name>[A-Za-z0-9][A-Za-z0-9._-]*)')) {
-        $name = Get-NormalizedPackageName $match.Groups['name'].Value
-        if (-not $names.Contains($name)) { $names.Add($name) }
-    }
-    foreach ($match in [regex]::Matches($text, '(?i)because (?<name>[A-Za-z0-9][A-Za-z0-9._-]*) was not found in the package registry')) {
-        $name = Get-NormalizedPackageName $match.Groups['name'].Value
-        if (-not $names.Contains($name)) { $names.Add($name) }
+    $patterns = @(
+        '(?i)you require (?<name>[A-Za-z0-9][A-Za-z0-9._-]*)'
+        '(?i)because (?<name>[A-Za-z0-9][A-Za-z0-9._-]*) was not found in the package registry'
+    )
+    foreach ($pattern in $patterns) {
+        foreach ($match in [regex]::Matches($text, $pattern)) {
+            $name = Get-NormalizedPackageName $match.Groups['name'].Value
+            if (-not $names.Contains($name)) { $names.Add($name) }
+        }
     }
     Write-Output -NoEnumerate $names.ToArray()
 }
