@@ -1082,42 +1082,6 @@ function Set-RequirementInText {
     return @{ Problems = $problems.ToArray(); Requirements = $requirements.ToArray() }
 }
 
-function Get-RequirementTxtSource {
-    # Reads the "# via" annotations uv writes under each pin of requirements.txt: a hashtable
-    # normalized name -> string[] of what requires it ("-r <file>" for a requirement listed in
-    # the input, otherwise package names, normalized). A pin without an annotation gets an
-    # empty list.
-    [CmdletBinding()]
-    [OutputType([hashtable])]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    $sources = @{}
-    $current = $null
-    $inList = $false
-    foreach ($raw in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
-        $line = [string]$raw
-        if ($line -match '^(?<name>[A-Za-z0-9][A-Za-z0-9_.\-]*)\s*(\[[^\]]*\])?\s*==') {
-            $current = Get-NormalizedPackageName $Matches['name']
-            $sources[$current] = [System.Collections.Generic.List[string]]::new()
-            $inList = $false
-            continue
-        }
-        if (-not $current -or $line -notmatch '^\s+#\s*(?<text>.*)$') { $current = $null; $inList = $false; continue }
-        $text = $Matches['text'].Trim()
-        if ($text -eq 'via') { $inList = $true; continue }
-        if ($text -match '^via\s+(?<what>.+)$') { $text = $Matches['what'].Trim(); $inList = $false }
-        elseif (-not $inList) { continue }
-        if ($text -match '^-r\s') { $sources[$current].Add($text) }
-        elseif ($text -match '^(?<dep>[A-Za-z0-9][A-Za-z0-9_.\-]*)') { $sources[$current].Add((Get-NormalizedPackageName $Matches['dep'])) }
-    }
-    $result = @{}
-    foreach ($key in $sources.Keys) { $result[$key] = [string[]]$sources[$key].ToArray() }
-    return $result
-}
-
 function Test-RequirementTxtDirect {
     # Whether a pin of requirements.txt was asked for (listed in the input) rather than only
     # pulled in by another package. Without an annotation it counts as asked for.
@@ -1144,17 +1108,18 @@ function Remove-RequirementTxtPin {
         [string[]]$Name
     )
 
-    $sources = Get-RequirementTxtSource -Path $Path
+    $sources = Read-RequirementDependent -FilePath $Path -IncludeSource
+    $pins = Read-RequirementFile -FilePath $Path
     $drop = @{}
     foreach ($item in $Name) {
         $normalized = Get-NormalizedPackageName $item
-        if (-not $sources.ContainsKey($normalized)) { throw [System.Collections.Generic.KeyNotFoundException]::new("'$normalized' is not pinned in requirements.txt.") }
+        if (-not $pins.ContainsKey($normalized)) { throw [System.Collections.Generic.KeyNotFoundException]::new("'$normalized' is not pinned in requirements.txt.") }
         $drop[$normalized] = $true
     }
     do {
         $more = $false
         foreach ($key in @($sources.Keys)) {
-            if ($drop.ContainsKey($key)) { continue }
+            if ($drop.ContainsKey($key) -or -not $pins.ContainsKey($key)) { continue }
             $from = @($sources[$key])
             if ($from.Count -eq 0 -or (Test-RequirementTxtDirect -Source $from)) { continue }
             if (@($from | Where-Object { -not $drop.ContainsKey($_) }).Count -eq 0) { $drop[$key] = $true; $more = $true }

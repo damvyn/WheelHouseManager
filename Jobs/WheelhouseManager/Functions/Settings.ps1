@@ -25,6 +25,7 @@ function Get-WheelhouseDefaultSetting {
         SmtpServer            = ''
         MailTo                = 'servicedesk@company.com'
         MailFrom              = 'NoReply@company.com'
+        DefenderScanAtIntake         = $true
         RequireDefenderScanAtIntake  = $false
         AutoQuarantine               = $true
         DueDaysCritical              = 3
@@ -33,6 +34,7 @@ function Get-WheelhouseDefaultSetting {
         DueDaysLow                   = 90
         WaiverMaxDays                = 90
         AuditFreshnessDays           = 8
+        AuditMaxAgeDays              = 7
         OverdueReminderDays          = 7
         ApprovalMode                 = 'SamePersonAllowed'
         EventLog                     = $false
@@ -255,6 +257,7 @@ function Get-WheelhouseSettingSchema {
         @{ Key = 'SmtpServer'; Type = 'string'; Label = 'SMTP server'; Help = 'Empty: alerts are saved as HTML instead of emailed.' }
         @{ Key = 'MailTo'; Type = 'string'; Label = 'Alert recipient'; Help = 'Where vulnerability alerts go.' }
         @{ Key = 'MailFrom'; Type = 'string'; Label = 'Alert sender'; Help = 'From address of alert mails.' }
+        @{ Key = 'DefenderScanAtIntake'; Type = 'bool'; Label = 'Scan new packages with Defender'; Help = 'On (default): every new download is scanned with Microsoft Defender before it is published. Off: the scan is skipped and each update logs a warning - only for test setups; the file server''s antivirus still scans the share.' }
         @{ Key = 'RequireDefenderScanAtIntake'; Type = 'bool'; Label = 'Require a Defender scan at intake'; Help = 'On: a new package is rejected when its download cannot be scanned (for example, the run is not elevated). Off: it is published with a warning.' }
         @{ Key = 'AutoQuarantine'; Type = 'bool'; Label = 'Take out changed or removed wheels automatically'; Help = 'On: a published wheel that disappeared from the share (e.g. removed by the file server''s antivirus) is taken out of the group files and denylisted; one whose content changed is quarantined. Off: it is only reported, and updates stop until someone acts. An alert is sent either way. Override per run with -AutoQuarantine On|Off. The same switch quarantines a published version that OSV lists as a malicious package (MAL-*).' }
         @{ Key = 'DueDaysCritical'; Type = 'int'; Label = 'Fix within (days): Critical'; Min = 1; Max = 365; Help = 'How long a Critical vulnerability may stay open before it is overdue and escalated.' }
@@ -263,6 +266,7 @@ function Get-WheelhouseSettingSchema {
         @{ Key = 'DueDaysLow'; Type = 'int'; Label = 'Fix within (days): Low'; Min = 1; Max = 365; Help = 'How long a Low vulnerability may stay open.' }
         @{ Key = 'WaiverMaxDays'; Type = 'int'; Label = 'Longest waiver (days)'; Min = 1; Max = 365; Help = 'An accepted risk must be reviewed again after at most this many days.' }
         @{ Key = 'AuditFreshnessDays'; Type = 'int'; Label = 'Audit freshness (days)'; Min = 1; Max = 365; Help = 'A published version without a completed audit for this long is Unverified and alerted; the UI warns when the scheduled check has not run for this long.' }
+        @{ Key = 'AuditMaxAgeDays'; Type = 'int'; Label = 'Run the weekly check early after (days)'; Min = 1; Max = 365; Help = 'Updates audit only their new packages. When a published version has had no completed audit for this long, whm and the web UI say so and run the weekly check now: its Scheduled Task if registered, otherwise Test-Wheelhouse.ps1 in the background. Its results appear in the UI and its alert is emailed or saved as a file.' }
         @{ Key = 'EventLog'; Type = 'bool'; Label = 'Write to the Windows Event Log'; Help = 'On: run results (IDs 1000 OK, 1001 needs attention, 1002 failed), automatic actions (1003) and changes by people (1004) also go to the Application log, source WheelhouseManager, for central monitoring. The source is created by Setup.ps1 -EnableEventLog, run once as administrator.' }
         @{ Key = 'ApprovalMode'; Type = 'choice'; Label = 'Approval of changes'; Options = @('SamePersonAllowed', 'SeparateApprover'); Help = 'Who may approve a resolved requirements.txt (or a fix) before it is published. SamePersonAllowed: anyone, also whoever requested it - publishing counts as approving; who did it is recorded. SeparateApprover: another account than the requester must approve it first.' }
         @{ Key = 'OverdueReminderDays'; Type = 'int'; Label = 'Overdue reminder (days)'; Min = 1; Max = 365; Help = 'An overdue vulnerability is alerted again after this many days. New, overdue and resolved findings are alerted once.' }

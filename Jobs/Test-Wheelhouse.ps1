@@ -309,6 +309,12 @@ try {
         }
     }
 
+    # Name the published packages that need a version a notice is about (they stay published).
+    if ($notices.Count -gt 0) {
+        try { [void](Add-WheelhouseNoticeDependent -Notice $notices.ToArray() -Catalog (Read-WheelhouseCatalog -WheelhousePath $cfg.WheelhousePath)) }
+        catch { Write-Log "Could not look up the packages that depend on the reported versions: $($_.Exception.Message)" 'WARN' }
+    }
+
     # -----------------------------------------------------------------------
     # Step 6: alert on anything new or any failed check, in one call
     # -----------------------------------------------------------------------

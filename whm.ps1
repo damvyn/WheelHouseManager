@@ -105,10 +105,15 @@ $exitCode = 0
 
 try {
     $cfg = Resolve-WheelhouseParameter -BoundParameters @{} -Name @((Get-WheelhouseDefaultSetting).Keys)
+    # Every command except those that audit anyway (and help, and the UI, which checks on
+    # its own start): audits older than AuditMaxAgeDays -> a warning and a background audit.
+    if ($Command.ToLowerInvariant() -notin 'help', 'audit', 'check', 'ui', 'doctor') {
+        [void](Invoke-WheelhouseStartupAuditCheck)
+    }
     switch ($Command.ToLowerInvariant()) {
         'status' {
             if (-not $cfg.WheelhousePath) { throw 'WheelhousePath is not set - run Setup.ps1 -WheelhousePath ... or whm doctor.' }
-            $status = Get-WheelhouseStatus -WheelhousePath $cfg.WheelhousePath -FreshnessDays ([int]$cfg.AuditFreshnessDays)
+            $status = Get-WheelhouseStatus -WheelhousePath $cfg.WheelhousePath -FreshnessDays ([int]$cfg.AuditFreshnessDays) -AuditMaxAgeDays ([int]$cfg.AuditMaxAgeDays)
             Write-Host "Wheelhouse $($cfg.WheelhousePath)"
             Write-Host ("  {0} package(s), {1} published version(s) in {2} group file(s); {3} quarantined" -f $status.Packages, $status.Published, $status.Groups, $status.Quarantined)
             Write-Host ("  Vulnerabilities: {0} open ({1} overdue), {2} waived; {3} yanked; {4} unverified" -f $status.Open, $status.Overdue, $status.Waived, $status.Yanked, $status.Unverified)

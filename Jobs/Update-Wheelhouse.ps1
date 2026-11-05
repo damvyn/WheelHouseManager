@@ -34,16 +34,19 @@
         vulnerability audit, PyPI's yanked flag, the package-age (cooldown) check and
         the download into a staging folder outside the wheelhouse. Each downloaded file
         must match the sha256 PyPI publishes for it and pass a Microsoft Defender scan
-        before it is copied into the wheelhouse - clients never see an unchecked file.
-        Each package is judged on its own. A package that fails a step is rejected with
-        the reason (log + Report_Rejected_<timestamp>.json) and never holds back the
-        others. Only packages whose wheel was actually downloaded are written into the
+        (unless the setting DefenderScanAtIntake is off) before it is copied into the
+        wheelhouse - clients never see an unchecked file. A package that fails a step is
+        rejected with the reason (log + Report_Rejected_<timestamp>.json), and so is every
+        package that needs it (the "# via" lines of requirements.txt, category
+        "dependency"), in any group; the others are published. Every group is checked
+        before any is published. Only packages whose wheel was actually downloaded are written into the
         group file - a group file never lists a package that isn't in the wheelhouse.
         A rejected new package stays in the local requirements file and is simply
         tried again on the next run (e.g. once its cooldown has passed).
 
-      - Every group that already existed is then audited as deployed (vulnerability
-        check, no download).
+      - Only the new packages are audited and scanned. Published versions are re-audited
+        by the weekly check (Test-Wheelhouse.ps1), and whm / the web UI start an audit in
+        the background when the last one is older than AuditMaxAgeDays.
 
       - Downloads use pip's --no-deps: group files come from `uv pip compile`, so every
         transitive dependency is already pinned in them and goes through the same
@@ -168,7 +171,7 @@ param(
 Import-Module (Join-Path $PSScriptRoot 'WheelhouseManager') -ErrorAction Stop
 
 $cfg = Resolve-WheelhouseParameter -BoundParameters $PSBoundParameters `
-    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays, ApprovalMode
+    -Name WheelhousePath, LocalRequirementsPath, PythonVersion, Platform, MinimumPackageAgeDays, VulnerabilityServices, ReportRetentionMonths, DefenderScanAtIntake, RequireDefenderScanAtIntake, AutoQuarantine, DueDaysCritical, DueDaysHigh, DueDaysMedium, DueDaysLow, AuditFreshnessDays, ApprovalMode
 
 $title = 'Wheelhouse maintenance script'
 $outcome = $null
@@ -202,6 +205,7 @@ try {
         Expedite              = $expedite
         ExpediteReason        = [string]$ExpediteReason
         RequireDefenderScan   = [bool]$cfg.RequireDefenderScanAtIntake
+        SkipDefenderScan      = -not (ConvertTo-WheelhouseBoolean $cfg.DefenderScanAtIntake)
         # -AutoQuarantine On|Off wins over the setting (a bool).
         AutoQuarantine        = ConvertTo-WheelhouseBoolean $cfg.AutoQuarantine
         ApprovalMode          = [string]$cfg.ApprovalMode

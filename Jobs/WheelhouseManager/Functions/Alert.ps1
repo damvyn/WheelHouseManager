@@ -52,6 +52,8 @@ function New-WheelhouseNotice {
         Files      = @($File)
         Message    = $Message
         Action     = $Action
+        # Published packages that need this version (Add-WheelhouseNoticeDependent).
+        NeededBy   = [string[]]@()
     }
 }
 
@@ -216,6 +218,10 @@ function ConvertTo-VulnerabilityAlertHtml {
             if ($finding.Deployed) {
                 $recommendation = "1) Remove or update the line <code>$(ConvertTo-HtmlSafe $requirementsLine)</code> in $(ConvertTo-HtmlSafe $groupFiles)$fixNote"
                 $recommendation += "<br/>2) Move the following wheel file(s) to the quarantine folder:<br/>$quarantineFilesHtml"
+                $neededBy = @($finding.PSObject.Properties['NeededBy'] | ForEach-Object { $_.Value } | Where-Object { $_ })
+                if ($neededBy.Count -gt 0) {
+                    $recommendation += "<br/><b>Needed by published package(s):</b> $(($neededBy | ForEach-Object { ConvertTo-HtmlSafe $_ }) -join '; '). Removing this version without a replacement breaks their installs - prefer the fix version (whm fix / UI: Fix)."
+                }
             }
             else {
                 $recommendation = "<b>Blocked before download</b> - this version was NOT added to the wheelhouse ($(ConvertTo-HtmlSafe $groupFiles)). "

@@ -8,7 +8,9 @@ function Invoke-CandidateIntake {
     # and decides per package:
     #   Verified - passed everything; its downloaded files wait in the staging folder.
     #   Rejected - failed a step (with the reason and a category).
-    # A package that fails never holds back the others. Publish-CandidateIntake then
+    # Each package is checked on its own here; Invoke-WheelhouseSync then holds back the
+    # verified packages that need a rejected one (Get-DependentRejection, category
+    # 'dependency') before anything is published. Publish-CandidateIntake then
     # publishes the verified ones (and deletes the staging folder), so a group file
     # never lists a package whose wheel was not published.
     #
@@ -59,6 +61,10 @@ function Invoke-CandidateIntake {
         # Reject packages whose download could not be scanned with Defender, instead of
         # publishing them with a warning.
         [switch]$RequireDefenderScan,
+
+        # Skip the Defender scan of the downloads (setting DefenderScanAtIntake off - test
+        # setups). Wins over -RequireDefenderScan.
+        [switch]$SkipDefenderScan,
 
         # Downloads wait here (one subfolder per run) until they passed every check. Kept
         # off the wheelhouse share, and off %TEMP%, whose 8.3 short names would not match
@@ -237,7 +243,10 @@ function Invoke-CandidateIntake {
         }
 
         # --- 5. Defender scan of the staged files -------------------------------------
-        if ($filesByName.Count -gt 0) {
+        if ($filesByName.Count -gt 0 -and $SkipDefenderScan) {
+            Write-Log "The Defender scan at intake is turned off (setting DefenderScanAtIntake): $($filesByName.Count) package(s) are published without it." 'WARN'
+        }
+        elseif ($filesByName.Count -gt 0) {
             $scan = Invoke-WheelhouseDefenderScan -Path @($staging) -ReportsFolder $ReportsFolder
             if ($scan.Status -eq 'Threat') {
                 $threats = @($scan.Threats)

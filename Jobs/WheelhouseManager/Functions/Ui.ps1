@@ -72,8 +72,9 @@ function Get-WheelhouseUiToolStatus {
 function Get-WheelhouseUiPendingPin {
     # What publishing requirements.txt would add: its pins (-Pin, name -> version) that are not
     # in the wheelhouse yet, as { name; version; rejected (the latest update's reason or $null);
-    # retryable (rejected only for the cooldown, so publishing again can pass); direct (asked
-    # for, per requirements.txt's "# via" annotations - otherwise only a dependency) }. Without a
+    # retryable (rejected only for the cooldown - its own, or a dependency's it waits for - so
+    # publishing again can pass); direct (asked for, per requirements.txt's "# via" annotations -
+    # otherwise only a dependency); requested_by ("User input" or the pins that need it) }. Without a
     # reachable wheelhouse every pin is pending.
     [CmdletBinding()]
     param(
@@ -103,7 +104,7 @@ function Get-WheelhouseUiPendingPin {
     }
     $sources = @{}
     $txtPath = [string]$Context.Settings.LocalRequirementsPath
-    if ($txtPath -and (Test-Path -LiteralPath $txtPath -PathType Leaf)) { $sources = Get-RequirementTxtSource -Path $txtPath }
+    if ($txtPath -and (Test-Path -LiteralPath $txtPath -PathType Leaf)) { $sources = Read-RequirementDependent -FilePath $txtPath -IncludeSource }
     foreach ($name in ($Pin.Keys | Sort-Object)) {
         $key = "$name==$($Pin[$name])"
         if ($published.ContainsKey($key)) { continue }
@@ -116,7 +117,7 @@ function Get-WheelhouseUiPendingPin {
             name      = $name
             version   = [string]$Pin[$name]
             rejected  = $reason
-            retryable = [bool]($reason -and $reason -match '^cooldown')
+            retryable = [bool]($reason -and $reason -match '^(needs \S+, which was rejected \()*cooldown')
             direct    = [bool](Test-RequirementTxtDirect -Source $from)
             requested_by = $requestedBy
         }
@@ -701,7 +702,7 @@ function Get-WheelhouseUiRoute {
             Wheelhouse = $true
             Handler    = {
                 param($Context, $Body, $Match)
-                $status = Get-WheelhouseStatus -WheelhousePath $Context.WheelhousePath -FreshnessDays ([int]$Context.Settings.AuditFreshnessDays) -ProposalPath $Context.ProposalPath
+                $status = Get-WheelhouseStatus -WheelhousePath $Context.WheelhousePath -FreshnessDays ([int]$Context.Settings.AuditFreshnessDays) -AuditMaxAgeDays ([int]$Context.Settings.AuditMaxAgeDays) -ProposalPath $Context.ProposalPath
                 $task = $null
                 try { $task = Get-WheelhouseScheduledCheck -ManagerRoot $Context.ManagerRoot } catch { Write-Verbose "Task Scheduler unreadable: $($_.Exception.Message)" }
                 # Plain assignment: one-element lists must stay lists in the JSON.
@@ -777,6 +778,8 @@ function Get-WheelhouseUiRoute {
                         published_utc = $record.published_utc
                         checks        = $record.checks
                         findings      = @(ConvertTo-WheelhouseUiFinding -Record $record)
+                        # Published packages that need this version.
+                        needed_by     = [string[]]@(Format-CatalogDependent -Dependent (Get-CatalogDependent -Catalog $catalog -Name $name -Version $version))
                     }
                 }
                 return @{ Status = 200; Body = @{ name = $name; version = $version; record = $state; events = $events } }
@@ -1668,6 +1671,9 @@ function Start-WheelhouseUiServer {
     $url = "http://localhost:$Port/?t=$Token"
     Write-Log "Wheelhouse UI is running. Open: $url" 'OK'
     Write-Log 'It accepts connections from this computer only. Press Ctrl+C here, or use the Stop button in the page, to stop it.'
+    # Audits older than AuditMaxAgeDays: say so and start one in the background (the
+    # Overview tab lists it too).
+    [void](Invoke-WheelhouseStartupAuditCheck -ManagerRoot $ManagerRoot)
     if (-not $NoBrowser) {
         try { Start-Process -FilePath $url } catch { Write-Log "Could not open the browser automatically: $($_.Exception.Message)" 'WARN' }
     }
