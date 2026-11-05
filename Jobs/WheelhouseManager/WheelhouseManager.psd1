@@ -148,6 +148,7 @@
         'Get-WheelhouseDenylistPath',
         'Read-WheelhouseDenylist',
         'Get-DenylistMatch',
+        'Format-DenylistMatch',
         'Add-WheelhouseDenylistEntry',
         'Remove-WheelhouseDenylistEntry',
         'Get-DenylistConstraintLine',

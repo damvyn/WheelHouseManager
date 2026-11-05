@@ -611,6 +611,7 @@ The resolve loop of `Update-Requirement.ps1` (sequence in 7.3). It never touches
 | `Get-WheelhouseDenylistPath` | `<root>\config\denylist.json` | defaults, UI |
 | `Read-WheelhouseDenylist` | entries (plain array - fine inside `@()`); damaged -> throws | worker, resolve, checks, UI |
 | `Get-DenylistMatch` | first entry blocking `name==version` (`*` = all) | intake, inventory, remove, add, notices |
+| `Format-DenylistMatch` | `(version, source): reason` of an entry | intake rejections, `Denylisted` notices |
 | `Add-WheelhouseDenylistEntry` | validate, replace same name+version, write sorted | remove, UI |
 | `Remove-WheelhouseDenylistEntry` | remove name+version, optionally only for `-OnlySource` | remove undo, restore, UI |
 | `Get-DenylistConstraintLine` | exact versions as `name!=version` (`-NoEnumerate`) | Update-Requirement |

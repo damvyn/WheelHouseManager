@@ -451,8 +451,7 @@ function Get-DeployedPackageNotice {
 
         $blocked = Get-DenylistMatch -Name $name -Version $version -Denylist $Denylist
         if ($blocked) {
-            $why = if ($blocked.reason) { ": $($blocked.reason)" } else { '' }
-            $notices.Add((New-WheelhouseNotice -Kind 'Denylisted' -Package $name -Version $version -File $files -Message "Blocked by the denylist ($($blocked.version), $($blocked.source))$why, but still published."))
+            $notices.Add((New-WheelhouseNotice -Kind 'Denylisted' -Package $name -Version $version -File $files -Message "Blocked by the denylist $(Format-DenylistMatch -Entry $blocked), but still published."))
         }
 
         if ($SkipYanked) { continue }

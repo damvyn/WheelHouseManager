@@ -92,8 +92,7 @@ function Invoke-CandidateIntake {
     foreach ($name in @($remaining.Keys)) {
         $blocked = Get-DenylistMatch -Name $name -Version $remaining[$name] -Denylist $Denylist
         if ($blocked) {
-            $why = if ($blocked.reason) { ": $($blocked.reason)" } else { '' }
-            & $reject $name 'denylist' "denylist ($($blocked.version), $($blocked.source))$why"
+            & $reject $name 'denylist' "denylist $(Format-DenylistMatch -Entry $blocked)"
         }
     }
 
@@ -381,8 +380,7 @@ function Publish-CandidateIntake {
             foreach ($name in @($verified.Keys | Sort-Object)) {
                 $blocked = Get-DenylistMatch -Name $name -Version $versions[$name] -Denylist $denylist
                 if ($blocked) {
-                    $why = if ($blocked.reason) { ": $($blocked.reason)" } else { '' }
-                    $rejected.Add([PSCustomObject]@{ Name = $name; Version = $versions[$name]; Category = 'denylist'; Reason = "denylisted while the checks ran ($($blocked.version), $($blocked.source))$why" })
+                    $rejected.Add([PSCustomObject]@{ Name = $name; Version = $versions[$name]; Category = 'denylist'; Reason = "denylisted while the checks ran $(Format-DenylistMatch -Entry $blocked)" })
                     continue
                 }
                 $plans[$name] = @(foreach ($file in $verified[$name]) {

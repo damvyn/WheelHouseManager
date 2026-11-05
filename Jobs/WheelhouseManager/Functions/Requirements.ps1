@@ -61,15 +61,12 @@ function Read-RequirementDependent {
     $add = {
         param([string]$Entry)
         $token = ($Entry.Trim() -split '\s+')[0]
-        if ($keepSource -and $token -eq '-r') {
-            $source = ($Entry.Trim() -replace '\s+', ' ')
-            if (-not $dependents.ContainsKey($current)) { $dependents[$current] = @() }
-            if ($dependents[$current] -notcontains $source) { $dependents[$current] = @($dependents[$current]) + $source }
-            return
+        if ($keepSource -and $token -eq '-r') { $parent = ($Entry.Trim() -replace '\s+', ' ') }
+        elseif (-not $token -or $token.StartsWith('-') -or $token -notmatch '^[A-Za-z0-9][A-Za-z0-9_.\-]*$') { return }
+        else {
+            $parent = Get-NormalizedPackageName $token
+            if ($parent -eq $current) { return }
         }
-        if (-not $token -or $token.StartsWith('-') -or $token -notmatch '^[A-Za-z0-9][A-Za-z0-9_.\-]*$') { return }
-        $parent = Get-NormalizedPackageName $token
-        if ($parent -eq $current) { return }
         if (-not $dependents.ContainsKey($current)) { $dependents[$current] = @() }
         if ($dependents[$current] -notcontains $parent) { $dependents[$current] = @($dependents[$current]) + $parent }
     }

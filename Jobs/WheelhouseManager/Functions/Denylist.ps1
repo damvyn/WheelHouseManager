@@ -72,6 +72,21 @@ function Get-DenylistMatch {
     return $null
 }
 
+function Format-DenylistMatch {
+    # "(version, source)" of a denylist entry, then ": reason" when it has one - the text
+    # that names it in rejections and notices.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Entry
+    )
+
+    $text = "($($Entry.version), $($Entry.source))"
+    if ($Entry.reason) { $text += ": $($Entry.reason)" }
+    return $text
+}
+
 function Add-WheelhouseDenylistEntry {
     # Adds a package to the denylist, or updates the reason of an existing entry for
     # the same name and version. Returns the entry.
